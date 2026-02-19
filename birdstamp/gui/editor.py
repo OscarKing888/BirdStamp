@@ -4,6 +4,7 @@ import json
 import hashlib
 import re
 import sys
+import threading
 from collections import defaultdict
 from functools import lru_cache
 from importlib import resources
@@ -58,6 +59,11 @@ _FALLBACK_DEFAULT_FIELD_TAG = "EXIF:Model"
 _FALLBACK_TAG_OPTIONS: list[tuple[str, str]] = [("机身型号 (EXIF)", "EXIF:Model")]
 _FALLBACK_SAMPLE_RAW_METADATA: dict[str, Any] = {}
 _DEFAULT_FOCUS_BOX_SHORT_EDGE_RATIO = 0.12
+_BIRD_MODEL_CANDIDATES = ("yolo11n.pt", "yolo11s.pt", "yolov8n.pt")
+_BIRD_CLASS_NAME = "bird"
+_COCO_FALLBACK_BIRD_CLASS_ID = 14
+_BIRD_DETECT_CONFIDENCE = 0.25
+_BIRD_DETECTOR_ERROR_MESSAGE = ""
 
 
 @lru_cache(maxsize=1)
@@ -598,6 +604,226 @@ def _pil_to_qpixmap(image: Image.Image) -> QPixmap:
     return QPixmap.fromImage(q_image.copy())
 
 
+def _resolve_bird_class_ids(names: Any) -> set[int]:
+    ids: set[int] = set()
+    if isinstance(names, dict):
+        iterator = names.items()
+    elif isinstance(names, (list, tuple)):
+        iterator = enumerate(names)
+    else:
+        iterator = []
+
+    for raw_idx, raw_name in iterator:
+        if str(raw_name).strip().lower() != _BIRD_CLASS_NAME:
+            continue
+        try:
+            ids.add(int(raw_idx))
+        except Exception:
+            continue
+
+    if not ids:
+        ids.add(_COCO_FALLBACK_BIRD_CLASS_ID)
+    return ids
+
+
+def _short_error_text(exc: Exception) -> str:
+    text = str(exc).strip() or exc.__class__.__name__
+    text = re.sub(r"\s+", " ", text)
+    if len(text) > 180:
+        return f"{text[:177]}..."
+    return text
+
+
+def _best_bird_box_from_result(result: Any, bird_class_ids: set[int]) -> tuple[float, float, float, float] | None:
+    boxes = getattr(result, "boxes", None)
+    if boxes is None:
+        return None
+
+    try:
+        xyxy_rows = boxes.xyxy.tolist()
+        cls_values = boxes.cls.tolist()
+        conf_values = boxes.conf.tolist()
+    except Exception:
+        return None
+
+    total = min(len(xyxy_rows), len(cls_values), len(conf_values))
+    if total <= 0:
+        return None
+
+    best_box: tuple[float, float, float, float] | None = None
+    best_conf = -1.0
+    best_area = -1.0
+    for idx in range(total):
+        try:
+            cls_id = int(round(float(cls_values[idx])))
+        except Exception:
+            continue
+        if cls_id not in bird_class_ids:
+            continue
+
+        row = xyxy_rows[idx]
+        if not isinstance(row, (list, tuple)) or len(row) < 4:
+            continue
+        try:
+            x1 = float(row[0])
+            y1 = float(row[1])
+            x2 = float(row[2])
+            y2 = float(row[3])
+            conf = float(conf_values[idx])
+        except Exception:
+            continue
+
+        area = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+        if conf > best_conf or (abs(conf - best_conf) <= 1e-9 and area > best_area):
+            best_conf = conf
+            best_area = area
+            best_box = (x1, y1, x2, y2)
+
+    return best_box
+
+
+def _normalize_xyxy_box(
+    box: tuple[float, float, float, float],
+    width: int,
+    height: int,
+) -> tuple[float, float, float, float] | None:
+    if width <= 0 or height <= 0:
+        return None
+    left_px = min(box[0], box[2])
+    right_px = max(box[0], box[2])
+    top_px = min(box[1], box[3])
+    bottom_px = max(box[1], box[3])
+
+    left = _clamp01(left_px / float(width))
+    right = _clamp01(right_px / float(width))
+    top = _clamp01(top_px / float(height))
+    bottom = _clamp01(bottom_px / float(height))
+    if right <= left or bottom <= top:
+        return None
+    return (left, top, right, bottom)
+
+
+@lru_cache(maxsize=1)
+def _load_torch_module() -> Any | None:
+    global _BIRD_DETECTOR_ERROR_MESSAGE
+    try:
+        import torch as torch_module
+    except Exception as exc:
+        text = _short_error_text(exc)
+        if "numpy" in text.lower():
+            _BIRD_DETECTOR_ERROR_MESSAGE = "当前 Torch/NumPy 版本不兼容，请安装 numpy<2 或升级匹配版本"
+        else:
+            _BIRD_DETECTOR_ERROR_MESSAGE = f"加载 torch 失败: {text}"
+        return None
+    return torch_module
+
+
+@lru_cache(maxsize=1)
+def _load_yolo_class() -> Any | None:
+    global _BIRD_DETECTOR_ERROR_MESSAGE
+    try:
+        from ultralytics import YOLO as yolo_class
+    except Exception as exc:
+        text = _short_error_text(exc)
+        if "numpy" in text.lower():
+            _BIRD_DETECTOR_ERROR_MESSAGE = "当前 Torch/NumPy 版本不兼容，请安装 numpy<2 或升级匹配版本"
+        else:
+            _BIRD_DETECTOR_ERROR_MESSAGE = f"未安装或无法加载 ultralytics: {text}"
+        return None
+    return yolo_class
+
+
+def _preferred_bird_detect_device() -> str | int:
+    torch_module = _load_torch_module()
+    if torch_module is None:
+        return "cpu"
+    try:
+        if torch_module.cuda.is_available():
+            return 0
+    except Exception:
+        pass
+    try:
+        backends = getattr(torch_module, "backends", None)
+        mps = getattr(backends, "mps", None)
+        if mps is not None and mps.is_available():
+            return "mps"
+    except Exception:
+        pass
+    return "cpu"
+
+
+@lru_cache(maxsize=1)
+def _load_bird_detector() -> tuple[Any, set[int]] | None:
+    global _BIRD_DETECTOR_ERROR_MESSAGE
+    _BIRD_DETECTOR_ERROR_MESSAGE = ""
+
+    yolo_class = _load_yolo_class()
+    if yolo_class is None:
+        if not _BIRD_DETECTOR_ERROR_MESSAGE:
+            _BIRD_DETECTOR_ERROR_MESSAGE = "未安装 ultralytics（pip install ultralytics）"
+        return None
+
+    last_error = ""
+    for model_name in _BIRD_MODEL_CANDIDATES:
+        try:
+            model = yolo_class(f"models/{model_name}")
+        except Exception as exc:
+            last_error = f"{model_name}: {_short_error_text(exc)}"
+            continue
+        bird_class_ids = _resolve_bird_class_ids(getattr(model, "names", None))
+        if not bird_class_ids:
+            last_error = f"{model_name}: 未找到 bird 类别"
+            continue
+        return (model, bird_class_ids)
+
+    _BIRD_DETECTOR_ERROR_MESSAGE = last_error or "鸟体识别模型加载失败"
+    return None
+
+
+def _detect_primary_bird_box(image: Image.Image) -> tuple[float, float, float, float] | None:
+    global _BIRD_DETECTOR_ERROR_MESSAGE
+    detector = _load_bird_detector()
+    if detector is None:
+        return None
+
+    _BIRD_DETECTOR_ERROR_MESSAGE = ""
+    model, bird_class_ids = detector
+    source = image if image.mode == "RGB" else image.convert("RGB")
+    detect_device = _preferred_bird_detect_device()
+    predict_kwargs = {
+        "source": source,
+        "conf": _BIRD_DETECT_CONFIDENCE,
+        "verbose": False,
+    }
+
+    try:
+        results = model.predict(device=detect_device, **predict_kwargs)
+    except Exception as primary_exc:
+        primary_text = _short_error_text(primary_exc)
+        if detect_device == "cpu":
+            if "Numpy is not available" in primary_text:
+                _BIRD_DETECTOR_ERROR_MESSAGE = "当前 Torch/NumPy 版本不兼容，请安装 numpy<2 或升级匹配版本"
+            else:
+                _BIRD_DETECTOR_ERROR_MESSAGE = f"鸟体识别推理失败: {primary_text}"
+            return None
+        try:
+            results = model.predict(device="cpu", **predict_kwargs)
+        except Exception as fallback_exc:
+            fallback_text = _short_error_text(fallback_exc)
+            if "Numpy is not available" in fallback_text:
+                _BIRD_DETECTOR_ERROR_MESSAGE = "当前 Torch/NumPy 版本不兼容，请安装 numpy<2 或升级匹配版本"
+            else:
+                _BIRD_DETECTOR_ERROR_MESSAGE = f"鸟体识别推理失败: {primary_text}; CPU 回退失败: {fallback_text}"
+            return None
+
+    if not results:
+        return None
+    best_box = _best_bird_box_from_result(results[0], bird_class_ids)
+    if best_box is None:
+        return None
+    return _normalize_xyxy_box(best_box, source.width, source.height)
+
+
 def _template_directory() -> Path:
     return get_config_path().parent / "templates"
 
@@ -982,7 +1208,9 @@ class PreviewCanvas(QLabel):
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._source_pixmap: QPixmap | None = None
         self._focus_box: tuple[float, float, float, float] | None = None
+        self._bird_box: tuple[float, float, float, float] | None = None
         self._show_focus_box = True
+        self._show_bird_box = False
         self._use_original_size = False
         self._zoom = 1.0
         self._offset = QPointF(0.0, 0.0)
@@ -997,6 +1225,14 @@ class PreviewCanvas(QLabel):
 
     def set_show_focus_box(self, enabled: bool) -> None:
         self._show_focus_box = bool(enabled)
+        self.update()
+
+    def set_bird_box(self, bird_box: tuple[float, float, float, float] | None) -> None:
+        self._bird_box = bird_box
+        self.update()
+
+    def set_show_bird_box(self, enabled: bool) -> None:
+        self._show_bird_box = bool(enabled)
         self.update()
 
     def _fit_scale(self) -> float:
@@ -1100,6 +1336,7 @@ class PreviewCanvas(QLabel):
         if self._source_pixmap is None or self._source_pixmap.isNull():
             self._source_pixmap = None
             self._focus_box = None
+            self._bird_box = None
             self._zoom = 1.0
             self._offset = QPointF(0.0, 0.0)
             self._dragging = False
@@ -1296,6 +1533,30 @@ class PreviewCanvas(QLabel):
             self._source_pixmap,
             QRectF(0, 0, self._source_pixmap.width(), self._source_pixmap.height()),
         )
+
+        if self._show_bird_box and self._bird_box:
+            bird_left = draw_rect.left() + (self._bird_box[0] * draw_rect.width())
+            bird_top = draw_rect.top() + (self._bird_box[1] * draw_rect.height())
+            bird_right = draw_rect.left() + (self._bird_box[2] * draw_rect.width())
+            bird_bottom = draw_rect.top() + (self._bird_box[3] * draw_rect.height())
+            bird_rect = QRectF(
+                min(bird_left, bird_right),
+                min(bird_top, bird_bottom),
+                abs(bird_right - bird_left),
+                abs(bird_bottom - bird_top),
+            )
+            bird_rect = bird_rect.intersected(QRectF(content))
+            if bird_rect.width() >= 1.0 and bird_rect.height() >= 1.0:
+                fill_color = QColor("#A9DBFF")
+                fill_color.setAlpha(96)
+                painter.fillRect(bird_rect, fill_color)
+
+                bird_pen = QPen(QColor("#8BCBFF"))
+                bird_pen.setWidth(1)
+                bird_pen.setJoinStyle(Qt.PenJoinStyle.MiterJoin)
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.setPen(bird_pen)
+                painter.drawRect(bird_rect)
 
         if self._show_focus_box and self._focus_box:
             left = int(round(draw_rect.left() + (self._focus_box[0] * draw_rect.width())))
@@ -1909,8 +2170,13 @@ class BirdStampEditorWindow(QMainWindow):
         self.preview_pixmap: QPixmap | None = None
         self.preview_focus_box: tuple[float, float, float, float] | None = None
         self.preview_focus_box_original: tuple[float, float, float, float] | None = None
+        self.preview_bird_box: tuple[float, float, float, float] | None = None
         self._original_mode_pixmap: QPixmap | None = None
         self._original_mode_signature: str | None = None
+        self._bird_box_cache: dict[str, tuple[float, float, float, float] | None] = {}
+        self._bird_detect_error_reported = False
+        self._bird_detector_preload_started = False
+        self._bird_detector_preload_thread: threading.Thread | None = None
         self.last_rendered: Image.Image | None = None
         self.current_path: Path | None = None
         self.current_source_image: Image.Image | None = None
@@ -1926,6 +2192,7 @@ class BirdStampEditorWindow(QMainWindow):
         self._reload_template_combo(preferred="default")
         self._set_status("就绪。请添加照片并选择模板。")
         self._show_placeholder_preview()
+        self._start_bird_detector_preload()
 
         if startup_file:
             self._add_photo_paths([startup_file])
@@ -2078,6 +2345,11 @@ class BirdStampEditorWindow(QMainWindow):
         self.show_focus_box_check.setChecked(True)
         self.show_focus_box_check.toggled.connect(self._on_preview_toolbar_toggled)
         preview_toolbar.addWidget(self.show_focus_box_check)
+
+        self.show_bird_box_check = QCheckBox("显示鸟体框")
+        self.show_bird_box_check.setChecked(False)
+        self.show_bird_box_check.toggled.connect(self._on_preview_toolbar_toggled)
+        preview_toolbar.addWidget(self.show_bird_box_check)
         preview_toolbar.addStretch(1)
         right_layout.addLayout(preview_toolbar)
 
@@ -2196,11 +2468,31 @@ class BirdStampEditorWindow(QMainWindow):
             self._apply_system_adaptive_style()
         super().changeEvent(event)
 
-    def _on_preview_toolbar_toggled(self, checked: bool) -> None:
-        self.preview_label.set_show_focus_box(checked)
+    def _on_preview_toolbar_toggled(self, _checked: bool) -> None:
+        if self.show_bird_box_check.isChecked():
+            self.preview_bird_box = self._current_bird_box()
+        else:
+            self.preview_bird_box = None
+        self._refresh_preview_label(preserve_view=True)
 
     def _on_preview_scale_mode_toggled(self, _checked: bool) -> None:
         self._refresh_preview_label(preserve_view=True)
+
+    def _start_bird_detector_preload(self) -> None:
+        if self._bird_detector_preload_started:
+            return
+        self._bird_detector_preload_started = True
+
+        def _worker() -> None:
+            _load_bird_detector()
+
+        thread = threading.Thread(
+            target=_worker,
+            name="birdstamp-bird-detector-preload",
+            daemon=True,
+        )
+        self._bird_detector_preload_thread = thread
+        thread.start()
 
     def _source_signature(self, path: Path) -> str:
         try:
@@ -2289,10 +2581,27 @@ class BirdStampEditorWindow(QMainWindow):
             anchor=anchor,
         )
 
+    def _current_bird_box(self) -> tuple[float, float, float, float] | None:
+        if self.current_path is None or self.current_source_image is None:
+            return None
+
+        signature = self._source_signature(self.current_path)
+        if signature in self._bird_box_cache:
+            return self._bird_box_cache[signature]
+
+        bird_box = _detect_primary_bird_box(self.current_source_image)
+        self._bird_box_cache[signature] = bird_box
+
+        if bird_box is None and not self._bird_detect_error_reported and _BIRD_DETECTOR_ERROR_MESSAGE:
+            self._set_status(f"鸟体识别不可用: {_BIRD_DETECTOR_ERROR_MESSAGE}")
+            self._bird_detect_error_reported = True
+        return bird_box
+
     def _show_placeholder_preview(self) -> None:
         self.preview_pixmap = _pil_to_qpixmap(self.placeholder)
         self.preview_focus_box = None
         self.preview_focus_box_original = None
+        self.preview_bird_box = None
         self._invalidate_original_mode_cache()
         self._refresh_preview_label(reset_view=True)
 
@@ -2320,9 +2629,11 @@ class BirdStampEditorWindow(QMainWindow):
             preserve_scale=preserve_view,
         )
         self.preview_label.set_show_focus_box(self.show_focus_box_check.isChecked())
+        self.preview_label.set_show_bird_box(self.show_bird_box_check.isChecked())
 
         display_pixmap: QPixmap | None = self.preview_pixmap
         focus_box = self.preview_focus_box if self.preview_pixmap else None
+        bird_box = self.preview_bird_box if self.preview_pixmap else None
         source_mode = "预览图"
 
         if self.show_original_size_check.isChecked():
@@ -2333,6 +2644,7 @@ class BirdStampEditorWindow(QMainWindow):
                 source_mode = "原图"
 
         self.preview_label.set_focus_box(focus_box)
+        self.preview_label.set_bird_box(bird_box)
         self.preview_label.set_source_pixmap(
             display_pixmap,
             reset_view=reset_view,
@@ -2460,6 +2772,8 @@ class BirdStampEditorWindow(QMainWindow):
 
         for key in removed_keys:
             self.raw_metadata_cache.pop(key, None)
+        if removed_keys:
+            self._bird_box_cache.clear()
 
         if self.photo_list.count() == 0:
             self.current_path = None
@@ -2475,6 +2789,7 @@ class BirdStampEditorWindow(QMainWindow):
     def _clear_photos(self) -> None:
         self.photo_list.clear()
         self.raw_metadata_cache.clear()
+        self._bird_box_cache.clear()
         self.current_path = None
         self.current_source_image = None
         self.current_raw_metadata = {}
@@ -2616,6 +2931,7 @@ class BirdStampEditorWindow(QMainWindow):
         except Exception as exc:
             self.preview_focus_box = None
             self.preview_focus_box_original = None
+            self.preview_bird_box = None
             self._show_error("预览失败", str(exc))
             self._set_status(f"预览失败: {exc}")
             return
@@ -2627,6 +2943,10 @@ class BirdStampEditorWindow(QMainWindow):
             self.preview_focus_box_original = _extract_focus_box(self.current_raw_metadata, source_width, source_height)
         else:
             self.preview_focus_box_original = None
+        if self.show_bird_box_check.isChecked():
+            self.preview_bird_box = self._current_bird_box()
+        else:
+            self.preview_bird_box = None
         self.preview_pixmap = _pil_to_qpixmap(rendered)
         self._refresh_preview_label(reset_view=True)
         self._set_status(f"预览完成: {rendered.width}x{rendered.height}")
