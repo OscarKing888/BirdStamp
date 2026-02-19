@@ -35,3 +35,4 @@ packages = [
 
 [tool.setuptools.package-data]
 birdstamp = ["templates/*.yaml"]
+"birdstamp.gui" = ["resources/*.json"]

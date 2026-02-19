@@ -1,0 +1,65 @@
+{
+  "name": "default",
+  "fields": [
+    {
+      "name": "鸟种",
+      "tag": "XMP-dc:Title",
+      "fallback": "{bird}",
+      "align_horizontal": "left",
+      "align_vertical": "top",
+      "x_offset_pct": 3.0,
+      "y_offset_pct": 4.0,
+      "color": "#FFFFFF",
+      "font_size": 66,
+      "style": "bold"
+    },
+    {
+      "name": "拍摄时间",
+      "tag": "EXIF:DateTimeOriginal",
+      "fallback": "{capture_text}",
+      "align_horizontal": "left",
+      "align_vertical": "top",
+      "x_offset_pct": 3.0,
+      "y_offset_pct": 12.0,
+      "color": "#F2F2F2",
+      "font_size": 34,
+      "style": "normal"
+    },
+    {
+      "name": "机身",
+      "tag": "EXIF:Model",
+      "fallback": "{camera}",
+      "align_horizontal": "right",
+      "align_vertical": "top",
+      "x_offset_pct": -3.0,
+      "y_offset_pct": 6.0,
+      "color": "#FFFFFF",
+      "font_size": 30,
+      "style": "normal"
+    },
+    {
+      "name": "镜头",
+      "tag": "EXIF:LensModel",
+      "fallback": "{lens}",
+      "align_horizontal": "right",
+      "align_vertical": "top",
+      "x_offset_pct": -3.0,
+      "y_offset_pct": 12.0,
+      "color": "#FFFFFF",
+      "font_size": 30,
+      "style": "normal"
+    },
+    {
+      "name": "参数",
+      "tag": "settings_text",
+      "fallback": "{settings_text}",
+      "align_horizontal": "center",
+      "align_vertical": "top",
+      "x_offset_pct": 0.0,
+      "y_offset_pct": 90.0,
+      "color": "#F8F8F8",
+      "font_size": 28,
+      "style": "bold"
+    }
+  ]
+}
