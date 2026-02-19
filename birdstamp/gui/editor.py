@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import math
 import re
 import sys
 import threading
@@ -13,7 +14,7 @@ from typing import Any, Iterable
 
 from PIL import Image, ImageColor, ImageDraw
 from PyQt6.QtCore import QEvent, QPointF, QRectF, Qt, pyqtSignal
-from PyQt6.QtGui import QAction, QColor, QImage, QKeySequence, QPainter, QPalette, QPen, QPixmap
+from PyQt6.QtGui import QAction, QColor, QImage, QKeySequence, QPainter, QPainterPath, QPalette, QPen, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -32,6 +33,7 @@ from PyQt6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QSlider,
     QSplitter,
     QSpinBox,
     QVBoxLayout,
@@ -64,6 +66,11 @@ _BIRD_CLASS_NAME = "bird"
 _COCO_FALLBACK_BIRD_CLASS_ID = 14
 _BIRD_DETECT_CONFIDENCE = 0.25
 _BIRD_DETECTOR_ERROR_MESSAGE = ""
+_CENTER_MODE_IMAGE = "image"
+_CENTER_MODE_FOCUS = "focus"
+_CENTER_MODE_BIRD = "bird"
+_CENTER_MODE_OPTIONS = (_CENTER_MODE_IMAGE, _CENTER_MODE_FOCUS, _CENTER_MODE_BIRD)
+_DEFAULT_CROP_EFFECT_ALPHA = 160
 
 
 @lru_cache(maxsize=1)
@@ -573,28 +580,169 @@ def _resize_fit(image: Image.Image, max_long_edge: int) -> Image.Image:
     return image.resize(new_size, Image.Resampling.LANCZOS)
 
 
-def _crop_to_ratio_with_anchor(image: Image.Image, ratio: float, anchor: tuple[float, float]) -> Image.Image:
-    width, height = image.size
-    if width <= 0 or height <= 0 or ratio <= 0:
-        return image
+def _normalize_center_mode(value: Any) -> str:
+    text = str(value or _CENTER_MODE_IMAGE).strip().lower()
+    if text not in _CENTER_MODE_OPTIONS:
+        return _CENTER_MODE_IMAGE
+    return text
+
+
+def _normalize_unit_box(
+    box: tuple[float, float, float, float] | None,
+) -> tuple[float, float, float, float] | None:
+    if box is None:
+        return None
+    try:
+        left = _clamp01(float(box[0]))
+        top = _clamp01(float(box[1]))
+        right = _clamp01(float(box[2]))
+        bottom = _clamp01(float(box[3]))
+    except Exception:
+        return None
+
+    if right < left:
+        left, right = right, left
+    if bottom < top:
+        top, bottom = bottom, top
+    if right - left <= 0.0001 or bottom - top <= 0.0001:
+        return None
+    return (left, top, right, bottom)
+
+
+def _box_center(box: tuple[float, float, float, float]) -> tuple[float, float]:
+    return ((box[0] + box[2]) * 0.5, (box[1] + box[3]) * 0.5)
+
+
+def _solve_axis_crop_start(
+    *,
+    full_size: int,
+    crop_size: int,
+    anchor_center: float,
+    keep_start: float | None = None,
+    keep_end: float | None = None,
+) -> int:
+    if full_size <= 0 or crop_size >= full_size:
+        return 0
+
+    max_start = full_size - crop_size
+    target_center = _clamp01(anchor_center) * float(full_size)
+    start = int(round(target_center - (crop_size * 0.5)))
+    start = max(0, min(max_start, start))
+
+    if keep_start is None or keep_end is None:
+        return start
+
+    low = min(keep_start, keep_end)
+    high = max(keep_start, keep_end)
+    feasible_min = max(0, int(math.ceil(high - crop_size)))
+    feasible_max = min(max_start, int(math.floor(low)))
+    if feasible_min <= feasible_max:
+        return max(feasible_min, min(feasible_max, start))
+
+    keep_center = (low + high) * 0.5
+    centered = int(round(keep_center - (crop_size * 0.5)))
+    return max(0, min(max_start, centered))
+
+
+def _compute_ratio_crop_box(
+    *,
+    width: int,
+    height: int,
+    ratio: float | None,
+    anchor: tuple[float, float] = (0.5, 0.5),
+    keep_box: tuple[float, float, float, float] | None = None,
+) -> tuple[float, float, float, float]:
+    if width <= 0 or height <= 0 or ratio is None or ratio <= 0:
+        return (0.0, 0.0, 1.0, 1.0)
 
     current = width / float(height)
     if abs(current - ratio) < 0.0001:
-        return image
+        return (0.0, 0.0, 1.0, 1.0)
 
-    anchor_x = max(0.0, min(1.0, anchor[0]))
-    anchor_y = max(0.0, min(1.0, anchor[1]))
+    keep = _normalize_unit_box(keep_box)
+    anchor_x = _clamp01(anchor[0])
+    anchor_y = _clamp01(anchor[1])
 
     if current > ratio:
-        new_width = max(1, int(round(height * ratio)))
-        center_x = int(round(anchor_x * width))
-        left = max(0, min(width - new_width, center_x - (new_width // 2)))
-        return image.crop((left, 0, left + new_width, height))
+        crop_w = max(1, min(width, int(round(height * ratio))))
+        left = _solve_axis_crop_start(
+            full_size=width,
+            crop_size=crop_w,
+            anchor_center=anchor_x,
+            keep_start=(keep[0] * width) if keep else None,
+            keep_end=(keep[2] * width) if keep else None,
+        )
+        right = left + crop_w
+        return (
+            _clamp01(left / float(width)),
+            0.0,
+            _clamp01(right / float(width)),
+            1.0,
+        )
 
-    new_height = max(1, int(round(width / ratio)))
-    center_y = int(round(anchor_y * height))
-    top = max(0, min(height - new_height, center_y - (new_height // 2)))
-    return image.crop((0, top, width, top + new_height))
+    crop_h = max(1, min(height, int(round(width / ratio))))
+    top = _solve_axis_crop_start(
+        full_size=height,
+        crop_size=crop_h,
+        anchor_center=anchor_y,
+        keep_start=(keep[1] * height) if keep else None,
+        keep_end=(keep[3] * height) if keep else None,
+    )
+    bottom = top + crop_h
+    return (
+        0.0,
+        _clamp01(top / float(height)),
+        1.0,
+        _clamp01(bottom / float(height)),
+    )
+
+
+def _crop_box_has_effect(crop_box: tuple[float, float, float, float] | None) -> bool:
+    normalized = _normalize_unit_box(crop_box)
+    if normalized is None:
+        return False
+    eps = 0.0005
+    return (
+        normalized[0] > eps
+        or normalized[1] > eps
+        or normalized[2] < (1.0 - eps)
+        or normalized[3] < (1.0 - eps)
+    )
+
+
+def _crop_image_by_normalized_box(
+    image: Image.Image,
+    crop_box: tuple[float, float, float, float] | None,
+) -> Image.Image:
+    normalized = _normalize_unit_box(crop_box)
+    if normalized is None:
+        return image
+    width, height = image.size
+    if width <= 0 or height <= 0:
+        return image
+
+    left = int(round(normalized[0] * width))
+    top = int(round(normalized[1] * height))
+    right = int(round(normalized[2] * width))
+    bottom = int(round(normalized[3] * height))
+    left = max(0, min(width - 1, left))
+    top = max(0, min(height - 1, top))
+    right = max(left + 1, min(width, right))
+    bottom = max(top + 1, min(height, bottom))
+    if left <= 0 and top <= 0 and right >= width and bottom >= height:
+        return image
+    return image.crop((left, top, right, bottom))
+
+
+def _crop_to_ratio_with_anchor(image: Image.Image, ratio: float, anchor: tuple[float, float]) -> Image.Image:
+    crop_box = _compute_ratio_crop_box(
+        width=image.width,
+        height=image.height,
+        ratio=ratio,
+        anchor=anchor,
+        keep_box=None,
+    )
+    return _crop_image_by_normalized_box(image, crop_box)
 
 
 def _pil_to_qpixmap(image: Image.Image) -> QPixmap:
@@ -1209,8 +1357,11 @@ class PreviewCanvas(QLabel):
         self._source_pixmap: QPixmap | None = None
         self._focus_box: tuple[float, float, float, float] | None = None
         self._bird_box: tuple[float, float, float, float] | None = None
+        self._crop_effect_box: tuple[float, float, float, float] | None = None
         self._show_focus_box = True
         self._show_bird_box = False
+        self._show_crop_effect = False
+        self._crop_effect_alpha = _DEFAULT_CROP_EFFECT_ALPHA
         self._use_original_size = False
         self._zoom = 1.0
         self._offset = QPointF(0.0, 0.0)
@@ -1233,6 +1384,21 @@ class PreviewCanvas(QLabel):
 
     def set_show_bird_box(self, enabled: bool) -> None:
         self._show_bird_box = bool(enabled)
+        self.update()
+
+    def set_crop_effect_box(self, crop_effect_box: tuple[float, float, float, float] | None) -> None:
+        self._crop_effect_box = crop_effect_box
+        self.update()
+
+    def set_show_crop_effect(self, enabled: bool) -> None:
+        self._show_crop_effect = bool(enabled)
+        self.update()
+
+    def set_crop_effect_alpha(self, alpha: int) -> None:
+        parsed = max(0, min(255, int(alpha)))
+        if parsed == self._crop_effect_alpha:
+            return
+        self._crop_effect_alpha = parsed
         self.update()
 
     def _fit_scale(self) -> float:
@@ -1337,6 +1503,7 @@ class PreviewCanvas(QLabel):
             self._source_pixmap = None
             self._focus_box = None
             self._bird_box = None
+            self._crop_effect_box = None
             self._zoom = 1.0
             self._offset = QPointF(0.0, 0.0)
             self._dragging = False
@@ -1599,6 +1766,27 @@ class PreviewCanvas(QLabel):
                     inner_pen.setJoinStyle(Qt.PenJoinStyle.MiterJoin)
                     painter.setPen(inner_pen)
                     painter.drawRect(left + 3, top + 3, box_w - 6, box_h - 6)
+
+        if self._show_crop_effect and self._crop_effect_box:
+            crop_left = draw_rect.left() + (self._crop_effect_box[0] * draw_rect.width())
+            crop_top = draw_rect.top() + (self._crop_effect_box[1] * draw_rect.height())
+            crop_right = draw_rect.left() + (self._crop_effect_box[2] * draw_rect.width())
+            crop_bottom = draw_rect.top() + (self._crop_effect_box[3] * draw_rect.height())
+            crop_rect = QRectF(
+                min(crop_left, crop_right),
+                min(crop_top, crop_bottom),
+                abs(crop_right - crop_left),
+                abs(crop_bottom - crop_top),
+            )
+            visible_rect = draw_rect.intersected(QRectF(content))
+            crop_rect = crop_rect.intersected(visible_rect)
+            if visible_rect.width() >= 1.0 and visible_rect.height() >= 1.0 and crop_rect.width() >= 1.0 and crop_rect.height() >= 1.0:
+                shade_path = QPainterPath()
+                shade_path.addRect(visible_rect)
+                keep_path = QPainterPath()
+                keep_path.addRect(crop_rect)
+                shade_path = shade_path.subtracted(keep_path)
+                painter.fillPath(shade_path, QColor(0, 0, 0, self._crop_effect_alpha))
 
         painter.end()
 
@@ -2171,9 +2359,11 @@ class BirdStampEditorWindow(QMainWindow):
         self.preview_focus_box: tuple[float, float, float, float] | None = None
         self.preview_focus_box_original: tuple[float, float, float, float] | None = None
         self.preview_bird_box: tuple[float, float, float, float] | None = None
+        self.preview_crop_effect_box: tuple[float, float, float, float] | None = None
         self._original_mode_pixmap: QPixmap | None = None
         self._original_mode_signature: str | None = None
         self._bird_box_cache: dict[str, tuple[float, float, float, float] | None] = {}
+        self.photo_render_overrides: dict[str, dict[str, Any]] = {}
         self._bird_detect_error_reported = False
         self._bird_detector_preload_started = False
         self._bird_detector_preload_thread: threading.Thread | None = None
@@ -2301,10 +2491,21 @@ class BirdStampEditorWindow(QMainWindow):
         output_form.addRow("裁切比例", self.ratio_combo)
 
         self.center_mode_combo = QComboBox()
-        self.center_mode_combo.addItem("图像中心", "image")
-        self.center_mode_combo.addItem("焦点中心", "focus")
+        self.center_mode_combo.addItem("中心", _CENTER_MODE_IMAGE)
+        self.center_mode_combo.addItem("焦点", _CENTER_MODE_FOCUS)
+        self.center_mode_combo.addItem("鸟体", _CENTER_MODE_BIRD)
         self.center_mode_combo.currentIndexChanged.connect(self.render_preview)
         output_form.addRow("裁切中心", self.center_mode_combo)
+
+        apply_row = QHBoxLayout()
+        self.apply_selected_btn = QPushButton("应用")
+        self.apply_selected_btn.clicked.connect(self._apply_current_settings_to_selected_photos)
+        apply_row.addWidget(self.apply_selected_btn)
+
+        self.apply_all_btn = QPushButton("全部应用")
+        self.apply_all_btn.clicked.connect(self._apply_current_settings_to_all_photos)
+        apply_row.addWidget(self.apply_all_btn)
+        output_form.addRow("裁切重载", apply_row)
 
         left_layout.addWidget(output_group)
 
@@ -2340,6 +2541,27 @@ class BirdStampEditorWindow(QMainWindow):
         self.show_original_size_check = QCheckBox("显示原尺寸图")
         self.show_original_size_check.toggled.connect(self._on_preview_scale_mode_toggled)
         preview_toolbar.addWidget(self.show_original_size_check)
+
+        self.show_crop_effect_check = QCheckBox("显示裁切效果")
+        self.show_crop_effect_check.setChecked(False)
+        self.show_crop_effect_check.toggled.connect(self._on_preview_toolbar_toggled)
+        preview_toolbar.addWidget(self.show_crop_effect_check)
+
+        self.crop_effect_alpha_label = QLabel("Alpha")
+        preview_toolbar.addWidget(self.crop_effect_alpha_label)
+
+        self.crop_effect_alpha_slider = QSlider(Qt.Orientation.Horizontal)
+        self.crop_effect_alpha_slider.setRange(0, 255)
+        self.crop_effect_alpha_slider.setSingleStep(1)
+        self.crop_effect_alpha_slider.setPageStep(16)
+        self.crop_effect_alpha_slider.setValue(_DEFAULT_CROP_EFFECT_ALPHA)
+        self.crop_effect_alpha_slider.setFixedWidth(120)
+        self.crop_effect_alpha_slider.valueChanged.connect(self._on_crop_effect_alpha_changed)
+        preview_toolbar.addWidget(self.crop_effect_alpha_slider)
+
+        self.crop_effect_alpha_value_label = QLabel(str(_DEFAULT_CROP_EFFECT_ALPHA))
+        self.crop_effect_alpha_value_label.setMinimumWidth(28)
+        preview_toolbar.addWidget(self.crop_effect_alpha_value_label)
 
         self.show_focus_box_check = QCheckBox("显示对焦点")
         self.show_focus_box_check.setChecked(True)
@@ -2473,10 +2695,19 @@ class BirdStampEditorWindow(QMainWindow):
             self.preview_bird_box = self._current_bird_box()
         else:
             self.preview_bird_box = None
+        if self.show_crop_effect_check.isChecked():
+            self.preview_crop_effect_box = self._current_crop_effect_box()
+        else:
+            self.preview_crop_effect_box = None
         self._refresh_preview_label(preserve_view=True)
 
     def _on_preview_scale_mode_toggled(self, _checked: bool) -> None:
         self._refresh_preview_label(preserve_view=True)
+
+    def _on_crop_effect_alpha_changed(self, value: int) -> None:
+        alpha = max(0, min(255, int(value)))
+        self.crop_effect_alpha_value_label.setText(str(alpha))
+        self.preview_label.set_crop_effect_alpha(alpha)
 
     def _start_bird_detector_preload(self) -> None:
         if self._bird_detector_preload_started:
@@ -2566,12 +2797,24 @@ class BirdStampEditorWindow(QMainWindow):
             return focus_box
 
         ratio = self._selected_ratio()
-        center_mode = str(self.center_mode_combo.currentData() or "image")
+        center_mode = self._selected_center_mode()
         anchor = (0.5, 0.5)
-        if center_mode == "focus":
+        if center_mode == _CENTER_MODE_FOCUS:
             focus_point = _extract_focus_point(self.current_raw_metadata, source_width, source_height)
             if focus_point is not None:
                 anchor = focus_point
+            else:
+                bird_box = self._current_bird_box()
+                if bird_box is not None:
+                    anchor = _box_center(bird_box)
+        elif center_mode == _CENTER_MODE_BIRD:
+            bird_box = self._current_bird_box()
+            if bird_box is not None:
+                anchor = _box_center(bird_box)
+            else:
+                focus_point = _extract_focus_point(self.current_raw_metadata, source_width, source_height)
+                if focus_point is not None:
+                    anchor = focus_point
 
         return _transform_focus_box_after_crop(
             focus_box,
@@ -2584,24 +2827,14 @@ class BirdStampEditorWindow(QMainWindow):
     def _current_bird_box(self) -> tuple[float, float, float, float] | None:
         if self.current_path is None or self.current_source_image is None:
             return None
-
-        signature = self._source_signature(self.current_path)
-        if signature in self._bird_box_cache:
-            return self._bird_box_cache[signature]
-
-        bird_box = _detect_primary_bird_box(self.current_source_image)
-        self._bird_box_cache[signature] = bird_box
-
-        if bird_box is None and not self._bird_detect_error_reported and _BIRD_DETECTOR_ERROR_MESSAGE:
-            self._set_status(f"鸟体识别不可用: {_BIRD_DETECTOR_ERROR_MESSAGE}")
-            self._bird_detect_error_reported = True
-        return bird_box
+        return self._bird_box_for_path(self.current_path, source_image=self.current_source_image)
 
     def _show_placeholder_preview(self) -> None:
         self.preview_pixmap = _pil_to_qpixmap(self.placeholder)
         self.preview_focus_box = None
         self.preview_focus_box_original = None
         self.preview_bird_box = None
+        self.preview_crop_effect_box = None
         self._invalidate_original_mode_cache()
         self._refresh_preview_label(reset_view=True)
 
@@ -2628,10 +2861,13 @@ class BirdStampEditorWindow(QMainWindow):
             preserve_view=preserve_view,
             preserve_scale=preserve_view,
         )
+        self.preview_label.set_crop_effect_alpha(self.crop_effect_alpha_slider.value())
+        self.preview_label.set_show_crop_effect(self.show_crop_effect_check.isChecked())
         self.preview_label.set_show_focus_box(self.show_focus_box_check.isChecked())
         self.preview_label.set_show_bird_box(self.show_bird_box_check.isChecked())
 
         display_pixmap: QPixmap | None = self.preview_pixmap
+        crop_effect_box = self.preview_crop_effect_box if self.preview_pixmap else None
         focus_box = self.preview_focus_box if self.preview_pixmap else None
         bird_box = self.preview_bird_box if self.preview_pixmap else None
         source_mode = "预览图"
@@ -2643,6 +2879,7 @@ class BirdStampEditorWindow(QMainWindow):
                 focus_box = self.preview_focus_box_original
                 source_mode = "原图"
 
+        self.preview_label.set_crop_effect_box(crop_effect_box)
         self.preview_label.set_focus_box(focus_box)
         self.preview_label.set_bird_box(bird_box)
         self.preview_label.set_source_pixmap(
@@ -2694,6 +2931,8 @@ class BirdStampEditorWindow(QMainWindow):
         preferred = dialog.current_template_name
         self._reload_template_combo(preferred=preferred)
         if self.current_path:
+            settings = self._render_settings_for_path(self.current_path, prefer_current_ui=False)
+            self._apply_render_settings_to_ui(settings)
             self.render_preview()
 
     def _pick_files(self) -> None:
@@ -2731,6 +2970,7 @@ class BirdStampEditorWindow(QMainWindow):
 
     def _add_photo_paths(self, paths: Iterable[Path]) -> None:
         existing_keys = {_path_key(path) for path in self._list_photo_paths()}
+        default_settings = self._build_current_render_settings()
         add_count = 0
 
         for incoming in paths:
@@ -2746,6 +2986,7 @@ class BirdStampEditorWindow(QMainWindow):
             item.setData(Qt.ItemDataRole.UserRole, str(path))
             item.setToolTip(str(path))
             self.photo_list.addItem(item)
+            self.photo_render_overrides[key] = self._clone_render_settings(default_settings)
             add_count += 1
 
         if add_count == 0:
@@ -2772,6 +3013,7 @@ class BirdStampEditorWindow(QMainWindow):
 
         for key in removed_keys:
             self.raw_metadata_cache.pop(key, None)
+            self.photo_render_overrides.pop(key, None)
         if removed_keys:
             self._bird_box_cache.clear()
 
@@ -2789,6 +3031,7 @@ class BirdStampEditorWindow(QMainWindow):
     def _clear_photos(self) -> None:
         self.photo_list.clear()
         self.raw_metadata_cache.clear()
+        self.photo_render_overrides.clear()
         self._bird_box_cache.clear()
         self.current_path = None
         self.current_source_image = None
@@ -2821,6 +3064,8 @@ class BirdStampEditorWindow(QMainWindow):
         self._invalidate_original_mode_cache()
         self.current_raw_metadata = self._load_raw_metadata(path)
         self.current_metadata_context = _build_metadata_context(path, self.current_raw_metadata)
+        settings = self._render_settings_for_path(path, prefer_current_ui=False)
+        self._apply_render_settings_to_ui(settings)
         self.current_file_label.setText(f"当前照片: {path}")
         self.render_preview()
 
@@ -2841,6 +3086,302 @@ class BirdStampEditorWindow(QMainWindow):
 
         self.raw_metadata_cache[key] = raw_metadata
         return raw_metadata
+
+    def _selected_center_mode(self) -> str:
+        return _normalize_center_mode(self.center_mode_combo.currentData())
+
+    def _build_current_render_settings(self) -> dict[str, Any]:
+        template_name = str(self.template_combo.currentText() or "default").strip() or "default"
+        template_payload = _normalize_template_payload(self.current_template_payload, fallback_name=template_name)
+        return {
+            "template_name": template_name,
+            "template_payload": _deep_copy_payload(template_payload),
+            "ratio": self._selected_ratio(),
+            "center_mode": self._selected_center_mode(),
+            "max_long_edge": self._selected_max_long_edge(),
+        }
+
+    def _clone_render_settings(self, settings: dict[str, Any]) -> dict[str, Any]:
+        template_name = str(settings.get("template_name") or "default").strip() or "default"
+        template_payload_raw = settings.get("template_payload")
+        if isinstance(template_payload_raw, dict):
+            template_payload = _normalize_template_payload(template_payload_raw, fallback_name=template_name)
+        else:
+            template_payload = _default_template_payload(name=template_name)
+
+        ratio: float | None
+        ratio_raw = settings.get("ratio")
+        if ratio_raw is None:
+            ratio = None
+        else:
+            try:
+                ratio = float(ratio_raw)
+            except Exception:
+                ratio = None
+            if ratio is not None and ratio <= 0:
+                ratio = None
+
+        max_long_edge = 0
+        try:
+            max_long_edge = int(settings.get("max_long_edge", 0))
+        except Exception:
+            max_long_edge = 0
+        max_long_edge = max(0, max_long_edge)
+
+        return {
+            "template_name": template_name,
+            "template_payload": _deep_copy_payload(template_payload),
+            "ratio": ratio,
+            "center_mode": _normalize_center_mode(settings.get("center_mode")),
+            "max_long_edge": max_long_edge,
+        }
+
+    def _normalize_render_settings(self, raw: Any, fallback: dict[str, Any]) -> dict[str, Any]:
+        settings = self._clone_render_settings(fallback)
+        if not isinstance(raw, dict):
+            return settings
+
+        template_name = str(raw.get("template_name") or settings["template_name"]).strip() or settings["template_name"]
+        settings["template_name"] = template_name
+        payload_raw = raw.get("template_payload")
+        if isinstance(payload_raw, dict):
+            settings["template_payload"] = _normalize_template_payload(payload_raw, fallback_name=template_name)
+
+        ratio_raw = raw.get("ratio")
+        if ratio_raw is None or ratio_raw == "":
+            settings["ratio"] = None
+        else:
+            try:
+                ratio = float(ratio_raw)
+            except Exception:
+                ratio = settings["ratio"]
+            else:
+                settings["ratio"] = ratio if ratio > 0 else None
+
+        if "center_mode" in raw:
+            settings["center_mode"] = _normalize_center_mode(raw.get("center_mode"))
+
+        if "max_long_edge" in raw:
+            try:
+                parsed_max_edge = int(raw.get("max_long_edge"))
+            except Exception:
+                parsed_max_edge = int(settings["max_long_edge"])
+            settings["max_long_edge"] = max(0, parsed_max_edge)
+        return settings
+
+    def _render_settings_for_path(self, path: Path | None, *, prefer_current_ui: bool) -> dict[str, Any]:
+        fallback = self._build_current_render_settings()
+        if path is None:
+            return fallback
+        key = _path_key(path)
+        if prefer_current_ui and self.current_path is not None and key == _path_key(self.current_path):
+            return fallback
+        return self._normalize_render_settings(self.photo_render_overrides.get(key), fallback=fallback)
+
+    def _ratio_combo_index_for_value(self, ratio: float | None) -> int:
+        for idx in range(self.ratio_combo.count()):
+            data = self.ratio_combo.itemData(idx)
+            if data is None and ratio is None:
+                return idx
+            if data is None or ratio is None:
+                continue
+            try:
+                if abs(float(data) - float(ratio)) <= 0.0001:
+                    return idx
+            except Exception:
+                continue
+        return -1
+
+    def _ensure_max_edge_option(self, max_edge: int) -> int:
+        edge = max(0, int(max_edge))
+        idx = self.max_edge_combo.findData(edge)
+        if idx >= 0:
+            return idx
+        label = "不限制" if edge == 0 else str(edge)
+        self.max_edge_combo.addItem(label, edge)
+        return self.max_edge_combo.findData(edge)
+
+    def _apply_render_settings_to_ui(self, settings: dict[str, Any]) -> None:
+        normalized = self._clone_render_settings(settings)
+        template_name = str(normalized["template_name"])
+
+        self.template_combo.blockSignals(True)
+        self.ratio_combo.blockSignals(True)
+        self.center_mode_combo.blockSignals(True)
+        self.max_edge_combo.blockSignals(True)
+        try:
+            template_idx = self.template_combo.findText(template_name)
+            if template_idx >= 0:
+                self.template_combo.setCurrentIndex(template_idx)
+
+            ratio_idx = self._ratio_combo_index_for_value(normalized["ratio"])
+            if ratio_idx >= 0:
+                self.ratio_combo.setCurrentIndex(ratio_idx)
+
+            center_idx = self.center_mode_combo.findData(normalized["center_mode"])
+            if center_idx >= 0:
+                self.center_mode_combo.setCurrentIndex(center_idx)
+
+            max_edge_idx = self._ensure_max_edge_option(int(normalized["max_long_edge"]))
+            if max_edge_idx >= 0:
+                self.max_edge_combo.setCurrentIndex(max_edge_idx)
+        finally:
+            self.max_edge_combo.blockSignals(False)
+            self.center_mode_combo.blockSignals(False)
+            self.ratio_combo.blockSignals(False)
+            self.template_combo.blockSignals(False)
+
+        self.current_template_payload = _normalize_template_payload(
+            normalized["template_payload"],
+            fallback_name=template_name,
+        )
+
+    def _selected_photo_paths(self) -> list[Path]:
+        selected_items = self.photo_list.selectedItems()
+        paths: list[Path] = []
+        if selected_items:
+            for item in selected_items:
+                raw = item.data(Qt.ItemDataRole.UserRole)
+                if isinstance(raw, str):
+                    paths.append(Path(raw))
+        elif self.current_path is not None:
+            paths.append(self.current_path)
+
+        ordered: list[Path] = []
+        seen: set[str] = set()
+        for path in paths:
+            key = _path_key(path)
+            if key in seen:
+                continue
+            seen.add(key)
+            ordered.append(path)
+        return ordered
+
+    def _apply_current_settings_to_selected_photos(self) -> None:
+        targets = self._selected_photo_paths()
+        if not targets:
+            self._set_status("请先选择要应用设置的照片。")
+            return
+
+        snapshot = self._build_current_render_settings()
+        for path in targets:
+            self.photo_render_overrides[_path_key(path)] = self._clone_render_settings(snapshot)
+
+        if self.current_path is not None:
+            current_key = _path_key(self.current_path)
+            if any(_path_key(path) == current_key for path in targets):
+                self.render_preview()
+
+        self._set_status(f"已将当前裁切重载设置应用到 {len(targets)} 张照片。")
+
+    def _apply_current_settings_to_all_photos(self) -> None:
+        targets = self._list_photo_paths()
+        if not targets:
+            self._set_status("照片列表为空。")
+            return
+
+        snapshot = self._build_current_render_settings()
+        for path in targets:
+            self.photo_render_overrides[_path_key(path)] = self._clone_render_settings(snapshot)
+
+        if self.current_path is not None:
+            self.render_preview()
+        self._set_status(f"已将当前裁切重载设置应用到全部 {len(targets)} 张照片。")
+
+    def _bird_box_for_path(self, path: Path, *, source_image: Image.Image | None = None) -> tuple[float, float, float, float] | None:
+        signature = self._source_signature(path)
+        if signature in self._bird_box_cache:
+            return self._bird_box_cache[signature]
+
+        image = source_image
+        if image is None:
+            try:
+                image = decode_image(path, decoder="auto")
+            except Exception:
+                self._bird_box_cache[signature] = None
+                return None
+
+        bird_box = _detect_primary_bird_box(image)
+        self._bird_box_cache[signature] = bird_box
+        if bird_box is None and not self._bird_detect_error_reported and _BIRD_DETECTOR_ERROR_MESSAGE:
+            self._set_status(f"鸟体识别不可用: {_BIRD_DETECTOR_ERROR_MESSAGE}")
+            self._bird_detect_error_reported = True
+        return bird_box
+
+    def _resolve_crop_anchor_and_keep_box(
+        self,
+        *,
+        path: Path | None,
+        image: Image.Image,
+        raw_metadata: dict[str, Any],
+        center_mode: str,
+    ) -> tuple[tuple[float, float], tuple[float, float, float, float] | None]:
+        focus_point = _extract_focus_point(raw_metadata, image.width, image.height)
+        bird_box: tuple[float, float, float, float] | None = None
+        if path is not None:
+            bird_box = self._bird_box_for_path(path, source_image=image)
+
+        mode = _normalize_center_mode(center_mode)
+        anchor = (0.5, 0.5)
+        if mode == _CENTER_MODE_FOCUS:
+            if focus_point is not None:
+                anchor = focus_point
+            elif bird_box is not None:
+                anchor = _box_center(bird_box)
+        elif mode == _CENTER_MODE_BIRD:
+            if bird_box is not None:
+                anchor = _box_center(bird_box)
+            elif focus_point is not None:
+                anchor = focus_point
+        return (anchor, bird_box)
+
+    def _compute_crop_box_for_image(
+        self,
+        *,
+        path: Path | None,
+        image: Image.Image,
+        raw_metadata: dict[str, Any],
+        settings: dict[str, Any],
+    ) -> tuple[float, float, float, float] | None:
+        ratio_raw = settings.get("ratio")
+        ratio: float | None
+        if ratio_raw is None:
+            ratio = None
+        else:
+            try:
+                ratio = float(ratio_raw)
+            except Exception:
+                ratio = None
+        if ratio is None or ratio <= 0:
+            return None
+
+        anchor, keep_box = self._resolve_crop_anchor_and_keep_box(
+            path=path,
+            image=image,
+            raw_metadata=raw_metadata,
+            center_mode=str(settings.get("center_mode") or _CENTER_MODE_IMAGE),
+        )
+        crop_box = _compute_ratio_crop_box(
+            width=image.width,
+            height=image.height,
+            ratio=ratio,
+            anchor=anchor,
+            keep_box=keep_box,
+        )
+        if not _crop_box_has_effect(crop_box):
+            return None
+        return crop_box
+
+    def _current_crop_effect_box(self) -> tuple[float, float, float, float] | None:
+        if self.current_path is None or self.current_source_image is None:
+            return None
+        settings = self._render_settings_for_path(self.current_path, prefer_current_ui=True)
+        return self._compute_crop_box_for_image(
+            path=self.current_path,
+            image=self.current_source_image,
+            raw_metadata=self.current_raw_metadata,
+            settings=settings,
+        )
 
     def _selected_ratio(self) -> float | None:
         value = self.ratio_combo.currentData()
@@ -2872,24 +3413,25 @@ class BirdStampEditorWindow(QMainWindow):
         image: Image.Image,
         raw_metadata: dict[str, Any],
         *,
+        settings: dict[str, Any],
+        source_path: Path | None,
         apply_ratio_crop: bool = True,
     ) -> Image.Image:
-        ratio = self._selected_ratio()
-        center_mode = str(self.center_mode_combo.currentData() or "image")
+        if apply_ratio_crop:
+            crop_box = self._compute_crop_box_for_image(
+                path=source_path,
+                image=image,
+                raw_metadata=raw_metadata,
+                settings=settings,
+            )
+            image = _crop_image_by_normalized_box(image, crop_box)
 
-        if apply_ratio_crop and ratio is not None and ratio > 0:
-            anchor = (0.5, 0.5)
-            if center_mode == "focus":
-                focus = _extract_focus_point(raw_metadata, image.width, image.height)
-                if focus is not None:
-                    anchor = focus
-            image = _crop_to_ratio_with_anchor(image, ratio, anchor)
-
-        max_long_edge = self._selected_max_long_edge()
+        max_long_edge = max(0, int(settings.get("max_long_edge") or 0))
         image = _resize_fit(image, max_long_edge)
         return image
 
-    def _render_for_path(self, path: Path) -> Image.Image:
+    def _render_for_path(self, path: Path, *, prefer_current_ui: bool) -> Image.Image:
+        settings = self._render_settings_for_path(path, prefer_current_ui=prefer_current_ui)
         if self.current_path and path == self.current_path and self.current_source_image is not None:
             source_image = self.current_source_image.copy()
             raw_metadata = dict(self.current_raw_metadata)
@@ -2899,12 +3441,18 @@ class BirdStampEditorWindow(QMainWindow):
             raw_metadata = self._load_raw_metadata(path)
             context = _build_metadata_context(path, raw_metadata)
 
-        processed = self._build_processed_image(source_image, raw_metadata, apply_ratio_crop=True)
+        processed = self._build_processed_image(
+            source_image,
+            raw_metadata,
+            settings=settings,
+            source_path=path,
+            apply_ratio_crop=True,
+        )
         rendered = render_template_overlay(
             processed,
             raw_metadata=raw_metadata,
             metadata_context=context,
-            template_payload=self.current_template_payload,
+            template_payload=settings["template_payload"],
         )
         return rendered
 
@@ -2917,21 +3465,29 @@ class BirdStampEditorWindow(QMainWindow):
         try:
             if self.current_source_image is None:
                 raise RuntimeError("缺少当前原图数据")
+            settings = self._render_settings_for_path(self.current_path, prefer_current_ui=True)
             source_image = self.current_source_image.copy()
             raw_metadata = dict(self.current_raw_metadata)
             context = dict(self.current_metadata_context)
             # 预览图始终保持原图长宽比，仅进行尺寸缩放。
-            processed = self._build_processed_image(source_image, raw_metadata, apply_ratio_crop=False)
+            processed = self._build_processed_image(
+                source_image,
+                raw_metadata,
+                settings=settings,
+                source_path=self.current_path,
+                apply_ratio_crop=False,
+            )
             rendered = render_template_overlay(
                 processed,
                 raw_metadata=raw_metadata,
                 metadata_context=context,
-                template_payload=self.current_template_payload,
+                template_payload=settings["template_payload"],
             )
         except Exception as exc:
             self.preview_focus_box = None
             self.preview_focus_box_original = None
             self.preview_bird_box = None
+            self.preview_crop_effect_box = None
             self._show_error("预览失败", str(exc))
             self._set_status(f"预览失败: {exc}")
             return
@@ -2947,6 +3503,10 @@ class BirdStampEditorWindow(QMainWindow):
             self.preview_bird_box = self._current_bird_box()
         else:
             self.preview_bird_box = None
+        if self.show_crop_effect_check.isChecked():
+            self.preview_crop_effect_box = self._current_crop_effect_box()
+        else:
+            self.preview_crop_effect_box = None
         self.preview_pixmap = _pil_to_qpixmap(rendered)
         self._refresh_preview_label(reset_view=True)
         self._set_status(f"预览完成: {rendered.width}x{rendered.height}")
@@ -2957,7 +3517,7 @@ class BirdStampEditorWindow(QMainWindow):
             return
 
         try:
-            rendered = self._render_for_path(self.current_path)
+            rendered = self._render_for_path(self.current_path, prefer_current_ui=True)
         except Exception as exc:
             self._show_error("导出失败", str(exc))
             return
@@ -3005,7 +3565,7 @@ class BirdStampEditorWindow(QMainWindow):
 
         for path in paths:
             try:
-                rendered = self._render_for_path(path)
+                rendered = self._render_for_path(path, prefer_current_ui=False)
                 stem = f"{path.stem}__birdstamp"
                 count = stem_counter.get(stem, 0)
                 stem_counter[stem] = count + 1
