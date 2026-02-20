@@ -12,7 +12,7 @@ from importlib import resources
 from pathlib import Path
 from typing import Any, Iterable
 
-from PIL import Image, ImageColor, ImageDraw
+from PIL import Image, ImageColor, ImageDraw, ImageOps
 from PyQt6.QtCore import QEvent, QPointF, QRectF, Qt, pyqtSignal
 from PyQt6.QtGui import QAction, QColor, QImage, QKeySequence, QPainter, QPainterPath, QPalette, QPen, QPixmap
 from PyQt6.QtWidgets import (
@@ -23,6 +23,7 @@ from PyQt6.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QInputDialog,
@@ -55,7 +56,7 @@ ALIGN_OPTIONS_HORIZONTAL = ("left", "center", "right")
 _FALLBACK_STYLE_OPTIONS = ("normal",)
 _FALLBACK_RATIO_OPTIONS: list[tuple[str, float | None]] = [("原比例", None)]
 _FALLBACK_MAX_LONG_EDGE_OPTIONS = [0]
-_FALLBACK_OUTPUT_FORMAT_OPTIONS: list[tuple[str, str]] = [("jpg", "JPG")]
+_FALLBACK_OUTPUT_FORMAT_OPTIONS: list[tuple[str, str]] = [("png", "PNG"), ("jpg", "JPG")]
 _FALLBACK_COLOR_PRESETS: list[tuple[str, str]] = [("白色", "#FFFFFF"), ("黑色", "#111111")]
 _FALLBACK_DEFAULT_FIELD_TAG = "EXIF:Model"
 _FALLBACK_TAG_OPTIONS: list[tuple[str, str]] = [("机身型号 (EXIF)", "EXIF:Model")]
@@ -71,6 +72,7 @@ _CENTER_MODE_FOCUS = "focus"
 _CENTER_MODE_BIRD = "bird"
 _CENTER_MODE_OPTIONS = (_CENTER_MODE_IMAGE, _CENTER_MODE_FOCUS, _CENTER_MODE_BIRD)
 _DEFAULT_CROP_EFFECT_ALPHA = 160
+_DEFAULT_CROP_PADDING_PX = 0
 
 
 @lru_cache(maxsize=1)
@@ -568,6 +570,88 @@ def _transform_focus_box_after_crop(
     return (left_n, top_n, right_n, bottom_n)
 
 
+def _normalized_box_to_pixel_box(
+    box: tuple[float, float, float, float] | None,
+    width: int,
+    height: int,
+    *,
+    fallback_full: bool = False,
+) -> tuple[int, int, int, int] | None:
+    if width <= 0 or height <= 0:
+        return None
+    normalized = _normalize_unit_box(box)
+    if normalized is None:
+        if not fallback_full:
+            return None
+        normalized = (0.0, 0.0, 1.0, 1.0)
+
+    left = int(round(normalized[0] * width))
+    top = int(round(normalized[1] * height))
+    right = int(round(normalized[2] * width))
+    bottom = int(round(normalized[3] * height))
+
+    left = max(0, min(width - 1, left))
+    top = max(0, min(height - 1, top))
+    right = max(left + 1, min(width, right))
+    bottom = max(top + 1, min(height, bottom))
+    return (left, top, right, bottom)
+
+
+def _transform_source_box_after_crop_padding(
+    source_box: tuple[float, float, float, float] | None,
+    *,
+    crop_box: tuple[float, float, float, float] | None,
+    source_width: int,
+    source_height: int,
+    pt: int,
+    pb: int,
+    pl: int,
+    pr: int,
+) -> tuple[float, float, float, float] | None:
+    source_px = _normalized_box_to_pixel_box(source_box, source_width, source_height)
+    if source_px is None:
+        return None
+    crop_px = _normalized_box_to_pixel_box(crop_box, source_width, source_height, fallback_full=True)
+    if crop_px is None:
+        return None
+
+    crop_left, crop_top, crop_right, crop_bottom = crop_px
+    crop_w = crop_right - crop_left
+    crop_h = crop_bottom - crop_top
+    if crop_w <= 0 or crop_h <= 0:
+        return None
+
+    pad_top = max(0, int(pt))
+    pad_bottom = max(0, int(pb))
+    pad_left = max(0, int(pl))
+    pad_right = max(0, int(pr))
+    padded_w = crop_w + pad_left + pad_right
+    padded_h = crop_h + pad_top + pad_bottom
+    if padded_w <= 0 or padded_h <= 0:
+        return None
+
+    src_left, src_top, src_right, src_bottom = source_px
+    clipped_left = max(crop_left, min(crop_right, src_left))
+    clipped_top = max(crop_top, min(crop_bottom, src_top))
+    clipped_right = max(crop_left, min(crop_right, src_right))
+    clipped_bottom = max(crop_top, min(crop_bottom, src_bottom))
+    if clipped_right <= clipped_left or clipped_bottom <= clipped_top:
+        return None
+
+    mapped_left = (pad_left + (clipped_left - crop_left)) / float(padded_w)
+    mapped_top = (pad_top + (clipped_top - crop_top)) / float(padded_h)
+    mapped_right = (pad_left + (clipped_right - crop_left)) / float(padded_w)
+    mapped_bottom = (pad_top + (clipped_bottom - crop_top)) / float(padded_h)
+
+    left_n = _clamp01(mapped_left)
+    top_n = _clamp01(mapped_top)
+    right_n = _clamp01(mapped_right)
+    bottom_n = _clamp01(mapped_bottom)
+    if right_n <= left_n or bottom_n <= top_n:
+        return None
+    return (left_n, top_n, right_n, bottom_n)
+
+
 def _resize_fit(image: Image.Image, max_long_edge: int) -> Image.Image:
     if max_long_edge <= 0:
         return image
@@ -578,6 +662,79 @@ def _resize_fit(image: Image.Image, max_long_edge: int) -> Image.Image:
     scale = max_long_edge / float(long_edge)
     new_size = (max(1, int(round(width * scale))), max(1, int(round(height * scale))))
     return image.resize(new_size, Image.Resampling.LANCZOS)
+
+
+def _pad_image(
+    image: Image.Image,
+    top: int,
+    bottom: int,
+    left: int,
+    right: int,
+    fill: str = "#FFFFFF",
+) -> Image.Image:
+    """在图像四周添加填充。top/bottom/left/right 为像素数。"""
+    if top <= 0 and bottom <= 0 and left <= 0 and right <= 0:
+        return image
+    top = max(0, top)
+    bottom = max(0, bottom)
+    left = max(0, left)
+    right = max(0, right)
+    rgb = ImageColor.getrgb(fill)
+    if image.mode == "RGBA":
+        fill_color: tuple[int, ...] = (*rgb, 255)
+    elif image.mode == "L":
+        fill_color = (int(0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2]),)
+    else:
+        fill_color = rgb
+    return ImageOps.expand(image, border=(left, top, right, bottom), fill=fill_color)
+
+
+def _parse_ratio_value(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        ratio = float(value)
+    except Exception:
+        return None
+    if ratio <= 0:
+        return None
+    return ratio
+
+
+def _parse_bool_value(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
+
+
+def _expand_unit_box_to_unclamped_pixels(
+    box: tuple[float, float, float, float] | None,
+    *,
+    width: int,
+    height: int,
+    top: int,
+    bottom: int,
+    left: int,
+    right: int,
+) -> tuple[float, float, float, float] | None:
+    normalized = _normalize_unit_box(box)
+    if normalized is None or width <= 0 or height <= 0:
+        return None
+    return (
+        normalized[0] * width - max(0, int(left)),
+        normalized[1] * height - max(0, int(top)),
+        normalized[2] * width + max(0, int(right)),
+        normalized[3] * height + max(0, int(bottom)),
+    )
 
 
 def _normalize_center_mode(value: Any) -> str:
@@ -714,21 +871,12 @@ def _crop_image_by_normalized_box(
     image: Image.Image,
     crop_box: tuple[float, float, float, float] | None,
 ) -> Image.Image:
-    normalized = _normalize_unit_box(crop_box)
-    if normalized is None:
-        return image
     width, height = image.size
-    if width <= 0 or height <= 0:
+    crop_px = _normalized_box_to_pixel_box(crop_box, width, height)
+    if crop_px is None:
         return image
 
-    left = int(round(normalized[0] * width))
-    top = int(round(normalized[1] * height))
-    right = int(round(normalized[2] * width))
-    bottom = int(round(normalized[3] * height))
-    left = max(0, min(width - 1, left))
-    top = max(0, min(height - 1, top))
-    right = max(left + 1, min(width, right))
-    bottom = max(top + 1, min(height, bottom))
+    left, top, right, bottom = crop_px
     if left <= 0 and top <= 0 and right >= width and bottom >= height:
         return image
     return image.crop((left, top, right, bottom))
@@ -2401,6 +2549,21 @@ class BirdStampEditorWindow(QMainWindow):
         left_layout.setContentsMargins(8, 8, 8, 8)
         left_layout.setSpacing(8)
 
+        self._setup_ui_photos_list(left_layout)
+        self._setup_ui_template_output_actions(left_layout)
+
+        right_panel = self._setup_ui_preview_panel()
+
+        splitter.addWidget(left_panel)
+        splitter.addWidget(right_panel)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([500, 920])
+
+        self.setStatusBar(self.statusBar())
+
+    def _setup_ui_photos_list(self, left_layout: QVBoxLayout) -> None:
+        """构建左侧「照片列表」分组 UI。"""
         photos_group = QGroupBox("照片列表")
         photos_layout = QVBoxLayout(photos_group)
         photos_layout.setSpacing(6)
@@ -2435,6 +2598,8 @@ class BirdStampEditorWindow(QMainWindow):
 
         left_layout.addWidget(photos_group, stretch=2)
 
+    def _setup_ui_template_output_actions(self, left_layout: QVBoxLayout) -> None:
+        """构建左侧「模板」「输出设置」「操作」分组 UI。"""
         template_group = QGroupBox("模板")
         template_layout = QHBoxLayout(template_group)
 
@@ -2455,6 +2620,7 @@ class BirdStampEditorWindow(QMainWindow):
             self.output_format_combo.addItem(label, suffix)
         if self.output_format_combo.count() == 0:
             self.output_format_combo.addItem("JPG", "jpg")
+            self.output_format_combo.addItem("PNG", "png")
         output_form.addRow("输出格式", self.output_format_combo)
 
         self.max_edge_combo = QComboBox()
@@ -2491,11 +2657,64 @@ class BirdStampEditorWindow(QMainWindow):
         output_form.addRow("裁切比例", self.ratio_combo)
 
         self.center_mode_combo = QComboBox()
-        self.center_mode_combo.addItem("中心", _CENTER_MODE_IMAGE)
-        self.center_mode_combo.addItem("焦点", _CENTER_MODE_FOCUS)
         self.center_mode_combo.addItem("鸟体", _CENTER_MODE_BIRD)
+        self.center_mode_combo.addItem("焦点", _CENTER_MODE_FOCUS)
+        self.center_mode_combo.addItem("图像中心", _CENTER_MODE_IMAGE)
         self.center_mode_combo.currentIndexChanged.connect(self.render_preview)
         output_form.addRow("裁切中心", self.center_mode_combo)
+
+        self.auto_crop_by_bird_check = QCheckBox("自动根据鸟体计算")
+        self.auto_crop_by_bird_check.setChecked(False)
+        self.auto_crop_by_bird_check.toggled.connect(self._on_auto_crop_by_bird_toggled)
+        output_form.addRow("裁切策略", self.auto_crop_by_bird_check)
+
+        crop_padding_widget = QWidget()
+        crop_padding_grid = QGridLayout(crop_padding_widget)
+        crop_padding_grid.setContentsMargins(0, 4, 0, 4)
+        crop_padding_grid.setSpacing(6)
+        pad_default = _DEFAULT_CROP_PADDING_PX
+        self.crop_padding_top = QSpinBox()
+        self.crop_padding_top.setRange(0, 9999)
+        self.crop_padding_top.setValue(pad_default)
+        self.crop_padding_top.setSuffix(" px")
+        self.crop_padding_top.setAccessibleName("裁切边界内填充-上")
+        self.crop_padding_top.valueChanged.connect(self.render_preview)
+        crop_padding_grid.addWidget(self.crop_padding_top, 0, 1, Qt.AlignmentFlag.AlignCenter)
+        self.crop_padding_left = QSpinBox()
+        self.crop_padding_left.setRange(0, 9999)
+        self.crop_padding_left.setValue(pad_default)
+        self.crop_padding_left.setSuffix(" px")
+        self.crop_padding_left.setAccessibleName("裁切边界内填充-左")
+        self.crop_padding_left.valueChanged.connect(self.render_preview)
+        crop_padding_grid.addWidget(self.crop_padding_left, 1, 0, Qt.AlignmentFlag.AlignCenter)
+        self.crop_padding_right = QSpinBox()
+        self.crop_padding_right.setRange(0, 9999)
+        self.crop_padding_right.setValue(pad_default)
+        self.crop_padding_right.setSuffix(" px")
+        self.crop_padding_right.setAccessibleName("裁切边界内填充-右")
+        self.crop_padding_right.valueChanged.connect(self.render_preview)
+        crop_padding_grid.addWidget(self.crop_padding_right, 1, 2, Qt.AlignmentFlag.AlignCenter)
+        self.crop_padding_bottom = QSpinBox()
+        self.crop_padding_bottom.setRange(0, 9999)
+        self.crop_padding_bottom.setValue(pad_default)
+        self.crop_padding_bottom.setSuffix(" px")
+        self.crop_padding_bottom.setAccessibleName("裁切边界内填充-下")
+        self.crop_padding_bottom.valueChanged.connect(self.render_preview)
+        crop_padding_grid.addWidget(self.crop_padding_bottom, 2, 1, Qt.AlignmentFlag.AlignCenter)
+        output_form.addRow("裁切边界内填充（像素）", crop_padding_widget)
+
+        self.crop_padding_fill_combo = QComboBox()
+        for label, value in COLOR_PRESETS:
+            self.crop_padding_fill_combo.addItem(label, value)
+        if self.crop_padding_fill_combo.count() == 0:
+            self.crop_padding_fill_combo.addItem("白色", "#FFFFFF")
+        idx_white = self.crop_padding_fill_combo.findData("#FFFFFF")
+        if idx_white >= 0:
+            self.crop_padding_fill_combo.setCurrentIndex(idx_white)
+        self.crop_padding_fill_combo.currentIndexChanged.connect(self.render_preview)
+        self.crop_padding_fill_combo.setToolTip("自动根据鸟体计算时用于图像外圈自动填充色。")
+        output_form.addRow("裁切边界填充色", self.crop_padding_fill_combo)
+        self._set_inner_padding_controls_enabled(False)
 
         apply_row = QHBoxLayout()
         self.apply_selected_btn = QPushButton("应用")
@@ -2511,9 +2730,6 @@ class BirdStampEditorWindow(QMainWindow):
 
         actions_group = QGroupBox("操作")
         actions_layout = QHBoxLayout(actions_group)
-        preview_btn = QPushButton("预览")
-        preview_btn.clicked.connect(self.render_preview)
-        actions_layout.addWidget(preview_btn)
 
         export_current_btn = QPushButton("导出当前")
         export_current_btn.clicked.connect(self.export_current)
@@ -2526,6 +2742,8 @@ class BirdStampEditorWindow(QMainWindow):
 
         left_layout.addStretch(1)
 
+    def _setup_ui_preview_panel(self) -> QWidget:
+        """构建右侧「预览区」UI，返回该面板 QWidget。"""
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
         right_layout.setContentsMargins(8, 8, 8, 8)
@@ -2583,13 +2801,7 @@ class BirdStampEditorWindow(QMainWindow):
         self.preview_info_label.setObjectName("PreviewInfoLabel")
         right_layout.addWidget(self.preview_info_label)
 
-        splitter.addWidget(left_panel)
-        splitter.addWidget(right_panel)
-        splitter.setStretchFactor(0, 0)
-        splitter.setStretchFactor(1, 1)
-        splitter.setSizes([500, 920])
-
-        self.setStatusBar(self.statusBar())
+        return right_panel
 
     def _setup_shortcuts(self) -> None:
         action_add = QAction(self)
@@ -2691,14 +2903,6 @@ class BirdStampEditorWindow(QMainWindow):
         super().changeEvent(event)
 
     def _on_preview_toolbar_toggled(self, _checked: bool) -> None:
-        if self.show_bird_box_check.isChecked():
-            self.preview_bird_box = self._current_bird_box()
-        else:
-            self.preview_bird_box = None
-        if self.show_crop_effect_check.isChecked():
-            self.preview_crop_effect_box = self._current_crop_effect_box()
-        else:
-            self.preview_crop_effect_box = None
         self._refresh_preview_label(preserve_view=True)
 
     def _on_preview_scale_mode_toggled(self, _checked: bool) -> None:
@@ -2708,6 +2912,17 @@ class BirdStampEditorWindow(QMainWindow):
         alpha = max(0, min(255, int(value)))
         self.crop_effect_alpha_value_label.setText(str(alpha))
         self.preview_label.set_crop_effect_alpha(alpha)
+
+    def _set_inner_padding_controls_enabled(self, enabled: bool) -> None:
+        self.crop_padding_top.setEnabled(enabled)
+        self.crop_padding_bottom.setEnabled(enabled)
+        self.crop_padding_left.setEnabled(enabled)
+        self.crop_padding_right.setEnabled(enabled)
+        self.crop_padding_fill_combo.setEnabled(enabled)
+
+    def _on_auto_crop_by_bird_toggled(self, checked: bool) -> None:
+        self._set_inner_padding_controls_enabled(bool(checked))
+        self.render_preview()
 
     def _start_bird_detector_preload(self) -> None:
         if self._bird_detector_preload_started:
@@ -2741,11 +2956,29 @@ class BirdStampEditorWindow(QMainWindow):
         self._original_mode_signature = None
         self._original_mode_pixmap = None
 
+    def _original_mode_cache_key(self) -> str:
+        """原尺寸图缓存键：含源图与裁切/填充设置，任一变化即失效。"""
+        if self.current_path is None:
+            return ""
+        base = self._source_signature(self.current_path)
+        r = self._selected_ratio()
+        cm = self._selected_center_mode()
+        auto_crop = bool(self.auto_crop_by_bird_check.isChecked())
+        pt = self.crop_padding_top.value()
+        pb = self.crop_padding_bottom.value()
+        pl = self.crop_padding_left.value()
+        pr = self.crop_padding_right.value()
+        fill = getattr(self, "crop_padding_fill_combo", None)
+        fill_val = fill.currentData() if fill is not None and fill.currentData() else "#FFFFFF"
+        return f"{base}|{r}|{cm}|{auto_crop}|{pt}_{pb}_{pl}_{pr}|{fill_val}"
+
     def _load_original_mode_pixmap(self) -> QPixmap | None:
         if self.current_path is None or self.current_source_image is None:
             return None
 
-        signature = self._source_signature(self.current_path)
+        signature = self._original_mode_cache_key()
+        if not signature:
+            return None
         if (
             self._original_mode_signature == signature
             and self._original_mode_pixmap is not None
@@ -2753,7 +2986,27 @@ class BirdStampEditorWindow(QMainWindow):
         ):
             return self._original_mode_pixmap
 
-        # 优先直接使用原图像内存绘制，避免额外中间文件。
+        settings = self._render_settings_for_path(self.current_path, prefer_current_ui=True)
+        original_settings = self._clone_render_settings(settings)
+        original_settings["max_long_edge"] = 0
+        try:
+            # 原尺寸模式显示未裁切预览源，仅保持原始分辨率。
+            img = self._build_processed_image(
+                self.current_source_image.copy(),
+                dict(self.current_raw_metadata),
+                settings=original_settings,
+                source_path=self.current_path,
+                apply_ratio_crop=False,
+            )
+            direct_pixmap = _pil_to_qpixmap(img)
+            if not direct_pixmap.isNull():
+                self._original_mode_signature = signature
+                self._original_mode_pixmap = direct_pixmap
+                return direct_pixmap
+        except Exception:
+            pass
+
+        # 处理失败时退回原图，避免界面无预览。
         try:
             direct_pixmap = _pil_to_qpixmap(self.current_source_image)
             if not direct_pixmap.isNull():
@@ -2762,66 +3015,46 @@ class BirdStampEditorWindow(QMainWindow):
                 return direct_pixmap
         except Exception:
             pass
-
-        cache_path = self._preview_cache_file_for_source(self.current_path, signature)
-        if cache_path.exists():
-            cached = QPixmap(str(cache_path))
-            if not cached.isNull():
-                self._original_mode_signature = signature
-                self._original_mode_pixmap = cached
-                return cached
-
-        # 直接绘制不可用时，落盘到原图目录下 .preview 并复用。
-        try:
-            cache_path.parent.mkdir(parents=True, exist_ok=True)
-            if not cache_path.exists():
-                self.current_source_image.save(cache_path, format="PNG", optimize=True)
-            cached = QPixmap(str(cache_path))
-            if not cached.isNull():
-                self._original_mode_signature = signature
-                self._original_mode_pixmap = cached
-                return cached
-        except Exception:
-            return None
         return None
 
     def _current_focus_box_after_processing(self, *, apply_ratio_crop: bool = True) -> tuple[float, float, float, float] | None:
-        if self.current_source_image is None:
+        if self.current_path is None or self.current_source_image is None:
             return None
 
         source_width, source_height = self.current_source_image.size
-        focus_box = _extract_focus_box(self.current_raw_metadata, source_width, source_height)
-        if focus_box is None:
+        focus_box_source = _extract_focus_box(self.current_raw_metadata, source_width, source_height)
+        if focus_box_source is None:
             return None
-        if not apply_ratio_crop:
-            return focus_box
 
-        ratio = self._selected_ratio()
-        center_mode = self._selected_center_mode()
-        anchor = (0.5, 0.5)
-        if center_mode == _CENTER_MODE_FOCUS:
-            focus_point = _extract_focus_point(self.current_raw_metadata, source_width, source_height)
-            if focus_point is not None:
-                anchor = focus_point
-            else:
-                bird_box = self._current_bird_box()
-                if bird_box is not None:
-                    anchor = _box_center(bird_box)
-        elif center_mode == _CENTER_MODE_BIRD:
-            bird_box = self._current_bird_box()
-            if bird_box is not None:
-                anchor = _box_center(bird_box)
-            else:
-                focus_point = _extract_focus_point(self.current_raw_metadata, source_width, source_height)
-                if focus_point is not None:
-                    anchor = focus_point
-
-        return _transform_focus_box_after_crop(
-            focus_box,
+        settings = self._render_settings_for_path(self.current_path, prefer_current_ui=True)
+        crop_box, outer_pad = self._compute_crop_plan_for_image(
+            path=self.current_path,
+            image=self.current_source_image,
+            raw_metadata=self.current_raw_metadata,
+            settings=settings,
+        )
+        pad_top, pad_bottom, pad_left, pad_right = outer_pad
+        focus_box = _transform_source_box_after_crop_padding(
+            focus_box_source,
+            crop_box=None,
             source_width=source_width,
             source_height=source_height,
-            ratio=ratio,
-            anchor=anchor,
+            pt=pad_top,
+            pb=pad_bottom,
+            pl=pad_left,
+            pr=pad_right,
+        )
+        if not apply_ratio_crop or focus_box is None or crop_box is None:
+            return focus_box
+        return _transform_source_box_after_crop_padding(
+            focus_box,
+            crop_box=crop_box,
+            source_width=source_width + pad_left + pad_right,
+            source_height=source_height + pad_top + pad_bottom,
+            pt=0,
+            pb=0,
+            pl=0,
+            pr=0,
         )
 
     def _current_bird_box(self) -> tuple[float, float, float, float] | None:
@@ -3098,7 +3331,16 @@ class BirdStampEditorWindow(QMainWindow):
             "template_payload": _deep_copy_payload(template_payload),
             "ratio": self._selected_ratio(),
             "center_mode": self._selected_center_mode(),
+            "auto_crop_by_bird": bool(self.auto_crop_by_bird_check.isChecked()),
             "max_long_edge": self._selected_max_long_edge(),
+            "crop_padding_top": self.crop_padding_top.value(),
+            "crop_padding_bottom": self.crop_padding_bottom.value(),
+            "crop_padding_left": self.crop_padding_left.value(),
+            "crop_padding_right": self.crop_padding_right.value(),
+            "crop_padding_fill": _safe_color(
+                str(self.crop_padding_fill_combo.currentData() or "#FFFFFF"),
+                "#FFFFFF",
+            ),
         }
 
     def _clone_render_settings(self, settings: dict[str, Any]) -> dict[str, Any]:
@@ -3128,12 +3370,26 @@ class BirdStampEditorWindow(QMainWindow):
             max_long_edge = 0
         max_long_edge = max(0, max_long_edge)
 
+        def _pad_px(key: str) -> int:
+            try:
+                return max(0, int(settings.get(key, _DEFAULT_CROP_PADDING_PX)))
+            except Exception:
+                return _DEFAULT_CROP_PADDING_PX
+
+        fill = _safe_color(str(settings.get("crop_padding_fill", "#FFFFFF")), "#FFFFFF")
+
         return {
             "template_name": template_name,
             "template_payload": _deep_copy_payload(template_payload),
             "ratio": ratio,
             "center_mode": _normalize_center_mode(settings.get("center_mode")),
+            "auto_crop_by_bird": _parse_bool_value(settings.get("auto_crop_by_bird"), False),
             "max_long_edge": max_long_edge,
+            "crop_padding_top": _pad_px("crop_padding_top"),
+            "crop_padding_bottom": _pad_px("crop_padding_bottom"),
+            "crop_padding_left": _pad_px("crop_padding_left"),
+            "crop_padding_right": _pad_px("crop_padding_right"),
+            "crop_padding_fill": fill,
         }
 
     def _normalize_render_settings(self, raw: Any, fallback: dict[str, Any]) -> dict[str, Any]:
@@ -3160,6 +3416,8 @@ class BirdStampEditorWindow(QMainWindow):
 
         if "center_mode" in raw:
             settings["center_mode"] = _normalize_center_mode(raw.get("center_mode"))
+        if "auto_crop_by_bird" in raw:
+            settings["auto_crop_by_bird"] = _parse_bool_value(raw.get("auto_crop_by_bird"), settings["auto_crop_by_bird"])
 
         if "max_long_edge" in raw:
             try:
@@ -3167,6 +3425,18 @@ class BirdStampEditorWindow(QMainWindow):
             except Exception:
                 parsed_max_edge = int(settings["max_long_edge"])
             settings["max_long_edge"] = max(0, parsed_max_edge)
+
+        def _parse_pad(key: str) -> int:
+            try:
+                return max(0, int(raw.get(key, settings[key])))
+            except Exception:
+                return settings[key]
+
+        for key in ("crop_padding_top", "crop_padding_bottom", "crop_padding_left", "crop_padding_right"):
+            if key in raw:
+                settings[key] = _parse_pad(key)
+        if "crop_padding_fill" in raw:
+            settings["crop_padding_fill"] = _safe_color(str(raw.get("crop_padding_fill", "#FFFFFF")), "#FFFFFF")
         return settings
 
     def _render_settings_for_path(self, path: Path | None, *, prefer_current_ui: bool) -> dict[str, Any]:
@@ -3208,7 +3478,13 @@ class BirdStampEditorWindow(QMainWindow):
         self.template_combo.blockSignals(True)
         self.ratio_combo.blockSignals(True)
         self.center_mode_combo.blockSignals(True)
+        self.auto_crop_by_bird_check.blockSignals(True)
         self.max_edge_combo.blockSignals(True)
+        self.crop_padding_top.blockSignals(True)
+        self.crop_padding_bottom.blockSignals(True)
+        self.crop_padding_left.blockSignals(True)
+        self.crop_padding_right.blockSignals(True)
+        self.crop_padding_fill_combo.blockSignals(True)
         try:
             template_idx = self.template_combo.findText(template_name)
             if template_idx >= 0:
@@ -3222,14 +3498,35 @@ class BirdStampEditorWindow(QMainWindow):
             if center_idx >= 0:
                 self.center_mode_combo.setCurrentIndex(center_idx)
 
+            self.auto_crop_by_bird_check.setChecked(bool(normalized.get("auto_crop_by_bird", False)))
             max_edge_idx = self._ensure_max_edge_option(int(normalized["max_long_edge"]))
             if max_edge_idx >= 0:
                 self.max_edge_combo.setCurrentIndex(max_edge_idx)
+
+            self.crop_padding_top.setValue(max(0, int(normalized.get("crop_padding_top", _DEFAULT_CROP_PADDING_PX))))
+            self.crop_padding_bottom.setValue(max(0, int(normalized.get("crop_padding_bottom", _DEFAULT_CROP_PADDING_PX))))
+            self.crop_padding_left.setValue(max(0, int(normalized.get("crop_padding_left", _DEFAULT_CROP_PADDING_PX))))
+            self.crop_padding_right.setValue(max(0, int(normalized.get("crop_padding_right", _DEFAULT_CROP_PADDING_PX))))
+            fill = _safe_color(str(normalized.get("crop_padding_fill", "#FFFFFF")), "#FFFFFF")
+            fill_idx = self.crop_padding_fill_combo.findData(fill)
+            if fill_idx >= 0:
+                self.crop_padding_fill_combo.setCurrentIndex(fill_idx)
+            else:
+                self.crop_padding_fill_combo.addItem(fill, fill)
+                self.crop_padding_fill_combo.setCurrentIndex(self.crop_padding_fill_combo.count() - 1)
         finally:
+            self.crop_padding_fill_combo.blockSignals(False)
+            self.crop_padding_right.blockSignals(False)
+            self.crop_padding_left.blockSignals(False)
+            self.crop_padding_bottom.blockSignals(False)
+            self.crop_padding_top.blockSignals(False)
             self.max_edge_combo.blockSignals(False)
+            self.auto_crop_by_bird_check.blockSignals(False)
             self.center_mode_combo.blockSignals(False)
             self.ratio_combo.blockSignals(False)
             self.template_combo.blockSignals(False)
+
+        self._set_inner_padding_controls_enabled(bool(normalized.get("auto_crop_by_bird", False)))
 
         self.current_template_payload = _normalize_template_payload(
             normalized["template_payload"],
@@ -3335,6 +3632,115 @@ class BirdStampEditorWindow(QMainWindow):
                 anchor = focus_point
         return (anchor, bird_box)
 
+    def _compute_auto_bird_crop_plan(
+        self,
+        *,
+        image: Image.Image,
+        bird_box: tuple[float, float, float, float],
+        ratio: float,
+        inner_top: int,
+        inner_bottom: int,
+        inner_left: int,
+        inner_right: int,
+    ) -> tuple[tuple[float, float, float, float] | None, tuple[int, int, int, int]]:
+        width, height = image.size
+        if width <= 0 or height <= 0 or ratio <= 0:
+            return (None, (0, 0, 0, 0))
+
+        expanded_px = _expand_unit_box_to_unclamped_pixels(
+            bird_box,
+            width=width,
+            height=height,
+            top=inner_top,
+            bottom=inner_bottom,
+            left=inner_left,
+            right=inner_right,
+        )
+        if expanded_px is None:
+            return (None, (0, 0, 0, 0))
+
+        keep_left, keep_top, keep_right, keep_bottom = expanded_px
+        keep_w = max(1.0, keep_right - keep_left)
+        keep_h = max(1.0, keep_bottom - keep_top)
+        center_x = (keep_left + keep_right) * 0.5
+        center_y = (keep_top + keep_bottom) * 0.5
+
+        crop_w = keep_w
+        crop_h = crop_w / ratio
+        if crop_h < keep_h:
+            crop_h = keep_h
+            crop_w = crop_h * ratio
+
+        crop_left = center_x - (crop_w * 0.5)
+        crop_top = center_y - (crop_h * 0.5)
+        crop_right = crop_left + crop_w
+        crop_bottom = crop_top + crop_h
+
+        outer_left = max(0, int(math.ceil(-crop_left)))
+        outer_top = max(0, int(math.ceil(-crop_top)))
+        outer_right = max(0, int(math.ceil(crop_right - width)))
+        outer_bottom = max(0, int(math.ceil(crop_bottom - height)))
+
+        padded_width = width + outer_left + outer_right
+        padded_height = height + outer_top + outer_bottom
+        if padded_width <= 0 or padded_height <= 0:
+            return (None, (0, 0, 0, 0))
+
+        crop_box = _normalize_unit_box(
+            (
+                (crop_left + outer_left) / float(padded_width),
+                (crop_top + outer_top) / float(padded_height),
+                (crop_right + outer_left) / float(padded_width),
+                (crop_bottom + outer_top) / float(padded_height),
+            )
+        )
+        return (crop_box, (outer_top, outer_bottom, outer_left, outer_right))
+
+    def _compute_crop_plan_for_image(
+        self,
+        *,
+        path: Path | None,
+        image: Image.Image,
+        raw_metadata: dict[str, Any],
+        settings: dict[str, Any],
+    ) -> tuple[tuple[float, float, float, float] | None, tuple[int, int, int, int]]:
+        ratio = _parse_ratio_value(settings.get("ratio"))
+        if ratio is None:
+            return (None, (0, 0, 0, 0))
+
+        anchor, keep_box = self._resolve_crop_anchor_and_keep_box(
+            path=path,
+            image=image,
+            raw_metadata=raw_metadata,
+            center_mode=str(settings.get("center_mode") or _CENTER_MODE_IMAGE),
+        )
+
+        auto_crop = _parse_bool_value(settings.get("auto_crop_by_bird"), False)
+        if auto_crop and keep_box is not None:
+            crop_box, outer_pad = self._compute_auto_bird_crop_plan(
+                image=image,
+                bird_box=keep_box,
+                ratio=ratio,
+                inner_top=max(0, int(settings.get("crop_padding_top") or 0)),
+                inner_bottom=max(0, int(settings.get("crop_padding_bottom") or 0)),
+                inner_left=max(0, int(settings.get("crop_padding_left") or 0)),
+                inner_right=max(0, int(settings.get("crop_padding_right") or 0)),
+            )
+            if crop_box is not None:
+                return (crop_box, outer_pad)
+            # 自动模式失败时回退为普通裁切。
+
+        crop_box = _compute_ratio_crop_box(
+            width=image.width,
+            height=image.height,
+            ratio=ratio,
+            anchor=anchor,
+            keep_box=None,
+        )
+        if not _crop_box_has_effect(crop_box):
+            return (None, (0, 0, 0, 0))
+        return (crop_box, (0, 0, 0, 0))
+
     def _compute_crop_box_for_image(
         self,
         *,
@@ -3343,33 +3749,12 @@ class BirdStampEditorWindow(QMainWindow):
         raw_metadata: dict[str, Any],
         settings: dict[str, Any],
     ) -> tuple[float, float, float, float] | None:
-        ratio_raw = settings.get("ratio")
-        ratio: float | None
-        if ratio_raw is None:
-            ratio = None
-        else:
-            try:
-                ratio = float(ratio_raw)
-            except Exception:
-                ratio = None
-        if ratio is None or ratio <= 0:
-            return None
-
-        anchor, keep_box = self._resolve_crop_anchor_and_keep_box(
+        crop_box, _outer_pad = self._compute_crop_plan_for_image(
             path=path,
             image=image,
             raw_metadata=raw_metadata,
-            center_mode=str(settings.get("center_mode") or _CENTER_MODE_IMAGE),
+            settings=settings,
         )
-        crop_box = _compute_ratio_crop_box(
-            width=image.width,
-            height=image.height,
-            ratio=ratio,
-            anchor=anchor,
-            keep_box=keep_box,
-        )
-        if not _crop_box_has_effect(crop_box):
-            return None
         return crop_box
 
     def _current_crop_effect_box(self) -> tuple[float, float, float, float] | None:
@@ -3417,13 +3802,18 @@ class BirdStampEditorWindow(QMainWindow):
         source_path: Path | None,
         apply_ratio_crop: bool = True,
     ) -> Image.Image:
+        crop_box, outer_pad = self._compute_crop_plan_for_image(
+            path=source_path,
+            image=image,
+            raw_metadata=raw_metadata,
+            settings=settings,
+        )
+        top, bottom, left, right = outer_pad
+        if top or bottom or left or right:
+            fill = str(settings.get("crop_padding_fill") or "#FFFFFF").strip() or "#FFFFFF"
+            image = _pad_image(image, top=top, bottom=bottom, left=left, right=right, fill=fill)
+
         if apply_ratio_crop:
-            crop_box = self._compute_crop_box_for_image(
-                path=source_path,
-                image=image,
-                raw_metadata=raw_metadata,
-                settings=settings,
-            )
             image = _crop_image_by_normalized_box(image, crop_box)
 
         max_long_edge = max(0, int(settings.get("max_long_edge") or 0))
@@ -3469,7 +3859,7 @@ class BirdStampEditorWindow(QMainWindow):
             source_image = self.current_source_image.copy()
             raw_metadata = dict(self.current_raw_metadata)
             context = dict(self.current_metadata_context)
-            # 预览图始终保持原图长宽比，仅进行尺寸缩放。
+            # 预览保持完整画面，仅通过“显示裁切效果”遮罩提示最终裁切范围。
             processed = self._build_processed_image(
                 source_image,
                 raw_metadata,
@@ -3493,23 +3883,46 @@ class BirdStampEditorWindow(QMainWindow):
             return
 
         self.last_rendered = rendered
-        self.preview_focus_box = self._current_focus_box_after_processing(apply_ratio_crop=False)
-        if self.current_source_image is not None:
-            source_width, source_height = self.current_source_image.size
-            self.preview_focus_box_original = _extract_focus_box(self.current_raw_metadata, source_width, source_height)
-        else:
-            self.preview_focus_box_original = None
-        if self.show_bird_box_check.isChecked():
-            self.preview_bird_box = self._current_bird_box()
-        else:
-            self.preview_bird_box = None
-        if self.show_crop_effect_check.isChecked():
-            self.preview_crop_effect_box = self._current_crop_effect_box()
-        else:
-            self.preview_crop_effect_box = None
+        crop_box, outer_pad = self._compute_crop_plan_for_image(
+            path=self.current_path,
+            image=self.current_source_image,
+            raw_metadata=raw_metadata,
+            settings=settings,
+        )
+        pad_top, pad_bottom, pad_left, pad_right = outer_pad
+        self.preview_focus_box = _transform_source_box_after_crop_padding(
+            _extract_focus_box(raw_metadata, self.current_source_image.width, self.current_source_image.height),
+            crop_box=None,
+            source_width=self.current_source_image.width,
+            source_height=self.current_source_image.height,
+            pt=pad_top,
+            pb=pad_bottom,
+            pl=pad_left,
+            pr=pad_right,
+        )
+        self.preview_focus_box_original = self.preview_focus_box
+        self.preview_bird_box = _transform_source_box_after_crop_padding(
+            self._bird_box_for_path(self.current_path, source_image=self.current_source_image),
+            crop_box=None,
+            source_width=self.current_source_image.width,
+            source_height=self.current_source_image.height,
+            pt=pad_top,
+            pb=pad_bottom,
+            pl=pad_left,
+            pr=pad_right,
+        )
+
+        self.preview_crop_effect_box = crop_box
+
         self.preview_pixmap = _pil_to_qpixmap(rendered)
         self._refresh_preview_label(reset_view=True)
-        self._set_status(f"预览完成: {rendered.width}x{rendered.height}")
+        if _parse_bool_value(settings.get("auto_crop_by_bird"), False):
+            self._set_status(
+                "预览完成: "
+                f"{rendered.width}x{rendered.height} | 自动外填充 上{pad_top}px 下{pad_bottom}px 左{pad_left}px 右{pad_right}px"
+            )
+        else:
+            self._set_status(f"预览完成: {rendered.width}x{rendered.height}")
 
     def export_current(self) -> None:
         if not self.current_path:
