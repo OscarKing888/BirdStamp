@@ -1,9 +1,9 @@
 ---
-description: SuperPicky project guardrails (encoding, cross-platform, packaging, exiftool)
+description: BirdStamp project guardrails (encoding, cross-platform, packaging, exiftool)
 alwaysApply: true
 ---
 
-# SuperPicky Cursor Rules
+# BirdStamp Cursor Rules
 
 Follow `scripts_dev/AI_CODING_RULES.md`.
 

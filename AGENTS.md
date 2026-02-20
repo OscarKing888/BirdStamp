@@ -17,3 +17,5 @@ Follow `scripts_dev/AI_CODING_RULES.md` as the project baseline.
 - For metadata changes: write + read-back verification with Chinese sample values.
 - For `.spec` changes: packaged startup smoke test.
 
+## New Feature: GUI Options
+- Keep new GUI options feature reading from json config file @birdstamp/gui/resources/editor_options.json.
