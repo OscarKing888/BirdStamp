@@ -78,6 +78,10 @@ _CENTER_MODE_BIRD = "bird"
 _CENTER_MODE_OPTIONS = (_CENTER_MODE_IMAGE, _CENTER_MODE_FOCUS, _CENTER_MODE_BIRD)
 _DEFAULT_CROP_EFFECT_ALPHA = 160
 _DEFAULT_CROP_PADDING_PX = 128
+_DEFAULT_TEMPLATE_BANNER_COLOR = "#111111"
+_TEMPLATE_BANNER_COLOR_NONE = "none"
+_TEMPLATE_BANNER_COLOR_CUSTOM = "custom"
+_TEMPLATE_BANNER_TOP_PADDING_PX = 16
 _XML_LANG_ATTR = "{http://www.w3.org/XML/1998/namespace}lang"
 _RDF_NS = "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
 _RDF_DESC_TAG = f"{{{_RDF_NS}}}Description"
@@ -246,6 +250,26 @@ def _safe_color(value: str, fallback: str) -> str:
     except ValueError:
         return fallback
     return text
+
+
+def _normalize_template_banner_color(value: Any, default: str = _DEFAULT_TEMPLATE_BANNER_COLOR) -> str:
+    fallback = _safe_color(default, _DEFAULT_TEMPLATE_BANNER_COLOR)
+    if value is None:
+        return fallback
+    text = str(value).strip()
+    if not text:
+        return fallback
+    lowered = text.lower()
+    if lowered in {"none", "transparent", "off", "false", "0"}:
+        return _TEMPLATE_BANNER_COLOR_NONE
+    return _safe_color(text, fallback)
+
+
+def _template_banner_fill_color(value: Any) -> str | None:
+    color = _normalize_template_banner_color(value)
+    if color == _TEMPLATE_BANNER_COLOR_NONE:
+        return None
+    return color
 
 
 def _clean_text(value: Any) -> str | None:
@@ -1353,8 +1377,13 @@ def _normalize_template_payload(payload: dict[str, Any], fallback_name: str) -> 
     if not fields:
         fields.append(_default_template_field())
 
+    ratio = _parse_ratio_value(payload.get("ratio"))
+    banner_color = _normalize_template_banner_color(payload.get("banner_color"))
+
     return {
         "name": str(payload.get("name") or fallback_name),
+        "ratio": ratio,
+        "banner_color": banner_color,
         "fields": fields,
     }
 
@@ -1469,16 +1498,184 @@ def _draw_styled_text(
     image.alpha_composite(layer, (x - 5, y - 5))
 
 
+def _template_font_scale_for_canvas(width: int, height: int) -> float:
+    if width <= 0 or height <= 0:
+        return 1.0
+    short_edge = float(min(width, height))
+    long_edge = float(max(width, height))
+    short_scale = short_edge / 900.0
+    long_scale = long_edge / 1600.0
+    scale = (short_scale * 0.68) + (long_scale * 0.32)
+    return max(0.72, min(2.25, scale))
+
+
+def _compute_template_text_position(
+    *,
+    canvas_width: int,
+    canvas_height: int,
+    text_width: int,
+    text_height: int,
+    align_h: str,
+    align_v: str,
+    x_offset_pct: float,
+    y_offset_pct: float,
+) -> tuple[int, int]:
+    if align_h == "center":
+        anchor_x = int(round((canvas_width * 0.5) + (canvas_width * x_offset_pct)))
+        x = anchor_x - (text_width // 2)
+    elif align_h == "right":
+        anchor_x = int(round(canvas_width + (canvas_width * x_offset_pct)))
+        x = anchor_x - text_width
+    else:
+        anchor_x = int(round(canvas_width * x_offset_pct))
+        x = anchor_x
+
+    if align_v == "center":
+        anchor_y = int(round((canvas_height * 0.5) + (canvas_height * y_offset_pct)))
+        y = anchor_y - (text_height // 2)
+    elif align_v == "bottom":
+        anchor_y = int(round(canvas_height + (canvas_height * y_offset_pct)))
+        y = anchor_y - text_height
+    else:
+        anchor_y = int(round(canvas_height * y_offset_pct))
+        y = anchor_y
+
+    return (x, y)
+
+
+def _text_boxes_overlap(
+    a: tuple[int, int, int, int],
+    b: tuple[int, int, int, int],
+    *,
+    gap: int,
+) -> bool:
+    return not (
+        a[2] + gap <= b[0]
+        or b[2] + gap <= a[0]
+        or a[3] + gap <= b[1]
+        or b[3] + gap <= a[1]
+    )
+
+
+def _resolve_template_text_position_with_avoidance(
+    *,
+    base_x: int,
+    base_y: int,
+    text_width: int,
+    text_height: int,
+    canvas_width: int,
+    canvas_height: int,
+    align_h: str,
+    align_v: str,
+    occupied: list[tuple[int, int, int, int]],
+    gap: int,
+) -> tuple[int, int, tuple[int, int, int, int], bool]:
+    max_x = max(0, canvas_width - text_width)
+    max_y = max(0, canvas_height - text_height)
+    origin_x = max(0, min(max_x, base_x))
+    origin_y = max(0, min(max_y, base_y))
+
+    step_y = max(4, int(round(text_height * 0.36)))
+    step_x = max(6, int(round(text_width * 0.10)))
+    y_steps = max(8, (canvas_height // step_y) + 3)
+
+    y_offsets: list[int] = [0]
+    if align_v == "bottom":
+        y_offsets.extend([-step_y * i for i in range(1, y_steps + 1)])
+        y_offsets.extend([step_y * i for i in range(1, max(3, y_steps // 2) + 1)])
+    elif align_v == "top":
+        y_offsets.extend([step_y * i for i in range(1, y_steps + 1)])
+        y_offsets.extend([-step_y * i for i in range(1, max(3, y_steps // 2) + 1)])
+    else:
+        for i in range(1, y_steps + 1):
+            y_offsets.extend([step_y * i, -step_y * i])
+
+    x_offsets: list[int] = [0]
+    x_span = max(2, min(8, canvas_width // max(1, step_x)))
+    if align_h == "left":
+        x_offsets.extend([step_x * i for i in range(1, x_span + 1)])
+        x_offsets.extend([-step_x * i for i in range(1, max(2, x_span // 2) + 1)])
+    elif align_h == "right":
+        x_offsets.extend([-step_x * i for i in range(1, x_span + 1)])
+        x_offsets.extend([step_x * i for i in range(1, max(2, x_span // 2) + 1)])
+    else:
+        for i in range(1, x_span + 1):
+            x_offsets.extend([step_x * i, -step_x * i])
+
+    best: tuple[int, int, tuple[int, int, int, int], int] | None = None
+    for dy in y_offsets:
+        for dx in x_offsets:
+            x = max(0, min(max_x, origin_x + dx))
+            y = max(0, min(max_y, origin_y + dy))
+            rect = (x, y, x + text_width, y + text_height)
+            overlaps = sum(1 for existing in occupied if _text_boxes_overlap(rect, existing, gap=gap))
+            if overlaps == 0:
+                return (x, y, rect, True)
+            distance = abs(dx) + abs(dy)
+            score = overlaps * 100000 + distance
+            if best is None or score < best[3]:
+                best = (x, y, rect, score)
+
+    if best is not None:
+        return (best[0], best[1], best[2], False)
+    rect = (origin_x, origin_y, origin_x + text_width, origin_y + text_height)
+    return (origin_x, origin_y, rect, False)
+
+
+def _iter_font_sizes_for_layout(base_size: int, minimum: int = 8) -> list[int]:
+    start = max(minimum, int(base_size))
+    sizes = [start]
+    if start <= minimum:
+        return sizes
+    step = max(1, int(round(start * 0.12)))
+    current = start - step
+    while current > minimum:
+        sizes.append(current)
+        current -= step
+    if sizes[-1] != minimum:
+        sizes.append(minimum)
+    return sizes
+
+
+def _compute_template_banner_rect(
+    *,
+    text_boxes: list[tuple[int, int, int, int]],
+    canvas_width: int,
+    canvas_height: int,
+    top_padding: int = _TEMPLATE_BANNER_TOP_PADDING_PX,
+) -> tuple[int, int, int, int] | None:
+    if not text_boxes or canvas_width <= 0 or canvas_height <= 0:
+        return None
+
+    left = min(box[0] for box in text_boxes)
+    top = min(box[1] for box in text_boxes) - max(0, int(top_padding))
+    right = max(box[2] for box in text_boxes)
+    bottom = max(box[3] for box in text_boxes)
+
+    left = max(0, min(canvas_width, left))
+    top = max(0, min(canvas_height, top))
+    right = max(0, min(canvas_width, right))
+    bottom = max(0, min(canvas_height, bottom))
+    if right <= left or bottom <= top:
+        return None
+    return (left, top, right, bottom)
+
+
 def render_template_overlay(
     image: Image.Image,
     *,
     raw_metadata: dict[str, Any],
     metadata_context: dict[str, str],
     template_payload: dict[str, Any],
+    auto_scale_font: bool = True,
 ) -> Image.Image:
     canvas = image.convert("RGBA")
     draw = ImageDraw.Draw(canvas)
     lookup = _normalize_lookup(raw_metadata)
+    font_scale = _template_font_scale_for_canvas(canvas.width, canvas.height) if auto_scale_font else 1.0
+    occupied_boxes: list[tuple[int, int, int, int]] = []
+    text_gap = max(4, int(round(min(canvas.width, canvas.height) * 0.006)))
+    draw_commands: list[tuple[str, int, int, str, Any, str, tuple[int, int, int, int]]] = []
 
     fields = template_payload.get("fields") or []
     if not isinstance(fields, list):
@@ -1497,42 +1694,77 @@ def render_template_overlay(
         if not text:
             continue
 
-        font_size = int(field.get("font_size") or 24)
-        font = load_font(None, font_size)
+        font_size_base = max(8, int(field.get("font_size") or 24))
         color = _safe_color(str(field.get("color") or "#FFFFFF"), "#FFFFFF")
-
-        text_box = draw.textbbox((0, 0), text, font=font)
-        text_width = max(1, text_box[2] - text_box[0])
-        text_height = max(1, text_box[3] - text_box[1])
-
         align_h = str(field.get("align_horizontal") or field.get("align") or "left").lower()
         align_v = str(field.get("align_vertical") or "top").lower()
         x_offset = float(field.get("x_offset_pct") or 0.0) / 100.0
         y_offset = float(field.get("y_offset_pct") or 0.0) / 100.0
 
-        if align_h == "center":
-            anchor_x = int(round((canvas.width * 0.5) + (canvas.width * x_offset)))
-            x = anchor_x - (text_width // 2)
-        elif align_h == "right":
-            anchor_x = int(round(canvas.width + (canvas.width * x_offset)))
-            x = anchor_x - text_width
-        else:
-            anchor_x = int(round(canvas.width * x_offset))
-            x = anchor_x
+        scaled_size = max(8, min(320, int(round(font_size_base * font_scale))))
+        chosen_font = load_font(None, scaled_size)
+        chosen_x = 0
+        chosen_y = 0
+        chosen_rect = (0, 0, 1, 1)
+        for candidate_size in _iter_font_sizes_for_layout(scaled_size, minimum=8):
+            font = load_font(None, candidate_size)
+            text_box = draw.textbbox((0, 0), text, font=font)
+            text_width = max(1, text_box[2] - text_box[0])
+            text_height = max(1, text_box[3] - text_box[1])
+            base_x, base_y = _compute_template_text_position(
+                canvas_width=canvas.width,
+                canvas_height=canvas.height,
+                text_width=text_width,
+                text_height=text_height,
+                align_h=align_h,
+                align_v=align_v,
+                x_offset_pct=x_offset,
+                y_offset_pct=y_offset,
+            )
+            x, y, rect, non_overlap = _resolve_template_text_position_with_avoidance(
+                base_x=base_x,
+                base_y=base_y,
+                text_width=text_width,
+                text_height=text_height,
+                canvas_width=canvas.width,
+                canvas_height=canvas.height,
+                align_h=align_h,
+                align_v=align_v,
+                occupied=occupied_boxes,
+                gap=text_gap,
+            )
+            chosen_font = font
+            chosen_x = x
+            chosen_y = y
+            chosen_rect = rect
+            if non_overlap:
+                break
 
-        if align_v == "center":
-            anchor_y = int(round((canvas.height * 0.5) + (canvas.height * y_offset)))
-            y = anchor_y - (text_height // 2)
-        elif align_v == "bottom":
-            anchor_y = int(round(canvas.height + (canvas.height * y_offset)))
-            y = anchor_y - text_height
-        else:
-            anchor_y = int(round(canvas.height * y_offset))
-            y = anchor_y
+        draw_commands.append(
+            (
+                text,
+                chosen_x,
+                chosen_y,
+                color,
+                chosen_font,
+                str(field.get("style") or "normal"),
+                chosen_rect,
+            )
+        )
+        occupied_boxes.append(chosen_rect)
 
-        x = max(0, min(canvas.width - text_width, x))
-        y = max(0, min(canvas.height - text_height, y))
+    banner_fill = _template_banner_fill_color(template_payload.get("banner_color"))
+    if banner_fill and draw_commands:
+        banner_rect = _compute_template_banner_rect(
+            text_boxes=[cmd[6] for cmd in draw_commands],
+            canvas_width=canvas.width,
+            canvas_height=canvas.height,
+            top_padding=_TEMPLATE_BANNER_TOP_PADDING_PX,
+        )
+        if banner_rect is not None:
+            draw.rectangle(banner_rect, fill=banner_fill)
 
+    for text, x, y, color, font, style, _rect in draw_commands:
         _draw_styled_text(
             canvas,
             draw,
@@ -1541,10 +1773,56 @@ def render_template_overlay(
             y=y,
             color=color,
             font=font,
-            style=str(field.get("style") or "normal"),
+            style=style,
         )
 
     return canvas.convert("RGB")
+
+
+def _render_template_overlay_in_crop_region(
+    image: Image.Image,
+    *,
+    raw_metadata: dict[str, Any],
+    metadata_context: dict[str, str],
+    template_payload: dict[str, Any],
+    crop_box: tuple[float, float, float, float] | None,
+) -> Image.Image:
+    if not _crop_box_has_effect(crop_box):
+        return render_template_overlay(
+            image,
+            raw_metadata=raw_metadata,
+            metadata_context=metadata_context,
+            template_payload=template_payload,
+        )
+
+    crop_px = _normalized_box_to_pixel_box(crop_box, image.width, image.height)
+    if crop_px is None:
+        return render_template_overlay(
+            image,
+            raw_metadata=raw_metadata,
+            metadata_context=metadata_context,
+            template_payload=template_payload,
+        )
+
+    left, top, right, bottom = crop_px
+    if right - left < 2 or bottom - top < 2:
+        return render_template_overlay(
+            image,
+            raw_metadata=raw_metadata,
+            metadata_context=metadata_context,
+            template_payload=template_payload,
+        )
+
+    crop_image = image.crop((left, top, right, bottom))
+    rendered_crop = render_template_overlay(
+        crop_image,
+        raw_metadata=raw_metadata,
+        metadata_context=metadata_context,
+        template_payload=template_payload,
+    )
+    merged = image.copy()
+    merged.paste(rendered_crop, (left, top))
+    return merged
 
 
 def _build_metadata_context(path: Path, raw_metadata: dict[str, Any]) -> dict[str, str]:
@@ -2089,8 +2367,8 @@ class PhotoListWidget(QTreeWidget):
 
     def __init__(self) -> None:
         super().__init__()
-        self.setColumnCount(3)
-        self.setHeaderLabels(["照片", "Title", "裁切比例"])
+        self.setColumnCount(4)
+        self.setHeaderLabels(["照片", "Title", "裁切比例", "标星"])
         self.setRootIsDecorated(False)
         self.setUniformRowHeights(True)
         self.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -2101,9 +2379,11 @@ class PhotoListWidget(QTreeWidget):
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         header.resizeSection(0, 260)
         header.resizeSection(1, 160)
         header.resizeSection(2, 96)
+        header.resizeSection(3, 88)
 
     def dragEnterEvent(self, event) -> None:  # type: ignore[override]
         if event.mimeData().hasUrls():
@@ -2205,6 +2485,37 @@ class TemplateManagerDialog(QDialog):
         self.template_name_edit = QLineEdit()
         self.template_name_edit.setReadOnly(True)
         header_form.addRow("模板文件", self.template_name_edit)
+
+        self.template_ratio_combo = QComboBox()
+        for label, ratio in RATIO_OPTIONS:
+            self.template_ratio_combo.addItem(label, ratio)
+        if self.template_ratio_combo.count() == 0:
+            self.template_ratio_combo.addItem("原比例", None)
+        self.template_ratio_combo.currentIndexChanged.connect(self._on_template_ratio_changed)
+        header_form.addRow("裁切比例", self.template_ratio_combo)
+
+        banner_color_row = QWidget()
+        banner_color_row_layout = QHBoxLayout(banner_color_row)
+        banner_color_row_layout.setContentsMargins(0, 0, 0, 0)
+        banner_color_row_layout.setSpacing(6)
+
+        self.template_banner_color_combo = QComboBox()
+        self.template_banner_color_combo.addItem("无(透明)", _TEMPLATE_BANNER_COLOR_NONE)
+        for label, value in COLOR_PRESETS:
+            self.template_banner_color_combo.addItem(f"{label} {value}", value)
+        self.template_banner_color_combo.addItem("自定义", _TEMPLATE_BANNER_COLOR_CUSTOM)
+        self.template_banner_color_combo.currentIndexChanged.connect(self._on_template_banner_color_preset_changed)
+        banner_color_row_layout.addWidget(self.template_banner_color_combo, stretch=1)
+
+        self.template_banner_color_edit = QLineEdit(_DEFAULT_TEMPLATE_BANNER_COLOR)
+        self.template_banner_color_edit.textChanged.connect(self._on_template_banner_color_text_changed)
+        banner_color_row_layout.addWidget(self.template_banner_color_edit, stretch=1)
+
+        pick_banner_color_btn = QPushButton("调色板")
+        pick_banner_color_btn.clicked.connect(self._pick_template_banner_color)
+        banner_color_row_layout.addWidget(pick_banner_color_btn)
+
+        header_form.addRow("Banner颜色", banner_color_row)
         editor_layout.addWidget(header_group)
 
         fields_group = QGroupBox("文本项")
@@ -2371,8 +2682,141 @@ class TemplateManagerDialog(QDialog):
         self.current_template_name = name
         self.current_payload = payload
         self.template_name_edit.setText(path.name)
+        self._updating = True
+        try:
+            self._set_template_ratio_combo_value(payload.get("ratio"))
+            self._set_template_banner_color_value(payload.get("banner_color"))
+        finally:
+            self._updating = False
         self._populate_field_list(payload.get("fields") or [])
         self._refresh_preview()
+
+    def _template_ratio_combo_index_for_value(self, ratio: float | None) -> int:
+        for idx in range(self.template_ratio_combo.count()):
+            data = self.template_ratio_combo.itemData(idx)
+            if data is None and ratio is None:
+                return idx
+            if data is None or ratio is None:
+                continue
+            try:
+                if abs(float(data) - float(ratio)) <= 0.0001:
+                    return idx
+            except Exception:
+                continue
+        return -1
+
+    def _set_template_ratio_combo_value(self, ratio: Any) -> None:
+        parsed = _parse_ratio_value(ratio)
+        idx = self._template_ratio_combo_index_for_value(parsed)
+        if idx < 0:
+            return
+        self.template_ratio_combo.setCurrentIndex(idx)
+
+    def _on_template_ratio_changed(self, *_args: Any) -> None:
+        if self._updating or not self.current_payload:
+            return
+        ratio = _parse_ratio_value(self.template_ratio_combo.currentData())
+        self.current_payload["ratio"] = ratio
+        self._save_current_template()
+        self._refresh_preview()
+
+    def _template_banner_color_combo_index_for_value(self, value: str) -> int:
+        target = str(value or "").strip().lower()
+        for idx in range(self.template_banner_color_combo.count()):
+            data = str(self.template_banner_color_combo.itemData(idx) or "").strip().lower()
+            if data == target:
+                return idx
+        return -1
+
+    def _set_template_banner_color_value(self, value: Any) -> None:
+        normalized = _normalize_template_banner_color(value)
+        custom_idx = self._template_banner_color_combo_index_for_value(_TEMPLATE_BANNER_COLOR_CUSTOM)
+        if custom_idx < 0:
+            custom_idx = max(0, self.template_banner_color_combo.count() - 1)
+
+        if normalized == _TEMPLATE_BANNER_COLOR_NONE:
+            idx = self._template_banner_color_combo_index_for_value(_TEMPLATE_BANNER_COLOR_NONE)
+            if idx < 0:
+                idx = custom_idx
+            self.template_banner_color_combo.setCurrentIndex(idx)
+            self.template_banner_color_edit.setText("")
+            return
+
+        idx = self._template_banner_color_combo_index_for_value(normalized)
+        if idx < 0:
+            idx = custom_idx
+        self.template_banner_color_combo.setCurrentIndex(idx)
+        self.template_banner_color_edit.setText(normalized)
+
+    def _apply_template_banner_color(self) -> None:
+        if self._updating or not self.current_payload:
+            return
+
+        selected = str(self.template_banner_color_combo.currentData() or "").strip().lower()
+        if selected == _TEMPLATE_BANNER_COLOR_NONE:
+            banner_color = _TEMPLATE_BANNER_COLOR_NONE
+        elif selected == _TEMPLATE_BANNER_COLOR_CUSTOM:
+            typed = self.template_banner_color_edit.text().strip()
+            banner_color = _normalize_template_banner_color(
+                typed if typed else _DEFAULT_TEMPLATE_BANNER_COLOR
+            )
+            if banner_color == _TEMPLATE_BANNER_COLOR_NONE:
+                banner_color = _normalize_template_banner_color(_DEFAULT_TEMPLATE_BANNER_COLOR)
+        else:
+            banner_color = _normalize_template_banner_color(selected)
+
+        self.current_payload["banner_color"] = banner_color
+        self._save_current_template()
+        self._refresh_preview()
+
+    def _on_template_banner_color_preset_changed(self, *_args: Any) -> None:
+        if self._updating or not self.current_payload:
+            return
+
+        selected = str(self.template_banner_color_combo.currentData() or "").strip().lower()
+        self._updating = True
+        try:
+            if selected == _TEMPLATE_BANNER_COLOR_NONE:
+                self.template_banner_color_edit.setText("")
+            elif selected and selected != _TEMPLATE_BANNER_COLOR_CUSTOM:
+                self.template_banner_color_edit.setText(selected)
+        finally:
+            self._updating = False
+        self._apply_template_banner_color()
+
+    def _on_template_banner_color_text_changed(self, *_args: Any) -> None:
+        if self._updating or not self.current_payload:
+            return
+
+        selected = str(self.template_banner_color_combo.currentData() or "").strip().lower()
+        text = self.template_banner_color_edit.text().strip()
+        should_switch_to_custom = False
+        if text:
+            if selected == _TEMPLATE_BANNER_COLOR_NONE:
+                should_switch_to_custom = True
+            elif selected not in {_TEMPLATE_BANNER_COLOR_CUSTOM, ""} and text.lower() != selected:
+                should_switch_to_custom = True
+        if should_switch_to_custom:
+            custom_idx = self._template_banner_color_combo_index_for_value(_TEMPLATE_BANNER_COLOR_CUSTOM)
+            if custom_idx >= 0:
+                self.template_banner_color_combo.blockSignals(True)
+                try:
+                    self.template_banner_color_combo.setCurrentIndex(custom_idx)
+                finally:
+                    self.template_banner_color_combo.blockSignals(False)
+        self._apply_template_banner_color()
+
+    def _pick_template_banner_color(self) -> None:
+        initial_text = self.template_banner_color_edit.text().strip() or _DEFAULT_TEMPLATE_BANNER_COLOR
+        initial = QColor(initial_text)
+        chosen = QColorDialog.getColor(initial, self, "选择 Banner 颜色")
+        if not chosen.isValid():
+            return
+
+        custom_idx = self._template_banner_color_combo_index_for_value(_TEMPLATE_BANNER_COLOR_CUSTOM)
+        if custom_idx >= 0:
+            self.template_banner_color_combo.setCurrentIndex(custom_idx)
+        self.template_banner_color_edit.setText(chosen.name())
 
     def _populate_field_list(self, fields: list[dict[str, Any]]) -> None:
         self.field_list.blockSignals(True)
@@ -2622,8 +3066,12 @@ class TemplateManagerDialog(QDialog):
                 "stem": "sample",
                 "filename": "sample.jpg",
             }
+            preview_base = self.placeholder.copy()
+            ratio = _parse_ratio_value(self.current_payload.get("ratio"))
+            if ratio is not None:
+                preview_base = _crop_to_ratio_with_anchor(preview_base, ratio, (0.5, 0.5))
             image = render_template_overlay(
-                self.placeholder.copy(),
+                preview_base,
                 raw_metadata=SAMPLE_RAW_METADATA,
                 metadata_context=metadata_context,
                 template_payload=self.current_payload,
@@ -2777,10 +3225,15 @@ class BirdStampEditorWindow(QMainWindow):
         for suffix, label in OUTPUT_FORMAT_OPTIONS:
             self.output_format_combo.addItem(label, suffix)
         if self.output_format_combo.count() == 0:
-            self.output_format_combo.addItem("JPG", "jpg")
             self.output_format_combo.addItem("PNG", "png")
+            self.output_format_combo.addItem("JPG", "jpg")
         self.output_format_combo.currentIndexChanged.connect(self._on_output_settings_changed)
         output_form.addRow("输出格式", self.output_format_combo)
+
+        self.draw_template_overlay_check = QCheckBox("绘制 Banner / 文本")
+        self.draw_template_overlay_check.setChecked(True)
+        self.draw_template_overlay_check.toggled.connect(self._on_output_settings_changed)
+        output_form.addRow("叠加信息", self.draw_template_overlay_check)
 
         self.max_edge_combo = QComboBox()
         seen_edges: set[int] = set()
@@ -3137,6 +3590,8 @@ class BirdStampEditorWindow(QMainWindow):
         if self.current_path is None:
             return ""
         base = self._source_signature(self.current_path)
+        template_name = str(self.template_combo.currentText() or "default").strip() or "default"
+        draw_overlay = bool(self.draw_template_overlay_check.isChecked())
         r = self._selected_ratio()
         cm = self._selected_center_mode()
         auto_crop = bool(self.auto_crop_by_bird_check.isChecked())
@@ -3146,7 +3601,7 @@ class BirdStampEditorWindow(QMainWindow):
         pr = self.crop_padding_right.value()
         fill = getattr(self, "crop_padding_fill_combo", None)
         fill_val = fill.currentData() if fill is not None and fill.currentData() else "#FFFFFF"
-        return f"{base}|{r}|{cm}|{auto_crop}|{pt}_{pb}_{pl}_{pr}|{fill_val}"
+        return f"{base}|{template_name}|{draw_overlay}|{r}|{cm}|{auto_crop}|{pt}_{pb}_{pl}_{pr}|{fill_val}"
 
     def _load_original_mode_pixmap(self) -> QPixmap | None:
         if self.current_path is None or self.current_source_image is None:
@@ -3167,12 +3622,28 @@ class BirdStampEditorWindow(QMainWindow):
         original_settings["max_long_edge"] = 0
         try:
             # 原尺寸模式显示未裁切预览源，仅保持原始分辨率。
+            raw_metadata = dict(self.current_raw_metadata)
+            crop_box, _outer_pad = self._compute_crop_plan_for_image(
+                path=self.current_path,
+                image=self.current_source_image,
+                raw_metadata=raw_metadata,
+                settings=original_settings,
+            )
             img = self._build_processed_image(
                 self.current_source_image.copy(),
-                dict(self.current_raw_metadata),
+                raw_metadata,
                 settings=original_settings,
                 source_path=self.current_path,
                 apply_ratio_crop=False,
+            )
+            img = self._render_overlay_for_preview_frame(
+                preview_base=img,
+                source_image=self.current_source_image,
+                raw_metadata=raw_metadata,
+                metadata_context=dict(self.current_metadata_context),
+                settings=original_settings,
+                source_path=self.current_path,
+                crop_box=crop_box,
             )
             direct_pixmap = _pil_to_qpixmap(img)
             if not direct_pixmap.isNull():
@@ -3316,6 +3787,7 @@ class BirdStampEditorWindow(QMainWindow):
         selected = preferred if preferred in self.template_paths else names[0]
         self.template_combo.setCurrentText(selected)
         self._load_selected_template(selected)
+        self._apply_template_ratio_to_main_output()
 
     def _load_selected_template(self, name: str) -> None:
         path = self.template_paths.get(name)
@@ -3327,11 +3799,26 @@ class BirdStampEditorWindow(QMainWindow):
             self._show_error("模板错误", str(exc))
             self.current_template_payload = _default_template_payload(name="default")
 
+    def _apply_template_ratio_to_main_output(self) -> None:
+        ratio = _parse_ratio_value(self.current_template_payload.get("ratio"))
+        idx = self._ratio_combo_index_for_value(ratio)
+        if idx < 0:
+            return
+        self.ratio_combo.blockSignals(True)
+        try:
+            self.ratio_combo.setCurrentIndex(idx)
+        finally:
+            self.ratio_combo.blockSignals(False)
+
     def _on_template_changed(self, name: str) -> None:
         if not name:
             return
         self._load_selected_template(name)
+        self._apply_template_ratio_to_main_output()
+        self._invalidate_original_mode_cache()
         if self.current_path:
+            self._on_output_settings_changed()
+        else:
             self.render_preview()
 
     def _open_template_manager(self) -> None:
@@ -3420,6 +3907,81 @@ class BirdStampEditorWindow(QMainWindow):
                     return text
         return ""
 
+    def _extract_display_rating_from_metadata(self, raw_metadata: dict[str, Any]) -> int | None:
+        if not isinstance(raw_metadata, dict):
+            return None
+
+        def _value_to_rating(value: Any) -> int | None:
+            if value is None:
+                return None
+            if isinstance(value, (list, tuple)):
+                for item in value:
+                    parsed = _value_to_rating(item)
+                    if parsed is not None:
+                        return parsed
+                return None
+            if isinstance(value, dict):
+                for item in value.values():
+                    parsed = _value_to_rating(item)
+                    if parsed is not None:
+                        return parsed
+                return None
+
+            text = _clean_text(value)
+            if text:
+                full_star_count = text.count("★")
+                if full_star_count > 0:
+                    return max(0, min(5, full_star_count))
+            else:
+                text = str(value).strip()
+
+            number_match = re.search(r"[-+]?\d+(?:\.\d+)?", text)
+            if not number_match:
+                return None
+            try:
+                raw_score = float(number_match.group(0))
+            except Exception:
+                return None
+            if raw_score < 0:
+                return None
+            if raw_score > 5:
+                raw_score = raw_score / 20.0
+            score = int(round(raw_score))
+            return max(0, min(5, score))
+
+        lookup = _normalize_lookup(raw_metadata)
+        key_candidates = (
+            "XMP:Rating",
+            "XMP-xmp:Rating",
+            "EXIF:Rating",
+            "Composite:Rating",
+            "Rating",
+        )
+        for key in key_candidates:
+            value = lookup.get(key.lower())
+            if value is None:
+                value = raw_metadata.get(key)
+            parsed = _value_to_rating(value)
+            if parsed is not None:
+                return parsed
+
+        for key, value in raw_metadata.items():
+            key_text = str(key or "").strip().lower()
+            if "rating" not in key_text:
+                continue
+            parsed = _value_to_rating(value)
+            if parsed is not None:
+                return parsed
+        return None
+
+    def _format_rating_display(self, rating: int | None) -> str:
+        if rating is None:
+            return "-"
+        stars = max(0, min(5, int(rating)))
+        if stars <= 0:
+            return "-"
+        return "★" * stars
+
     def _find_photo_item_by_path(self, path: Path) -> QTreeWidgetItem | None:
         key = _path_key(path)
         for idx in range(self.photo_list.topLevelItemCount()):
@@ -3444,16 +4006,20 @@ class BirdStampEditorWindow(QMainWindow):
 
         metadata = raw_metadata if isinstance(raw_metadata, dict) else self._load_raw_metadata(path)
         title = self._extract_display_title_from_metadata(metadata)
+        rating_text = self._format_rating_display(self._extract_display_rating_from_metadata(metadata))
         active_settings = settings if isinstance(settings, dict) else self._render_settings_for_path(path, prefer_current_ui=False)
         ratio_text = self._format_ratio_display(_parse_ratio_value(active_settings.get("ratio")))
 
         item.setText(0, path.name)
         item.setText(1, title or "-")
         item.setText(2, ratio_text)
+        item.setText(3, rating_text)
         item.setToolTip(0, str(path))
         item.setToolTip(1, title or "")
         item.setToolTip(2, ratio_text)
+        item.setToolTip(3, rating_text)
         item.setTextAlignment(2, int(Qt.AlignmentFlag.AlignCenter))
+        item.setTextAlignment(3, int(Qt.AlignmentFlag.AlignCenter))
 
     def _list_photo_paths(self) -> list[Path]:
         paths: list[Path] = []
@@ -3484,14 +4050,17 @@ class BirdStampEditorWindow(QMainWindow):
             self.photo_render_overrides[key] = current_settings
             raw_metadata = self._load_raw_metadata(path)
             title = self._extract_display_title_from_metadata(raw_metadata)
+            rating_text = self._format_rating_display(self._extract_display_rating_from_metadata(raw_metadata))
             ratio_text = self._format_ratio_display(_parse_ratio_value(current_settings.get("ratio")))
 
-            item = QTreeWidgetItem([path.name, title or "-", ratio_text])
+            item = QTreeWidgetItem([path.name, title or "-", ratio_text, rating_text])
             item.setData(0, Qt.ItemDataRole.UserRole, str(path))
             item.setToolTip(0, str(path))
             item.setToolTip(1, title or "")
             item.setToolTip(2, ratio_text)
+            item.setToolTip(3, rating_text)
             item.setTextAlignment(2, int(Qt.AlignmentFlag.AlignCenter))
+            item.setTextAlignment(3, int(Qt.AlignmentFlag.AlignCenter))
             self.photo_list.addTopLevelItem(item)
             add_count += 1
 
@@ -3605,12 +4174,16 @@ class BirdStampEditorWindow(QMainWindow):
     def _selected_center_mode(self) -> str:
         return _normalize_center_mode(self.center_mode_combo.currentData())
 
+    def _should_draw_template_overlay(self, settings: dict[str, Any]) -> bool:
+        return _parse_bool_value(settings.get("draw_template_overlay"), True)
+
     def _build_current_render_settings(self) -> dict[str, Any]:
         template_name = str(self.template_combo.currentText() or "default").strip() or "default"
         template_payload = _normalize_template_payload(self.current_template_payload, fallback_name=template_name)
         return {
             "template_name": template_name,
             "template_payload": _deep_copy_payload(template_payload),
+            "draw_template_overlay": bool(self.draw_template_overlay_check.isChecked()),
             "ratio": self._selected_ratio(),
             "center_mode": self._selected_center_mode(),
             "auto_crop_by_bird": bool(self.auto_crop_by_bird_check.isChecked()),
@@ -3660,6 +4233,7 @@ class BirdStampEditorWindow(QMainWindow):
         return {
             "template_name": template_name,
             "template_payload": _deep_copy_payload(template_payload),
+            "draw_template_overlay": _parse_bool_value(settings.get("draw_template_overlay"), True),
             "ratio": ratio,
             "center_mode": _normalize_center_mode(settings.get("center_mode")),
             "auto_crop_by_bird": _parse_bool_value(settings.get("auto_crop_by_bird"), False),
@@ -3681,6 +4255,8 @@ class BirdStampEditorWindow(QMainWindow):
         payload_raw = raw.get("template_payload")
         if isinstance(payload_raw, dict):
             settings["template_payload"] = _normalize_template_payload(payload_raw, fallback_name=template_name)
+        if "draw_template_overlay" in raw:
+            settings["draw_template_overlay"] = _parse_bool_value(raw.get("draw_template_overlay"), settings["draw_template_overlay"])
 
         ratio_raw = raw.get("ratio")
         if ratio_raw is None or ratio_raw == "":
@@ -3752,6 +4328,7 @@ class BirdStampEditorWindow(QMainWindow):
         template_name = str(normalized["template_name"])
 
         self.template_combo.blockSignals(True)
+        self.draw_template_overlay_check.blockSignals(True)
         self.ratio_combo.blockSignals(True)
         self.center_mode_combo.blockSignals(True)
         self.auto_crop_by_bird_check.blockSignals(True)
@@ -3769,6 +4346,7 @@ class BirdStampEditorWindow(QMainWindow):
             template_idx = self.template_combo.findText(template_name)
             if template_idx >= 0:
                 self.template_combo.setCurrentIndex(template_idx)
+            self.draw_template_overlay_check.setChecked(bool(normalized.get("draw_template_overlay", True)))
 
             ratio_idx = self._ratio_combo_index_for_value(normalized["ratio"])
             if ratio_idx >= 0:
@@ -3828,6 +4406,7 @@ class BirdStampEditorWindow(QMainWindow):
             self.auto_crop_by_bird_check.blockSignals(False)
             self.center_mode_combo.blockSignals(False)
             self.ratio_combo.blockSignals(False)
+            self.draw_template_overlay_check.blockSignals(False)
             self.template_combo.blockSignals(False)
 
         self.current_template_payload = _normalize_template_payload(
@@ -4099,6 +4678,85 @@ class BirdStampEditorWindow(QMainWindow):
             return value
         return supported[0]
 
+    def _compose_preview_with_crop_aligned_overlay(
+        self,
+        *,
+        preview_base: Image.Image,
+        rendered_crop: Image.Image,
+        crop_box: tuple[float, float, float, float] | None,
+    ) -> Image.Image:
+        if not _crop_box_has_effect(crop_box):
+            return rendered_crop
+
+        crop_px = _normalized_box_to_pixel_box(crop_box, preview_base.width, preview_base.height)
+        if crop_px is None:
+            return preview_base
+        left, top, right, bottom = crop_px
+        target_w = max(1, right - left)
+        target_h = max(1, bottom - top)
+
+        patch = rendered_crop.convert("RGB")
+        if patch.width != target_w or patch.height != target_h:
+            patch = patch.resize((target_w, target_h), Image.Resampling.LANCZOS)
+
+        merged = preview_base.copy()
+        merged.paste(patch, (left, top))
+        return merged
+
+    def _resolve_template_payload_for_render(self, settings: dict[str, Any]) -> dict[str, Any]:
+        template_name = str(settings.get("template_name") or "default").strip() or "default"
+        payload_raw = settings.get("template_payload")
+        if isinstance(payload_raw, dict):
+            payload = _normalize_template_payload(payload_raw, fallback_name=template_name)
+        else:
+            payload = _default_template_payload(name=template_name)
+
+        # 主预览和导出的 Banner 颜色始终跟随模板文件配置。
+        template_path = self.template_paths.get(template_name)
+        if template_path and template_path.is_file():
+            try:
+                template_file_payload = _load_template_payload(template_path)
+                payload["banner_color"] = _normalize_template_banner_color(
+                    template_file_payload.get("banner_color")
+                )
+            except Exception:
+                pass
+        return payload
+
+    def _render_overlay_for_preview_frame(
+        self,
+        *,
+        preview_base: Image.Image,
+        source_image: Image.Image,
+        raw_metadata: dict[str, Any],
+        metadata_context: dict[str, str],
+        settings: dict[str, Any],
+        source_path: Path,
+        crop_box: tuple[float, float, float, float] | None,
+    ) -> Image.Image:
+        if not self._should_draw_template_overlay(settings):
+            return preview_base
+
+        template_payload = self._resolve_template_payload_for_render(settings)
+        final_cropped = self._build_processed_image(
+            source_image.copy(),
+            raw_metadata,
+            settings=settings,
+            source_path=source_path,
+            apply_ratio_crop=True,
+        )
+        rendered_crop = render_template_overlay(
+            final_cropped,
+            raw_metadata=raw_metadata,
+            metadata_context=metadata_context,
+            template_payload=template_payload,
+        )
+        return self._compose_preview_with_crop_aligned_overlay(
+            preview_base=preview_base,
+            rendered_crop=rendered_crop,
+            crop_box=crop_box,
+        )
+
     def _build_processed_image(
         self,
         image: Image.Image,
@@ -4131,11 +4789,9 @@ class BirdStampEditorWindow(QMainWindow):
         if self.current_path and path == self.current_path and self.current_source_image is not None:
             source_image = self.current_source_image.copy()
             raw_metadata = dict(self.current_raw_metadata)
-            context = dict(self.current_metadata_context)
         else:
             source_image = decode_image(path, decoder="auto")
             raw_metadata = self._load_raw_metadata(path)
-            context = _build_metadata_context(path, raw_metadata)
 
         processed = self._build_processed_image(
             source_image,
@@ -4144,13 +4800,20 @@ class BirdStampEditorWindow(QMainWindow):
             source_path=path,
             apply_ratio_crop=True,
         )
-        rendered = render_template_overlay(
+        if not self._should_draw_template_overlay(settings):
+            return processed
+
+        template_payload = self._resolve_template_payload_for_render(settings)
+        if self.current_path and path == self.current_path and self.current_source_image is not None:
+            context = dict(self.current_metadata_context)
+        else:
+            context = _build_metadata_context(path, raw_metadata)
+        return render_template_overlay(
             processed,
             raw_metadata=raw_metadata,
             metadata_context=context,
-            template_payload=settings["template_payload"],
+            template_payload=template_payload,
         )
-        return rendered
 
     def render_preview(self, *_args: Any) -> None:
         if not self.current_path:
@@ -4158,13 +4821,20 @@ class BirdStampEditorWindow(QMainWindow):
             self._set_status("请选择照片后再预览。")
             return
 
+        crop_box: tuple[float, float, float, float] | None = None
+        outer_pad: tuple[int, int, int, int] = (0, 0, 0, 0)
         try:
             if self.current_source_image is None:
                 raise RuntimeError("缺少当前原图数据")
             settings = self._render_settings_for_path(self.current_path, prefer_current_ui=True)
             source_image = self.current_source_image.copy()
             raw_metadata = dict(self.current_raw_metadata)
-            context = dict(self.current_metadata_context)
+            crop_box, outer_pad = self._compute_crop_plan_for_image(
+                path=self.current_path,
+                image=self.current_source_image,
+                raw_metadata=raw_metadata,
+                settings=settings,
+            )
             # 预览保持完整画面，仅通过“显示裁切效果”遮罩提示最终裁切范围。
             processed = self._build_processed_image(
                 source_image,
@@ -4173,11 +4843,14 @@ class BirdStampEditorWindow(QMainWindow):
                 source_path=self.current_path,
                 apply_ratio_crop=False,
             )
-            rendered = render_template_overlay(
-                processed,
+            rendered = self._render_overlay_for_preview_frame(
+                preview_base=processed,
+                source_image=source_image,
                 raw_metadata=raw_metadata,
-                metadata_context=context,
-                template_payload=settings["template_payload"],
+                metadata_context=dict(self.current_metadata_context),
+                settings=settings,
+                source_path=self.current_path,
+                crop_box=crop_box,
             )
         except Exception as exc:
             self.preview_focus_box = None
@@ -4189,12 +4862,6 @@ class BirdStampEditorWindow(QMainWindow):
             return
 
         self.last_rendered = rendered
-        crop_box, outer_pad = self._compute_crop_plan_for_image(
-            path=self.current_path,
-            image=self.current_source_image,
-            raw_metadata=raw_metadata,
-            settings=settings,
-        )
         pad_top, pad_bottom, pad_left, pad_right = outer_pad
         self.preview_focus_box = _transform_source_box_after_crop_padding(
             _extract_focus_box(raw_metadata, self.current_source_image.width, self.current_source_image.height),
