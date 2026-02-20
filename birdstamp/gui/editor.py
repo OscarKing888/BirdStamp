@@ -6,6 +6,7 @@ import math
 import re
 import sys
 import threading
+import xml.etree.ElementTree as ET
 from collections import defaultdict
 from functools import lru_cache
 from importlib import resources
@@ -16,6 +17,7 @@ from PIL import Image, ImageColor, ImageDraw, ImageOps
 from PyQt6.QtCore import QEvent, QPointF, QRectF, Qt, pyqtSignal
 from PyQt6.QtGui import QAction, QColor, QImage, QKeySequence, QPainter, QPainterPath, QPalette, QPen, QPixmap
 from PyQt6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QCheckBox,
     QComboBox,
@@ -34,9 +36,12 @@ from PyQt6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QHeaderView,
     QSlider,
     QSplitter,
     QSpinBox,
+    QTreeWidget,
+    QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
     QColorDialog,
@@ -72,7 +77,18 @@ _CENTER_MODE_FOCUS = "focus"
 _CENTER_MODE_BIRD = "bird"
 _CENTER_MODE_OPTIONS = (_CENTER_MODE_IMAGE, _CENTER_MODE_FOCUS, _CENTER_MODE_BIRD)
 _DEFAULT_CROP_EFFECT_ALPHA = 160
-_DEFAULT_CROP_PADDING_PX = 0
+_DEFAULT_CROP_PADDING_PX = 128
+_XML_LANG_ATTR = "{http://www.w3.org/XML/1998/namespace}lang"
+_RDF_NS = "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+_RDF_DESC_TAG = f"{{{_RDF_NS}}}Description"
+_RDF_LI_TAG = f"{{{_RDF_NS}}}li"
+_RDF_RESOURCE_ATTR = f"{{{_RDF_NS}}}resource"
+_XMP_NS_TO_PREFIX = {
+    "http://purl.org/dc/elements/1.1/": "XMP-dc",
+    "http://ns.adobe.com/photoshop/1.0/": "XMP-photoshop",
+    "http://ns.adobe.com/xap/1.0/": "XMP",
+    "http://ns.adobe.com/xmp/1.0/DynamicMedia/": "XMP-xmpDM",
+}
 
 
 @lru_cache(maxsize=1)
@@ -260,6 +276,113 @@ def _normalize_lookup(raw: dict[str, Any]) -> dict[str, Any]:
         if ":" in key_text:
             lookup.setdefault(key_text.split(":")[-1], value)
     return lookup
+
+
+def _split_xml_tag(tag: str) -> tuple[str, str]:
+    if not isinstance(tag, str):
+        return ("", "")
+    if tag.startswith("{") and "}" in tag:
+        uri, local = tag[1:].split("}", 1)
+        return (uri, local)
+    return ("", tag)
+
+
+def _find_sidecar_xmp_path(source_path: Path) -> Path | None:
+    candidates = (
+        source_path.with_suffix(".xmp"),
+        source_path.with_suffix(".XMP"),
+    )
+    for candidate in candidates:
+        if candidate.exists() and candidate.is_file():
+            return candidate
+
+    try:
+        for sibling in source_path.parent.iterdir():
+            if not sibling.is_file():
+                continue
+            if sibling.stem != source_path.stem:
+                continue
+            if sibling.suffix.lower() == ".xmp":
+                return sibling
+    except Exception:
+        return None
+    return None
+
+
+def _extract_xmp_property_value(node: ET.Element) -> Any | None:
+    li_nodes = node.findall(f".//{_RDF_LI_TAG}")
+    if li_nodes:
+        default_text: str | None = None
+        values: list[str] = []
+        for li in li_nodes:
+            text = _clean_text(li.text)
+            if not text:
+                continue
+            values.append(text)
+            lang = str(li.attrib.get(_XML_LANG_ATTR) or "").strip().lower()
+            if lang == "x-default" and default_text is None:
+                default_text = text
+        if default_text:
+            return default_text
+        if values:
+            return values[0] if len(values) == 1 else values
+
+    resource_text = _clean_text(node.attrib.get(_RDF_RESOURCE_ATTR))
+    if resource_text:
+        return resource_text
+
+    direct_text = _clean_text(node.text)
+    if direct_text:
+        return direct_text
+
+    all_text = _clean_text(" ".join(part for part in node.itertext() if isinstance(part, str)))
+    if all_text:
+        return all_text
+    return None
+
+
+def _load_sidecar_xmp_metadata(source_path: Path) -> dict[str, Any]:
+    xmp_path = _find_sidecar_xmp_path(source_path)
+    if xmp_path is None:
+        return {}
+
+    try:
+        payload = xmp_path.read_bytes()
+    except Exception:
+        return {}
+
+    try:
+        root = ET.fromstring(payload)
+    except Exception:
+        try:
+            root = ET.fromstring(payload.decode("utf-8", errors="ignore"))
+        except Exception:
+            return {}
+
+    parsed: dict[str, Any] = {}
+    for desc in root.findall(f".//{_RDF_DESC_TAG}"):
+        for child in list(desc):
+            if not isinstance(child.tag, str):
+                continue
+            namespace_uri, local_name = _split_xml_tag(child.tag)
+            local = str(local_name or "").strip()
+            if not local:
+                continue
+            value = _extract_xmp_property_value(child)
+            if value is None:
+                continue
+            prefix = _XMP_NS_TO_PREFIX.get(namespace_uri, "XMP")
+            parsed[f"{prefix}:{local}"] = value
+
+            if namespace_uri == "http://purl.org/dc/elements/1.1/" and local.lower() == "title":
+                parsed.setdefault("XMP:Title", value)
+                parsed.setdefault("Title", value)
+            if namespace_uri == "http://purl.org/dc/elements/1.1/" and local.lower() == "description":
+                parsed.setdefault("XMP:Description", value)
+
+    if parsed:
+        parsed["XMP:SidecarFile"] = str(xmp_path)
+    return parsed
 
 
 def _extract_numbers(value: Any) -> list[float]:
@@ -716,6 +839,14 @@ def _parse_bool_value(value: Any, default: bool = False) -> bool:
     return default
 
 
+def _parse_padding_value(value: Any, default: int = _DEFAULT_CROP_PADDING_PX) -> int:
+    try:
+        parsed = int(value)
+    except Exception:
+        parsed = int(default)
+    return max(-9999, min(9999, parsed))
+
+
 def _expand_unit_box_to_unclamped_pixels(
     box: tuple[float, float, float, float] | None,
     *,
@@ -729,11 +860,25 @@ def _expand_unit_box_to_unclamped_pixels(
     normalized = _normalize_unit_box(box)
     if normalized is None or width <= 0 or height <= 0:
         return None
+    left_px = normalized[0] * width - int(left)
+    top_px = normalized[1] * height - int(top)
+    right_px = normalized[2] * width + int(right)
+    bottom_px = normalized[3] * height + int(bottom)
+
+    if right_px <= left_px:
+        center_x = ((normalized[0] + normalized[2]) * 0.5) * width
+        left_px = center_x - 0.5
+        right_px = center_x + 0.5
+    if bottom_px <= top_px:
+        center_y = ((normalized[1] + normalized[3]) * 0.5) * height
+        top_px = center_y - 0.5
+        bottom_px = center_y + 0.5
+
     return (
-        normalized[0] * width - max(0, int(left)),
-        normalized[1] * height - max(0, int(top)),
-        normalized[2] * width + max(0, int(right)),
-        normalized[3] * height + max(0, int(bottom)),
+        left_px,
+        top_px,
+        right_px,
+        bottom_px,
     )
 
 
@@ -1939,13 +2084,26 @@ class PreviewCanvas(QLabel):
         painter.end()
 
 
-class PhotoListWidget(QListWidget):
+class PhotoListWidget(QTreeWidget):
     pathsDropped = pyqtSignal(list)
 
     def __init__(self) -> None:
         super().__init__()
+        self.setColumnCount(3)
+        self.setHeaderLabels(["照片", "Title", "裁切比例"])
+        self.setRootIsDecorated(False)
+        self.setUniformRowHeights(True)
+        self.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.setAcceptDrops(True)
-        self.setDragDropMode(QListWidget.DragDropMode.DropOnly)
+        self.setDragDropMode(QAbstractItemView.DragDropMode.DropOnly)
+        header = self.header()
+        header.setStretchLastSection(False)
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        header.resizeSection(0, 260)
+        header.resizeSection(1, 160)
+        header.resizeSection(2, 96)
 
     def dragEnterEvent(self, event) -> None:  # type: ignore[override]
         if event.mimeData().hasUrls():
@@ -2587,7 +2745,7 @@ class BirdStampEditorWindow(QMainWindow):
         photos_layout.addLayout(photo_btn_row)
 
         self.photo_list = PhotoListWidget()
-        self.photo_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
+        self.photo_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.photo_list.pathsDropped.connect(self._add_photo_paths)
         self.photo_list.currentItemChanged.connect(self._on_photo_selected)
         photos_layout.addWidget(self.photo_list, stretch=1)
@@ -2621,6 +2779,7 @@ class BirdStampEditorWindow(QMainWindow):
         if self.output_format_combo.count() == 0:
             self.output_format_combo.addItem("JPG", "jpg")
             self.output_format_combo.addItem("PNG", "png")
+        self.output_format_combo.currentIndexChanged.connect(self._on_output_settings_changed)
         output_form.addRow("输出格式", self.output_format_combo)
 
         self.max_edge_combo = QComboBox()
@@ -2647,25 +2806,25 @@ class BirdStampEditorWindow(QMainWindow):
             self.max_edge_combo.setCurrentIndex(1)
         else:
             self.max_edge_combo.setCurrentIndex(0)
-        self.max_edge_combo.currentIndexChanged.connect(self.render_preview)
+        self.max_edge_combo.currentIndexChanged.connect(self._on_output_settings_changed)
         output_form.addRow("最大长边", self.max_edge_combo)
 
         self.ratio_combo = QComboBox()
         for label, ratio in RATIO_OPTIONS:
             self.ratio_combo.addItem(label, ratio)
-        self.ratio_combo.currentIndexChanged.connect(self.render_preview)
+        self.ratio_combo.currentIndexChanged.connect(self._on_output_settings_changed)
         output_form.addRow("裁切比例", self.ratio_combo)
 
         self.center_mode_combo = QComboBox()
         self.center_mode_combo.addItem("鸟体", _CENTER_MODE_BIRD)
         self.center_mode_combo.addItem("焦点", _CENTER_MODE_FOCUS)
         self.center_mode_combo.addItem("图像中心", _CENTER_MODE_IMAGE)
-        self.center_mode_combo.currentIndexChanged.connect(self.render_preview)
+        self.center_mode_combo.currentIndexChanged.connect(self._on_output_settings_changed)
         output_form.addRow("裁切中心", self.center_mode_combo)
 
         self.auto_crop_by_bird_check = QCheckBox("自动根据鸟体计算")
-        self.auto_crop_by_bird_check.setChecked(False)
-        self.auto_crop_by_bird_check.toggled.connect(self._on_auto_crop_by_bird_toggled)
+        self.auto_crop_by_bird_check.setChecked(True)
+        self.auto_crop_by_bird_check.toggled.connect(self._on_output_settings_changed)
         output_form.addRow("裁切策略", self.auto_crop_by_bird_check)
 
         crop_padding_widget = QWidget()
@@ -2673,34 +2832,41 @@ class BirdStampEditorWindow(QMainWindow):
         crop_padding_grid.setContentsMargins(0, 4, 0, 4)
         crop_padding_grid.setSpacing(6)
         pad_default = _DEFAULT_CROP_PADDING_PX
-        self.crop_padding_top = QSpinBox()
-        self.crop_padding_top.setRange(0, 9999)
-        self.crop_padding_top.setValue(pad_default)
-        self.crop_padding_top.setSuffix(" px")
-        self.crop_padding_top.setAccessibleName("裁切边界内填充-上")
-        self.crop_padding_top.valueChanged.connect(self.render_preview)
-        crop_padding_grid.addWidget(self.crop_padding_top, 0, 1, Qt.AlignmentFlag.AlignCenter)
-        self.crop_padding_left = QSpinBox()
-        self.crop_padding_left.setRange(0, 9999)
-        self.crop_padding_left.setValue(pad_default)
-        self.crop_padding_left.setSuffix(" px")
-        self.crop_padding_left.setAccessibleName("裁切边界内填充-左")
-        self.crop_padding_left.valueChanged.connect(self.render_preview)
-        crop_padding_grid.addWidget(self.crop_padding_left, 1, 0, Qt.AlignmentFlag.AlignCenter)
-        self.crop_padding_right = QSpinBox()
-        self.crop_padding_right.setRange(0, 9999)
-        self.crop_padding_right.setValue(pad_default)
-        self.crop_padding_right.setSuffix(" px")
-        self.crop_padding_right.setAccessibleName("裁切边界内填充-右")
-        self.crop_padding_right.valueChanged.connect(self.render_preview)
-        crop_padding_grid.addWidget(self.crop_padding_right, 1, 2, Qt.AlignmentFlag.AlignCenter)
-        self.crop_padding_bottom = QSpinBox()
-        self.crop_padding_bottom.setRange(0, 9999)
-        self.crop_padding_bottom.setValue(pad_default)
-        self.crop_padding_bottom.setSuffix(" px")
-        self.crop_padding_bottom.setAccessibleName("裁切边界内填充-下")
-        self.crop_padding_bottom.valueChanged.connect(self.render_preview)
-        crop_padding_grid.addWidget(self.crop_padding_bottom, 2, 1, Qt.AlignmentFlag.AlignCenter)
+
+        def _build_crop_padding_control(accessible_name: str) -> tuple[QWidget, QSpinBox, QSlider]:
+            wrapper = QWidget()
+            wrapper_layout = QVBoxLayout(wrapper)
+            wrapper_layout.setContentsMargins(0, 0, 0, 0)
+            wrapper_layout.setSpacing(2)
+
+            spin = QSpinBox()
+            spin.setRange(-9999, 9999)
+            spin.setValue(pad_default)
+            spin.setSuffix(" px")
+            spin.setAccessibleName(accessible_name)
+            wrapper_layout.addWidget(spin)
+
+            slider = QSlider(Qt.Orientation.Horizontal)
+            slider.setRange(-512, 512)
+            slider.setSingleStep(1)
+            slider.setPageStep(16)
+            slider.setValue(max(slider.minimum(), min(slider.maximum(), pad_default)))
+            wrapper_layout.addWidget(slider)
+
+            spin.valueChanged.connect(lambda value, target=slider: self._sync_crop_padding_slider_from_spin(target, value))
+            spin.valueChanged.connect(self._on_output_settings_changed)
+            slider.valueChanged.connect(lambda value, target=spin: self._sync_crop_padding_spin_from_slider(target, value))
+            return wrapper, spin, slider
+
+        top_widget, self.crop_padding_top, self.crop_padding_top_slider = _build_crop_padding_control("裁切边界内填充-上")
+        left_widget, self.crop_padding_left, self.crop_padding_left_slider = _build_crop_padding_control("裁切边界内填充-左")
+        right_widget, self.crop_padding_right, self.crop_padding_right_slider = _build_crop_padding_control("裁切边界内填充-右")
+        bottom_widget, self.crop_padding_bottom, self.crop_padding_bottom_slider = _build_crop_padding_control("裁切边界内填充-下")
+
+        crop_padding_grid.addWidget(top_widget, 0, 1, Qt.AlignmentFlag.AlignCenter)
+        crop_padding_grid.addWidget(left_widget, 1, 0, Qt.AlignmentFlag.AlignCenter)
+        crop_padding_grid.addWidget(right_widget, 1, 2, Qt.AlignmentFlag.AlignCenter)
+        crop_padding_grid.addWidget(bottom_widget, 2, 1, Qt.AlignmentFlag.AlignCenter)
         output_form.addRow("裁切边界内填充（像素）", crop_padding_widget)
 
         self.crop_padding_fill_combo = QComboBox()
@@ -2711,15 +2877,11 @@ class BirdStampEditorWindow(QMainWindow):
         idx_white = self.crop_padding_fill_combo.findData("#FFFFFF")
         if idx_white >= 0:
             self.crop_padding_fill_combo.setCurrentIndex(idx_white)
-        self.crop_padding_fill_combo.currentIndexChanged.connect(self.render_preview)
+        self.crop_padding_fill_combo.currentIndexChanged.connect(self._on_output_settings_changed)
         self.crop_padding_fill_combo.setToolTip("自动根据鸟体计算时用于图像外圈自动填充色。")
-        output_form.addRow("裁切边界填充色", self.crop_padding_fill_combo)
-        self._set_inner_padding_controls_enabled(False)
+        output_form.addRow("图像外圈填充色", self.crop_padding_fill_combo)
 
         apply_row = QHBoxLayout()
-        self.apply_selected_btn = QPushButton("应用")
-        self.apply_selected_btn.clicked.connect(self._apply_current_settings_to_selected_photos)
-        apply_row.addWidget(self.apply_selected_btn)
 
         self.apply_all_btn = QPushButton("全部应用")
         self.apply_all_btn.clicked.connect(self._apply_current_settings_to_all_photos)
@@ -2761,7 +2923,7 @@ class BirdStampEditorWindow(QMainWindow):
         preview_toolbar.addWidget(self.show_original_size_check)
 
         self.show_crop_effect_check = QCheckBox("显示裁切效果")
-        self.show_crop_effect_check.setChecked(False)
+        self.show_crop_effect_check.setChecked(True)
         self.show_crop_effect_check.toggled.connect(self._on_preview_toolbar_toggled)
         preview_toolbar.addWidget(self.show_crop_effect_check)
 
@@ -2787,7 +2949,7 @@ class BirdStampEditorWindow(QMainWindow):
         preview_toolbar.addWidget(self.show_focus_box_check)
 
         self.show_bird_box_check = QCheckBox("显示鸟体框")
-        self.show_bird_box_check.setChecked(False)
+        self.show_bird_box_check.setChecked(True)
         self.show_bird_box_check.toggled.connect(self._on_preview_toolbar_toggled)
         preview_toolbar.addWidget(self.show_bird_box_check)
         preview_toolbar.addStretch(1)
@@ -2854,7 +3016,7 @@ class BirdStampEditorWindow(QMainWindow):
                 padding: 0 4px;
                 font-weight: 600;
             }}
-            QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QListWidget {{
+            QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QListWidget, QTreeWidget {{
                 border: 1px solid {border_color.name()};
                 border-radius: 7px;
                 padding: 4px 6px;
@@ -2913,15 +3075,29 @@ class BirdStampEditorWindow(QMainWindow):
         self.crop_effect_alpha_value_label.setText(str(alpha))
         self.preview_label.set_crop_effect_alpha(alpha)
 
-    def _set_inner_padding_controls_enabled(self, enabled: bool) -> None:
-        self.crop_padding_top.setEnabled(enabled)
-        self.crop_padding_bottom.setEnabled(enabled)
-        self.crop_padding_left.setEnabled(enabled)
-        self.crop_padding_right.setEnabled(enabled)
-        self.crop_padding_fill_combo.setEnabled(enabled)
+    def _sync_crop_padding_slider_from_spin(self, slider: QSlider, value: int) -> None:
+        clamped = max(slider.minimum(), min(slider.maximum(), int(value)))
+        if slider.value() == clamped:
+            return
+        slider.blockSignals(True)
+        try:
+            slider.setValue(clamped)
+        finally:
+            slider.blockSignals(False)
 
-    def _on_auto_crop_by_bird_toggled(self, checked: bool) -> None:
-        self._set_inner_padding_controls_enabled(bool(checked))
+    def _sync_crop_padding_spin_from_slider(self, spin: QSpinBox, value: int) -> None:
+        parsed = int(value)
+        if spin.value() == parsed:
+            return
+        spin.setValue(parsed)
+
+    def _on_output_settings_changed(self, *_args: Any) -> None:
+        if self.current_path is not None:
+            key = _path_key(self.current_path)
+            snapshot = self._clone_render_settings(self._build_current_render_settings())
+            self.photo_render_overrides[key] = snapshot
+            self._update_photo_list_item_display(self.current_path, settings=snapshot)
+            self._invalidate_original_mode_cache()
         self.render_preview()
 
     def _start_bird_detector_preload(self) -> None:
@@ -3190,13 +3366,102 @@ class BirdStampEditorWindow(QMainWindow):
             return
         self._add_photo_paths(found)
 
+    def _format_ratio_display(self, ratio: float | None) -> str:
+        parsed = _parse_ratio_value(ratio)
+        if parsed is None:
+            return "原比例"
+        idx = self._ratio_combo_index_for_value(parsed)
+        if idx >= 0:
+            label = str(self.ratio_combo.itemText(idx) or "").strip()
+            if label:
+                return label
+        text = f"{parsed:.4f}".rstrip("0").rstrip(".")
+        return text or "原比例"
+
+    def _extract_display_title_from_metadata(self, raw_metadata: dict[str, Any]) -> str:
+        if not isinstance(raw_metadata, dict):
+            return ""
+
+        def _value_to_text(value: Any) -> str:
+            if isinstance(value, dict):
+                for nested in value.values():
+                    text = _clean_text(nested)
+                    if text:
+                        return text
+                return ""
+            text = _clean_text(value)
+            return text or ""
+
+        lookup = _normalize_lookup(raw_metadata)
+        key_candidates = (
+            "XMP:Title",
+            "XMP-dc:Title",
+            "IPTC:ObjectName",
+            "IPTC:Headline",
+            "EXIF:ImageDescription",
+            "EXIF:XPTitle",
+            "Image:Title",
+            "Title",
+            "ImageDescription",
+        )
+        for key in key_candidates:
+            value = lookup.get(key.lower())
+            if value is None:
+                value = raw_metadata.get(key)
+            text = _value_to_text(value)
+            if text:
+                return text
+
+        for key, value in raw_metadata.items():
+            key_text = str(key or "").strip().lower()
+            if ("title" in key_text) or key_text.endswith("imagedescription") or key_text.endswith("headline"):
+                text = _value_to_text(value)
+                if text:
+                    return text
+        return ""
+
+    def _find_photo_item_by_path(self, path: Path) -> QTreeWidgetItem | None:
+        key = _path_key(path)
+        for idx in range(self.photo_list.topLevelItemCount()):
+            item = self.photo_list.topLevelItem(idx)
+            if item is None:
+                continue
+            raw = item.data(0, Qt.ItemDataRole.UserRole)
+            if isinstance(raw, str) and _path_key(Path(raw)) == key:
+                return item
+        return None
+
+    def _update_photo_list_item_display(
+        self,
+        path: Path,
+        *,
+        raw_metadata: dict[str, Any] | None = None,
+        settings: dict[str, Any] | None = None,
+    ) -> None:
+        item = self._find_photo_item_by_path(path)
+        if item is None:
+            return
+
+        metadata = raw_metadata if isinstance(raw_metadata, dict) else self._load_raw_metadata(path)
+        title = self._extract_display_title_from_metadata(metadata)
+        active_settings = settings if isinstance(settings, dict) else self._render_settings_for_path(path, prefer_current_ui=False)
+        ratio_text = self._format_ratio_display(_parse_ratio_value(active_settings.get("ratio")))
+
+        item.setText(0, path.name)
+        item.setText(1, title or "-")
+        item.setText(2, ratio_text)
+        item.setToolTip(0, str(path))
+        item.setToolTip(1, title or "")
+        item.setToolTip(2, ratio_text)
+        item.setTextAlignment(2, int(Qt.AlignmentFlag.AlignCenter))
+
     def _list_photo_paths(self) -> list[Path]:
         paths: list[Path] = []
-        for idx in range(self.photo_list.count()):
-            item = self.photo_list.item(idx)
+        for idx in range(self.photo_list.topLevelItemCount()):
+            item = self.photo_list.topLevelItem(idx)
             if not item:
                 continue
-            raw = item.data(Qt.ItemDataRole.UserRole)
+            raw = item.data(0, Qt.ItemDataRole.UserRole)
             if isinstance(raw, str):
                 paths.append(Path(raw))
         return paths
@@ -3215,19 +3480,29 @@ class BirdStampEditorWindow(QMainWindow):
                 continue
             existing_keys.add(key)
 
-            item = QListWidgetItem(path.name)
-            item.setData(Qt.ItemDataRole.UserRole, str(path))
-            item.setToolTip(str(path))
-            self.photo_list.addItem(item)
-            self.photo_render_overrides[key] = self._clone_render_settings(default_settings)
+            current_settings = self._clone_render_settings(default_settings)
+            self.photo_render_overrides[key] = current_settings
+            raw_metadata = self._load_raw_metadata(path)
+            title = self._extract_display_title_from_metadata(raw_metadata)
+            ratio_text = self._format_ratio_display(_parse_ratio_value(current_settings.get("ratio")))
+
+            item = QTreeWidgetItem([path.name, title or "-", ratio_text])
+            item.setData(0, Qt.ItemDataRole.UserRole, str(path))
+            item.setToolTip(0, str(path))
+            item.setToolTip(1, title or "")
+            item.setToolTip(2, ratio_text)
+            item.setTextAlignment(2, int(Qt.AlignmentFlag.AlignCenter))
+            self.photo_list.addTopLevelItem(item)
             add_count += 1
 
         if add_count == 0:
             self._set_status("没有新增照片。")
             return
 
-        if self.photo_list.currentRow() < 0:
-            self.photo_list.setCurrentRow(0)
+        if self.photo_list.currentItem() is None and self.photo_list.topLevelItemCount() > 0:
+            first_item = self.photo_list.topLevelItem(0)
+            if first_item is not None:
+                self.photo_list.setCurrentItem(first_item)
 
         self._set_status(f"已添加 {add_count} 张照片。")
 
@@ -3238,11 +3513,12 @@ class BirdStampEditorWindow(QMainWindow):
 
         removed_keys: list[str] = []
         for item in selected_items:
-            raw = item.data(Qt.ItemDataRole.UserRole)
+            raw = item.data(0, Qt.ItemDataRole.UserRole)
             if isinstance(raw, str):
                 removed_keys.append(_path_key(Path(raw)))
-            row = self.photo_list.row(item)
-            self.photo_list.takeItem(row)
+            row = self.photo_list.indexOfTopLevelItem(item)
+            if row >= 0:
+                self.photo_list.takeTopLevelItem(row)
 
         for key in removed_keys:
             self.raw_metadata_cache.pop(key, None)
@@ -3250,7 +3526,7 @@ class BirdStampEditorWindow(QMainWindow):
         if removed_keys:
             self._bird_box_cache.clear()
 
-        if self.photo_list.count() == 0:
+        if self.photo_list.topLevelItemCount() == 0:
             self.current_path = None
             self.current_source_image = None
             self.current_raw_metadata = {}
@@ -3275,10 +3551,10 @@ class BirdStampEditorWindow(QMainWindow):
         self._show_placeholder_preview()
         self._set_status("已清空照片列表。")
 
-    def _on_photo_selected(self, current: QListWidgetItem | None, _previous: QListWidgetItem | None) -> None:
+    def _on_photo_selected(self, current: QTreeWidgetItem | None, _previous: QTreeWidgetItem | None) -> None:
         if not current:
             return
-        raw = current.data(Qt.ItemDataRole.UserRole)
+        raw = current.data(0, Qt.ItemDataRole.UserRole)
         if not isinstance(raw, str):
             return
         path = Path(raw)
@@ -3299,6 +3575,7 @@ class BirdStampEditorWindow(QMainWindow):
         self.current_metadata_context = _build_metadata_context(path, self.current_raw_metadata)
         settings = self._render_settings_for_path(path, prefer_current_ui=False)
         self._apply_render_settings_to_ui(settings)
+        self._update_photo_list_item_display(path, raw_metadata=self.current_raw_metadata, settings=settings)
         self.current_file_label.setText(f"当前照片: {path}")
         self.render_preview()
 
@@ -3316,6 +3593,11 @@ class BirdStampEditorWindow(QMainWindow):
             raw_metadata = extract_pillow_metadata(path)
         if not isinstance(raw_metadata, dict):
             raw_metadata = {"SourceFile": str(path)}
+        sidecar_metadata = _load_sidecar_xmp_metadata(path)
+        if sidecar_metadata:
+            merged = dict(raw_metadata)
+            merged.update(sidecar_metadata)
+            raw_metadata = merged
 
         self.raw_metadata_cache[key] = raw_metadata
         return raw_metadata
@@ -3371,10 +3653,7 @@ class BirdStampEditorWindow(QMainWindow):
         max_long_edge = max(0, max_long_edge)
 
         def _pad_px(key: str) -> int:
-            try:
-                return max(0, int(settings.get(key, _DEFAULT_CROP_PADDING_PX)))
-            except Exception:
-                return _DEFAULT_CROP_PADDING_PX
+            return _parse_padding_value(settings.get(key, _DEFAULT_CROP_PADDING_PX), _DEFAULT_CROP_PADDING_PX)
 
         fill = _safe_color(str(settings.get("crop_padding_fill", "#FFFFFF")), "#FFFFFF")
 
@@ -3427,10 +3706,7 @@ class BirdStampEditorWindow(QMainWindow):
             settings["max_long_edge"] = max(0, parsed_max_edge)
 
         def _parse_pad(key: str) -> int:
-            try:
-                return max(0, int(raw.get(key, settings[key])))
-            except Exception:
-                return settings[key]
+            return _parse_padding_value(raw.get(key, settings[key]), settings[key])
 
         for key in ("crop_padding_top", "crop_padding_bottom", "crop_padding_left", "crop_padding_right"):
             if key in raw:
@@ -3484,6 +3760,10 @@ class BirdStampEditorWindow(QMainWindow):
         self.crop_padding_bottom.blockSignals(True)
         self.crop_padding_left.blockSignals(True)
         self.crop_padding_right.blockSignals(True)
+        self.crop_padding_top_slider.blockSignals(True)
+        self.crop_padding_bottom_slider.blockSignals(True)
+        self.crop_padding_left_slider.blockSignals(True)
+        self.crop_padding_right_slider.blockSignals(True)
         self.crop_padding_fill_combo.blockSignals(True)
         try:
             template_idx = self.template_combo.findText(template_name)
@@ -3503,10 +3783,30 @@ class BirdStampEditorWindow(QMainWindow):
             if max_edge_idx >= 0:
                 self.max_edge_combo.setCurrentIndex(max_edge_idx)
 
-            self.crop_padding_top.setValue(max(0, int(normalized.get("crop_padding_top", _DEFAULT_CROP_PADDING_PX))))
-            self.crop_padding_bottom.setValue(max(0, int(normalized.get("crop_padding_bottom", _DEFAULT_CROP_PADDING_PX))))
-            self.crop_padding_left.setValue(max(0, int(normalized.get("crop_padding_left", _DEFAULT_CROP_PADDING_PX))))
-            self.crop_padding_right.setValue(max(0, int(normalized.get("crop_padding_right", _DEFAULT_CROP_PADDING_PX))))
+            top_pad = _parse_padding_value(normalized.get("crop_padding_top", _DEFAULT_CROP_PADDING_PX), _DEFAULT_CROP_PADDING_PX)
+            bottom_pad = _parse_padding_value(
+                normalized.get("crop_padding_bottom", _DEFAULT_CROP_PADDING_PX), _DEFAULT_CROP_PADDING_PX
+            )
+            left_pad = _parse_padding_value(normalized.get("crop_padding_left", _DEFAULT_CROP_PADDING_PX), _DEFAULT_CROP_PADDING_PX)
+            right_pad = _parse_padding_value(
+                normalized.get("crop_padding_right", _DEFAULT_CROP_PADDING_PX), _DEFAULT_CROP_PADDING_PX
+            )
+            self.crop_padding_top.setValue(top_pad)
+            self.crop_padding_bottom.setValue(bottom_pad)
+            self.crop_padding_left.setValue(left_pad)
+            self.crop_padding_right.setValue(right_pad)
+            self.crop_padding_top_slider.setValue(
+                max(self.crop_padding_top_slider.minimum(), min(self.crop_padding_top_slider.maximum(), top_pad))
+            )
+            self.crop_padding_bottom_slider.setValue(
+                max(self.crop_padding_bottom_slider.minimum(), min(self.crop_padding_bottom_slider.maximum(), bottom_pad))
+            )
+            self.crop_padding_left_slider.setValue(
+                max(self.crop_padding_left_slider.minimum(), min(self.crop_padding_left_slider.maximum(), left_pad))
+            )
+            self.crop_padding_right_slider.setValue(
+                max(self.crop_padding_right_slider.minimum(), min(self.crop_padding_right_slider.maximum(), right_pad))
+            )
             fill = _safe_color(str(normalized.get("crop_padding_fill", "#FFFFFF")), "#FFFFFF")
             fill_idx = self.crop_padding_fill_combo.findData(fill)
             if fill_idx >= 0:
@@ -3516,6 +3816,10 @@ class BirdStampEditorWindow(QMainWindow):
                 self.crop_padding_fill_combo.setCurrentIndex(self.crop_padding_fill_combo.count() - 1)
         finally:
             self.crop_padding_fill_combo.blockSignals(False)
+            self.crop_padding_right_slider.blockSignals(False)
+            self.crop_padding_left_slider.blockSignals(False)
+            self.crop_padding_bottom_slider.blockSignals(False)
+            self.crop_padding_top_slider.blockSignals(False)
             self.crop_padding_right.blockSignals(False)
             self.crop_padding_left.blockSignals(False)
             self.crop_padding_bottom.blockSignals(False)
@@ -3525,8 +3829,6 @@ class BirdStampEditorWindow(QMainWindow):
             self.center_mode_combo.blockSignals(False)
             self.ratio_combo.blockSignals(False)
             self.template_combo.blockSignals(False)
-
-        self._set_inner_padding_controls_enabled(bool(normalized.get("auto_crop_by_bird", False)))
 
         self.current_template_payload = _normalize_template_payload(
             normalized["template_payload"],
@@ -3538,7 +3840,7 @@ class BirdStampEditorWindow(QMainWindow):
         paths: list[Path] = []
         if selected_items:
             for item in selected_items:
-                raw = item.data(Qt.ItemDataRole.UserRole)
+                raw = item.data(0, Qt.ItemDataRole.UserRole)
                 if isinstance(raw, str):
                     paths.append(Path(raw))
         elif self.current_path is not None:
@@ -3562,7 +3864,9 @@ class BirdStampEditorWindow(QMainWindow):
 
         snapshot = self._build_current_render_settings()
         for path in targets:
-            self.photo_render_overrides[_path_key(path)] = self._clone_render_settings(snapshot)
+            normalized = self._clone_render_settings(snapshot)
+            self.photo_render_overrides[_path_key(path)] = normalized
+            self._update_photo_list_item_display(path, settings=normalized)
 
         if self.current_path is not None:
             current_key = _path_key(self.current_path)
@@ -3579,7 +3883,9 @@ class BirdStampEditorWindow(QMainWindow):
 
         snapshot = self._build_current_render_settings()
         for path in targets:
-            self.photo_render_overrides[_path_key(path)] = self._clone_render_settings(snapshot)
+            normalized = self._clone_render_settings(snapshot)
+            self.photo_render_overrides[_path_key(path)] = normalized
+            self._update_photo_list_item_display(path, settings=normalized)
 
         if self.current_path is not None:
             self.render_preview()
@@ -3721,10 +4027,10 @@ class BirdStampEditorWindow(QMainWindow):
                 image=image,
                 bird_box=keep_box,
                 ratio=ratio,
-                inner_top=max(0, int(settings.get("crop_padding_top") or 0)),
-                inner_bottom=max(0, int(settings.get("crop_padding_bottom") or 0)),
-                inner_left=max(0, int(settings.get("crop_padding_left") or 0)),
-                inner_right=max(0, int(settings.get("crop_padding_right") or 0)),
+                inner_top=_parse_padding_value(settings.get("crop_padding_top"), 0),
+                inner_bottom=_parse_padding_value(settings.get("crop_padding_bottom"), 0),
+                inner_left=_parse_padding_value(settings.get("crop_padding_left"), 0),
+                inner_right=_parse_padding_value(settings.get("crop_padding_right"), 0),
             )
             if crop_box is not None:
                 return (crop_box, outer_pad)
@@ -3941,13 +4247,13 @@ class BirdStampEditorWindow(QMainWindow):
             self,
             "导出当前照片",
             default_name,
-            "JPG (*.jpg);;PNG (*.png);;All Files (*.*)",
+            "PNG (*.png);;JPG (*.jpg);;All Files (*.*)",
         )
         if not file_path:
             return
 
         target = Path(file_path)
-        if target.suffix.lower() not in {".jpg", ".jpeg", ".png"}:
+        if target.suffix.lower() not in {".png", ".jpg", ".jpeg"}:
             target = target.with_suffix(f".{suffix}")
 
         try:
