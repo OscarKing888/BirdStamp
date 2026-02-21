@@ -15,7 +15,18 @@ from typing import Any, Iterable
 
 from PIL import Image, ImageColor, ImageDraw, ImageOps
 from PyQt6.QtCore import QEvent, QPointF, QRectF, Qt, pyqtSignal
-from PyQt6.QtGui import QAction, QColor, QImage, QKeySequence, QPainter, QPainterPath, QPalette, QPen, QPixmap
+from PyQt6.QtGui import (
+    QAction,
+    QColor,
+    QFontDatabase,
+    QImage,
+    QKeySequence,
+    QPainter,
+    QPainterPath,
+    QPalette,
+    QPen,
+    QPixmap,
+)
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -34,9 +45,11 @@ from PyQt6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPushButton,
     QHeaderView,
+    QScrollArea,
     QSlider,
     QSplitter,
     QSpinBox,
@@ -54,7 +67,7 @@ from birdstamp.discover import discover_inputs
 from birdstamp.meta.exiftool import extract_many
 from birdstamp.meta.normalize import format_settings_line, normalize_metadata
 from birdstamp.meta.pillow_fallback import extract_pillow_metadata
-from birdstamp.render.typography import load_font
+from birdstamp.render.typography import list_available_font_paths, load_font
 
 ALIGN_OPTIONS_VERTICAL = ("top", "center", "bottom")
 ALIGN_OPTIONS_HORIZONTAL = ("left", "center", "right")
@@ -82,6 +95,7 @@ _DEFAULT_TEMPLATE_BANNER_COLOR = "#111111"
 _TEMPLATE_BANNER_COLOR_NONE = "none"
 _TEMPLATE_BANNER_COLOR_CUSTOM = "custom"
 _TEMPLATE_BANNER_TOP_PADDING_PX = 16
+_DEFAULT_TEMPLATE_FONT_TYPE = "auto"
 _XML_LANG_ATTR = "{http://www.w3.org/XML/1998/namespace}lang"
 _RDF_NS = "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
 _RDF_DESC_TAG = f"{{{_RDF_NS}}}Description"
@@ -270,6 +284,81 @@ def _template_banner_fill_color(value: Any) -> str | None:
     if color == _TEMPLATE_BANNER_COLOR_NONE:
         return None
     return color
+
+
+@lru_cache(maxsize=1)
+def _template_font_choices() -> list[tuple[str, str]]:
+    choices: list[tuple[str, str]] = [("自动(系统默认)", _DEFAULT_TEMPLATE_FONT_TYPE)]
+    font_entries: list[tuple[str, str]] = []
+    seen_paths: set[str] = set()
+    for font_path in list_available_font_paths():
+        key = str(font_path).strip()
+        if not key or key in seen_paths:
+            continue
+        seen_paths.add(key)
+        family_label = _font_family_label_from_path(key)
+        if family_label:
+            label = f"{family_label} ({font_path.name})"
+        else:
+            label = f"{font_path.stem} ({font_path.name})"
+        font_entries.append((label, key))
+    font_entries.sort(key=lambda item: item[0].lower())
+    choices.extend(font_entries)
+    return choices
+
+
+def _normalize_template_font_type(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return _DEFAULT_TEMPLATE_FONT_TYPE
+    lowered = text.lower()
+    if lowered in {"auto", "default", "system", "none"}:
+        return _DEFAULT_TEMPLATE_FONT_TYPE
+    return text
+
+
+def _template_font_path_from_type(value: Any) -> Path | None:
+    font_type = _normalize_template_font_type(value)
+    if font_type == _DEFAULT_TEMPLATE_FONT_TYPE:
+        return None
+    try:
+        candidate = Path(font_type).expanduser()
+    except Exception:
+        return None
+    try:
+        if candidate.exists() and candidate.is_file():
+            return candidate
+    except Exception:
+        return None
+    return None
+
+
+@lru_cache(maxsize=4096)
+def _font_family_label_from_path(font_path_text: str) -> str:
+    path_text = str(font_path_text or "").strip()
+    if not path_text:
+        return ""
+    try:
+        font_id = QFontDatabase.addApplicationFont(path_text)
+    except Exception:
+        return ""
+    if font_id < 0:
+        return ""
+
+    try:
+        names: list[str] = []
+        for family in QFontDatabase.applicationFontFamilies(font_id):
+            text = str(family or "").strip()
+            if text and text not in names:
+                names.append(text)
+        return " / ".join(names[:2])
+    except Exception:
+        return ""
+    finally:
+        try:
+            QFontDatabase.removeApplicationFont(font_id)
+        except Exception:
+            pass
 
 
 def _clean_text(value: Any) -> str | None:
@@ -1351,6 +1440,7 @@ def _normalize_template_field(data: dict[str, Any], index: int) -> dict[str, Any
     style = str(data.get("style") or "normal").lower()
     if style not in STYLE_OPTIONS:
         style = STYLE_OPTIONS[0]
+    font_type = _normalize_template_font_type(data.get("font_type"))
 
     return {
         "name": str(data.get("name") or f"字段{index + 1}"),
@@ -1362,6 +1452,7 @@ def _normalize_template_field(data: dict[str, Any], index: int) -> dict[str, Any
         "y_offset_pct": round(_clamp_float(data.get("y_offset_pct"), -100.0, 100.0, 5.0), 2),
         "color": _safe_color(str(data.get("color") or "#FFFFFF"), "#FFFFFF"),
         "font_size": _clamp_int(data.get("font_size"), 8, 300, 24),
+        "font_type": font_type,
         "style": style,
     }
 
@@ -1700,14 +1791,15 @@ def render_template_overlay(
         align_v = str(field.get("align_vertical") or "top").lower()
         x_offset = float(field.get("x_offset_pct") or 0.0) / 100.0
         y_offset = float(field.get("y_offset_pct") or 0.0) / 100.0
+        field_font_path = _template_font_path_from_type(field.get("font_type"))
 
         scaled_size = max(8, min(320, int(round(font_size_base * font_scale))))
-        chosen_font = load_font(None, scaled_size)
+        chosen_font = load_font(field_font_path, scaled_size)
         chosen_x = 0
         chosen_y = 0
         chosen_rect = (0, 0, 1, 1)
         for candidate_size in _iter_font_sizes_for_layout(scaled_size, minimum=8):
-            font = load_font(None, candidate_size)
+            font = load_font(field_font_path, candidate_size)
             text_box = draw.textbbox((0, 0), text, font=font)
             text_width = max(1, text_box[2] - text_box[0])
             text_height = max(1, text_box[3] - text_box[1])
@@ -2440,6 +2532,7 @@ class TemplateManagerDialog(QDialog):
         self.template_paths: dict[str, Path] = {}
         self.current_template_name: str | None = None
         self.current_payload: dict[str, Any] | None = None
+        self._field_font_all_choices: list[tuple[str, str]] = []
         self._updating = False
 
         self._setup_ui()
@@ -2459,6 +2552,8 @@ class TemplateManagerDialog(QDialog):
         left_layout.addWidget(QLabel("模板列表"))
         self.template_list = QListWidget()
         self.template_list.currentItemChanged.connect(self._on_template_selected)
+        self.template_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.template_list.customContextMenuRequested.connect(self._on_template_list_context_menu)
         left_layout.addWidget(self.template_list, stretch=1)
 
         left_buttons = QHBoxLayout()
@@ -2598,6 +2693,21 @@ class TemplateManagerDialog(QDialog):
         color_row_layout.addWidget(pick_color_btn)
         edit_form.addRow("文本颜色", color_row)
 
+        self.field_font_filter_edit = QLineEdit()
+        self.field_font_filter_edit.setPlaceholderText("过滤字体，如：微软雅黑 / PingFang / Arial")
+        self.field_font_filter_edit.textChanged.connect(self._on_field_font_filter_changed)
+        edit_form.addRow("字体过滤", self.field_font_filter_edit)
+
+        self.field_font_combo = QComboBox()
+        self.field_font_combo.setMaxVisibleItems(24)
+        self.field_font_combo.currentIndexChanged.connect(self._apply_field_changes)
+        edit_form.addRow("字体类型", self.field_font_combo)
+        self._field_font_all_choices = list(_template_font_choices())
+        self._rebuild_field_font_combo(
+            filter_text="",
+            preferred_font_type=_DEFAULT_TEMPLATE_FONT_TYPE,
+        )
+
         self.field_font_size_spin = QSpinBox()
         self.field_font_size_spin.setRange(8, 300)
         self.field_font_size_spin.valueChanged.connect(self._apply_field_changes)
@@ -2629,8 +2739,12 @@ class TemplateManagerDialog(QDialog):
         preview_layout.addWidget(self.preview_label, stretch=1)
         preview_layout_root.addWidget(preview_group, stretch=1)
 
+        editor_scroll = QScrollArea()
+        editor_scroll.setWidgetResizable(True)
+        editor_scroll.setWidget(editor_panel)
+
         splitter.addWidget(left_panel)
-        splitter.addWidget(editor_panel)
+        splitter.addWidget(editor_scroll)
         splitter.addWidget(preview_panel)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
@@ -2665,6 +2779,50 @@ class TemplateManagerDialog(QDialog):
             if item and item.text() == target:
                 self.template_list.setCurrentRow(idx)
                 break
+
+    def _on_template_list_context_menu(self, pos) -> None:
+        item = self.template_list.itemAt(pos)
+        if item is None:
+            return
+        menu = QMenu(self)
+        rename_action = menu.addAction("重命名")
+        selected = menu.exec(self.template_list.mapToGlobal(pos))
+        if selected is rename_action:
+            self._rename_template(item.text())
+
+    def _rename_template(self, source_name: str | None = None) -> None:
+        origin_name = str(source_name or self.current_template_name or "").strip()
+        if not origin_name:
+            return
+        source_path = self.template_paths.get(origin_name)
+        if not source_path:
+            return
+
+        raw_name, ok = QInputDialog.getText(self, "重命名模板", "新模板名(仅文件名):", text=origin_name)
+        if not ok:
+            return
+        target_name = _sanitize_template_name(raw_name)
+        if not target_name:
+            QMessageBox.warning(self, "模板管理", "模板名不能为空")
+            return
+        if target_name == origin_name:
+            return
+
+        target_path = self.template_dir / f"{target_name}.json"
+        if target_path.exists():
+            QMessageBox.warning(self, "模板管理", f"模板已存在: {target_path.name}")
+            return
+
+        try:
+            payload = _load_template_payload(source_path)
+            payload["name"] = target_name
+            _save_template_payload(target_path, payload)
+            source_path.unlink(missing_ok=True)
+        except Exception as exc:
+            QMessageBox.critical(self, "重命名失败", str(exc))
+            return
+
+        self._reload_template_list(preferred=target_name)
 
     def _on_template_selected(self, current: QListWidgetItem | None, _previous: QListWidgetItem | None) -> None:
         if not current:
@@ -2719,6 +2877,67 @@ class TemplateManagerDialog(QDialog):
         self.current_payload["ratio"] = ratio
         self._save_current_template()
         self._refresh_preview()
+
+    def _filtered_field_font_choices(self, filter_text: str) -> list[tuple[str, str]]:
+        all_choices = self._field_font_all_choices or [("自动(系统默认)", _DEFAULT_TEMPLATE_FONT_TYPE)]
+        query = str(filter_text or "").strip().lower()
+        if not query:
+            return list(all_choices)
+
+        filtered: list[tuple[str, str]] = []
+        for label, font_type in all_choices:
+            if font_type == _DEFAULT_TEMPLATE_FONT_TYPE:
+                filtered.append((label, font_type))
+                continue
+            haystack = f"{label} {font_type}".lower()
+            if query in haystack:
+                filtered.append((label, font_type))
+        if not filtered:
+            filtered.append(("自动(系统默认)", _DEFAULT_TEMPLATE_FONT_TYPE))
+        return filtered
+
+    def _field_font_combo_index_for_value(self, value: Any) -> int:
+        target = _normalize_template_font_type(value)
+        for idx in range(self.field_font_combo.count()):
+            data = _normalize_template_font_type(self.field_font_combo.itemData(idx))
+            if data == target:
+                return idx
+        return -1
+
+    def _rebuild_field_font_combo(self, *, filter_text: str, preferred_font_type: Any) -> None:
+        choices = self._filtered_field_font_choices(filter_text)
+        target = _normalize_template_font_type(preferred_font_type)
+        self.field_font_combo.blockSignals(True)
+        try:
+            self.field_font_combo.clear()
+            for label, font_type in choices:
+                self.field_font_combo.addItem(label, font_type)
+
+            idx = self._field_font_combo_index_for_value(target)
+            if idx < 0 and target != _DEFAULT_TEMPLATE_FONT_TYPE:
+                self.field_font_combo.addItem(f"当前字体: {target}", target)
+                idx = self.field_font_combo.count() - 1
+            if idx < 0:
+                idx = 0 if self.field_font_combo.count() > 0 else -1
+            if idx >= 0:
+                self.field_font_combo.setCurrentIndex(idx)
+        finally:
+            self.field_font_combo.blockSignals(False)
+
+    def _on_field_font_filter_changed(self, *_args: Any) -> None:
+        preferred = _normalize_template_font_type(self.field_font_combo.currentData())
+        self._rebuild_field_font_combo(
+            filter_text=self.field_font_filter_edit.text(),
+            preferred_font_type=preferred,
+        )
+
+    def _set_field_font_combo_value(self, value: Any) -> None:
+        normalized = _normalize_template_font_type(value)
+        filter_text = self.field_font_filter_edit.text() if hasattr(self, "field_font_filter_edit") else ""
+        self._rebuild_field_font_combo(
+            filter_text=filter_text,
+            preferred_font_type=normalized,
+        )
 
     def _template_banner_color_combo_index_for_value(self, value: str) -> int:
         target = str(value or "").strip().lower()
@@ -2872,6 +3091,7 @@ class TemplateManagerDialog(QDialog):
                 self.field_x_spin.setValue(0.0)
                 self.field_y_spin.setValue(0.0)
                 self.field_color_edit.setText("#FFFFFF")
+                self._set_field_font_combo_value(_DEFAULT_TEMPLATE_FONT_TYPE)
                 self.field_font_size_spin.setValue(24)
                 self.field_style_combo.setCurrentText(STYLE_OPTIONS[0])
                 self.field_color_combo.setCurrentIndex(0)
@@ -2886,6 +3106,7 @@ class TemplateManagerDialog(QDialog):
             self.field_x_spin.setValue(float(normalized["x_offset_pct"]))
             self.field_y_spin.setValue(float(normalized["y_offset_pct"]))
             self.field_color_edit.setText(normalized["color"])
+            self._set_field_font_combo_value(normalized.get("font_type"))
             self.field_font_size_spin.setValue(int(normalized["font_size"]))
             self.field_style_combo.setCurrentText(normalized["style"])
 
@@ -2930,6 +3151,7 @@ class TemplateManagerDialog(QDialog):
         field["x_offset_pct"] = round(self.field_x_spin.value(), 2)
         field["y_offset_pct"] = round(self.field_y_spin.value(), 2)
         field["color"] = _safe_color(self.field_color_edit.text(), "#FFFFFF")
+        field["font_type"] = _normalize_template_font_type(self.field_font_combo.currentData())
         field["font_size"] = int(self.field_font_size_spin.value())
         style = self.field_style_combo.currentText().strip().lower()
         field["style"] = style if style in STYLE_OPTIONS else STYLE_OPTIONS[0]
@@ -4711,14 +4933,11 @@ class BirdStampEditorWindow(QMainWindow):
         else:
             payload = _default_template_payload(name=template_name)
 
-        # 主预览和导出的 Banner 颜色始终跟随模板文件配置。
+        # 主预览和导出的模板内容始终跟随模板文件配置。
         template_path = self.template_paths.get(template_name)
         if template_path and template_path.is_file():
             try:
-                template_file_payload = _load_template_payload(template_path)
-                payload["banner_color"] = _normalize_template_banner_color(
-                    template_file_payload.get("banner_color")
-                )
+                payload = _load_template_payload(template_path)
             except Exception:
                 pass
         return payload

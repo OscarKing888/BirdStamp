@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import os
 import platform
+from functools import lru_cache
 from pathlib import Path
 
 from PIL import ImageDraw, ImageFont
+
+_FONT_FILE_SUFFIXES = {".ttf", ".ttc", ".otf", ".otc"}
 
 
 def _system_font_candidates() -> list[Path]:
@@ -28,6 +32,47 @@ def _system_font_candidates() -> list[Path]:
     ]
 
 
+def _system_font_directories() -> list[Path]:
+    system = platform.system().lower()
+    roots: list[Path] = []
+    if "windows" in system:
+        windows_dir = Path(os.environ.get("WINDIR", r"C:\Windows"))
+        roots.append(windows_dir / "Fonts")
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        if local_app_data:
+            roots.append(Path(local_app_data) / "Microsoft" / "Windows" / "Fonts")
+    elif "darwin" in system:
+        roots.extend(
+            [
+                Path("/System/Library/Fonts"),
+                Path("/Library/Fonts"),
+                Path.home() / "Library" / "Fonts",
+            ]
+        )
+    else:
+        roots.extend(
+            [
+                Path("/usr/share/fonts"),
+                Path("/usr/local/share/fonts"),
+                Path.home() / ".fonts",
+                Path.home() / ".local" / "share" / "fonts",
+            ]
+        )
+
+    deduped: list[Path] = []
+    seen: set[str] = set()
+    for root in roots:
+        key = str(root).strip()
+        if not key:
+            continue
+        normalized = key.lower() if "windows" in system else key
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped.append(root)
+    return deduped
+
+
 def load_font(font_path: Path | None, size: int) -> ImageFont.ImageFont:
     candidates: list[Path] = []
     if font_path:
@@ -40,6 +85,38 @@ def load_font(font_path: Path | None, size: int) -> ImageFont.ImageFont:
             except Exception:
                 continue
     return ImageFont.load_default()
+
+
+@lru_cache(maxsize=1)
+def list_available_font_paths() -> list[Path]:
+    system = platform.system().lower()
+    available: list[Path] = []
+    seen: set[str] = set()
+
+    for root in _system_font_directories():
+        try:
+            if not root.exists() or not root.is_dir():
+                continue
+        except Exception:
+            continue
+
+        for dir_path, _dir_names, file_names in os.walk(root, onerror=lambda _err: None):
+            for file_name in file_names:
+                suffix = Path(file_name).suffix.lower()
+                if suffix not in _FONT_FILE_SUFFIXES:
+                    continue
+                candidate = Path(dir_path) / file_name
+                key = str(candidate).strip()
+                if not key:
+                    continue
+                dedupe_key = key.lower() if "windows" in system else key
+                if dedupe_key in seen:
+                    continue
+                seen.add(dedupe_key)
+                available.append(candidate)
+
+    available.sort(key=lambda path: (path.stem.lower(), path.name.lower(), str(path).lower()))
+    return available
 
 
 def text_size(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont) -> tuple[int, int]:
@@ -124,4 +201,3 @@ def wrap_text(
         lines = lines[:max_lines]
         lines[-1] = ellipsize(draw, lines[-1], font, max_width)
     return lines
-
