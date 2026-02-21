@@ -1,6 +1,7 @@
 {
   "name": "default",
   "banner_color": "#111111",
+  "draw_banner_background": true,
   "fields": [
     {
       "name": "鸟种",

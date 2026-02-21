@@ -11,14 +11,16 @@ from collections import defaultdict
 from functools import lru_cache
 from importlib import resources
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 from PIL import Image, ImageColor, ImageDraw, ImageOps
-from PyQt6.QtCore import QEvent, QPointF, QRectF, Qt, pyqtSignal
+from PyQt6.QtCore import QEvent, QPoint, QPointF, QRect, QRectF, Qt, pyqtSignal
 from PyQt6.QtGui import (
     QAction,
     QColor,
+    QCursor,
     QFontDatabase,
+    QGuiApplication,
     QImage,
     QKeySequence,
     QPainter,
@@ -266,6 +268,41 @@ def _safe_color(value: str, fallback: str) -> str:
     return text
 
 
+def _build_color_preview_swatch() -> QLabel:
+    swatch = QLabel()
+    swatch.setFixedSize(24, 20)
+    swatch.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    swatch.setStyleSheet("border: 1px solid #2A2A2A; border-radius: 2px;")
+    swatch.setToolTip("")
+    return swatch
+
+
+def _set_color_preview_swatch(
+    swatch: QLabel | None,
+    value: str | None,
+    *,
+    fallback: str = "#FFFFFF",
+    allow_none: bool = False,
+) -> None:
+    if swatch is None:
+        return
+
+    raw = str(value or "").strip()
+    lowered = raw.lower()
+    if allow_none and lowered in {"", "none", "transparent", "off", "false", "0"}:
+        swatch.setText("无")
+        swatch.setToolTip("透明")
+        swatch.setStyleSheet(
+            "background: #E3E5E8; color: #4A4A4A; border: 1px dashed #7A7A7A; border-radius: 2px; font-size: 10px;"
+        )
+        return
+
+    color_text = _safe_color(raw, fallback).upper()
+    swatch.setText("")
+    swatch.setToolTip(color_text)
+    swatch.setStyleSheet(f"background: {color_text}; border: 1px solid #2A2A2A; border-radius: 2px;")
+
+
 def _normalize_template_banner_color(value: Any, default: str = _DEFAULT_TEMPLATE_BANNER_COLOR) -> str:
     fallback = _safe_color(default, _DEFAULT_TEMPLATE_BANNER_COLOR)
     if value is None:
@@ -389,6 +426,168 @@ def _normalize_lookup(raw: dict[str, Any]) -> dict[str, Any]:
         if ":" in key_text:
             lookup.setdefault(key_text.split(":")[-1], value)
     return lookup
+
+
+_ACTIVE_SCREEN_COLOR_PICKERS: list["_ScreenColorPickerSession"] = []
+
+
+def _sample_screen_color_at(global_pos: QPoint) -> str | None:
+    screen = QGuiApplication.screenAt(global_pos)
+    if screen is None:
+        screen = QGuiApplication.primaryScreen()
+    if screen is None:
+        return None
+
+    geo = screen.geometry()
+    local_x = global_pos.x() - geo.x()
+    local_y = global_pos.y() - geo.y()
+    if local_x < 0 or local_y < 0:
+        return None
+
+    sample = screen.grabWindow(0, local_x, local_y, 1, 1)
+    if sample.isNull():
+        return None
+    image = sample.toImage()
+    if image.isNull():
+        return None
+    color = QColor.fromRgb(image.pixel(0, 0))
+    return color.name(QColor.NameFormat.HexRgb).upper()
+
+
+class _ScreenColorPickerOverlay(QWidget):
+    colorPicked = pyqtSignal(str)
+    cancelled = pyqtSignal()
+
+    def __init__(self, geometry: QRect, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Tool
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setMouseTracking(True)
+        self.setCursor(Qt.CursorShape.CrossCursor)
+        self.setGeometry(geometry)
+
+    def mouseMoveEvent(self, event) -> None:  # type: ignore[override]
+        _ = event
+        self.update()
+
+    def mousePressEvent(self, event) -> None:  # type: ignore[override]
+        if event.button() == Qt.MouseButton.LeftButton:
+            color = _sample_screen_color_at(event.globalPosition().toPoint())
+            if color:
+                self.colorPicked.emit(color)
+            else:
+                self.cancelled.emit()
+            return
+        if event.button() in {Qt.MouseButton.RightButton, Qt.MouseButton.MiddleButton}:
+            self.cancelled.emit()
+            return
+        super().mousePressEvent(event)
+
+    def keyPressEvent(self, event) -> None:  # type: ignore[override]
+        if event.key() == Qt.Key.Key_Escape:
+            self.cancelled.emit()
+            return
+        super().keyPressEvent(event)
+
+    def paintEvent(self, event) -> None:  # type: ignore[override]
+        _ = event
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.fillRect(self.rect(), QColor(0, 0, 0, 26))
+
+        pos = self.mapFromGlobal(QCursor.pos())
+        sample = _sample_screen_color_at(QCursor.pos())
+        sample_color = QColor(sample) if sample else QColor("#FFFFFF")
+
+        preview_size = 32
+        preview_rect = QRectF(
+            float(pos.x() + 16),
+            float(pos.y() + 16),
+            float(preview_size),
+            float(preview_size),
+        )
+        if preview_rect.right() > self.width() - 8:
+            preview_rect.moveLeft(float(max(8, pos.x() - preview_size - 16)))
+        if preview_rect.bottom() > self.height() - 8:
+            preview_rect.moveTop(float(max(8, pos.y() - preview_size - 16)))
+
+        painter.setPen(QPen(QColor("#111111"), 1))
+        painter.setBrush(sample_color)
+        painter.drawRect(preview_rect)
+
+        text = f"{sample or '-'}  左键取色 / 右键或Esc取消"
+        text_rect = QRectF(
+            preview_rect.left(),
+            preview_rect.bottom() + 6.0,
+            280.0,
+            22.0,
+        )
+        if text_rect.right() > self.width() - 8:
+            text_rect.moveLeft(float(max(8, self.width() - text_rect.width() - 8)))
+        if text_rect.bottom() > self.height() - 8:
+            text_rect.moveTop(float(max(8, preview_rect.top() - text_rect.height() - 6.0)))
+
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(20, 20, 20, 180))
+        painter.drawRoundedRect(text_rect, 4.0, 4.0)
+        painter.setPen(QPen(QColor("#F6F6F6"), 1))
+        painter.drawText(text_rect.adjusted(8.0, 0.0, -8.0, 0.0), int(Qt.AlignmentFlag.AlignVCenter), text)
+        painter.end()
+
+
+class _ScreenColorPickerSession:
+    def __init__(self, *, parent: QWidget | None, on_picked: Callable[[str], None]) -> None:
+        self._parent = parent
+        self._on_picked = on_picked
+        self._overlays: list[_ScreenColorPickerOverlay] = []
+        self._finished = False
+
+    def start(self) -> None:
+        screens = QGuiApplication.screens()
+        if not screens:
+            return
+        for screen in screens:
+            overlay = _ScreenColorPickerOverlay(screen.geometry(), parent=None)
+            overlay.colorPicked.connect(self._handle_color_picked)
+            overlay.cancelled.connect(self._handle_cancelled)
+            self._overlays.append(overlay)
+
+        _ACTIVE_SCREEN_COLOR_PICKERS.append(self)
+        for overlay in self._overlays:
+            overlay.show()
+            overlay.raise_()
+        if self._overlays:
+            self._overlays[0].activateWindow()
+
+    def _finish(self) -> None:
+        if self._finished:
+            return
+        self._finished = True
+        for overlay in self._overlays:
+            overlay.hide()
+            overlay.deleteLater()
+        self._overlays.clear()
+        if self in _ACTIVE_SCREEN_COLOR_PICKERS:
+            _ACTIVE_SCREEN_COLOR_PICKERS.remove(self)
+
+    def _handle_color_picked(self, color: str) -> None:
+        self._finish()
+        try:
+            self._on_picked(color)
+        except Exception:
+            return
+
+    def _handle_cancelled(self) -> None:
+        self._finish()
+
+
+def _start_screen_color_picker(*, parent: QWidget | None, on_picked: Callable[[str], None]) -> None:
+    session = _ScreenColorPickerSession(parent=parent, on_picked=on_picked)
+    session.start()
 
 
 def _split_xml_tag(tag: str) -> tuple[str, str]:
@@ -1470,11 +1669,13 @@ def _normalize_template_payload(payload: dict[str, Any], fallback_name: str) -> 
 
     ratio = _parse_ratio_value(payload.get("ratio"))
     banner_color = _normalize_template_banner_color(payload.get("banner_color"))
+    draw_banner_background = _parse_bool_value(payload.get("draw_banner_background"), True)
 
     return {
         "name": str(payload.get("name") or fallback_name),
         "ratio": ratio,
         "banner_color": banner_color,
+        "draw_banner_background": draw_banner_background,
         "fields": fields,
     }
 
@@ -1738,14 +1939,12 @@ def _compute_template_banner_rect(
     if not text_boxes or canvas_width <= 0 or canvas_height <= 0:
         return None
 
-    left = min(box[0] for box in text_boxes)
     top = min(box[1] for box in text_boxes) - max(0, int(top_padding))
-    right = max(box[2] for box in text_boxes)
     bottom = max(box[3] for box in text_boxes)
 
-    left = max(0, min(canvas_width, left))
+    left = 0
     top = max(0, min(canvas_height, top))
-    right = max(0, min(canvas_width, right))
+    right = canvas_width
     bottom = max(0, min(canvas_height, bottom))
     if right <= left or bottom <= top:
         return None
@@ -1846,7 +2045,8 @@ def render_template_overlay(
         occupied_boxes.append(chosen_rect)
 
     banner_fill = _template_banner_fill_color(template_payload.get("banner_color"))
-    if banner_fill and draw_commands:
+    draw_banner_background = _parse_bool_value(template_payload.get("draw_banner_background"), True)
+    if draw_banner_background and banner_fill and draw_commands:
         banner_rect = _compute_template_banner_rect(
             text_boxes=[cmd[6] for cmd in draw_commands],
             canvas_width=canvas.width,
@@ -2600,17 +2800,32 @@ class TemplateManagerDialog(QDialog):
             self.template_banner_color_combo.addItem(f"{label} {value}", value)
         self.template_banner_color_combo.addItem("自定义", _TEMPLATE_BANNER_COLOR_CUSTOM)
         self.template_banner_color_combo.currentIndexChanged.connect(self._on_template_banner_color_preset_changed)
+        self.template_banner_color_combo.currentIndexChanged.connect(self._refresh_template_banner_color_swatch)
         banner_color_row_layout.addWidget(self.template_banner_color_combo, stretch=1)
 
         self.template_banner_color_edit = QLineEdit(_DEFAULT_TEMPLATE_BANNER_COLOR)
         self.template_banner_color_edit.textChanged.connect(self._on_template_banner_color_text_changed)
+        self.template_banner_color_edit.textChanged.connect(self._refresh_template_banner_color_swatch)
         banner_color_row_layout.addWidget(self.template_banner_color_edit, stretch=1)
+
+        self.template_banner_color_swatch = _build_color_preview_swatch()
+        banner_color_row_layout.addWidget(self.template_banner_color_swatch)
+        self._refresh_template_banner_color_swatch()
 
         pick_banner_color_btn = QPushButton("调色板")
         pick_banner_color_btn.clicked.connect(self._pick_template_banner_color)
         banner_color_row_layout.addWidget(pick_banner_color_btn)
 
+        pick_banner_screen_color_btn = QPushButton("吸管")
+        pick_banner_screen_color_btn.clicked.connect(self._pick_template_banner_color_from_screen)
+        banner_color_row_layout.addWidget(pick_banner_screen_color_btn)
+
         header_form.addRow("Banner颜色", banner_color_row)
+
+        self.template_draw_banner_bg_check = QCheckBox("绘制 Banner 底")
+        self.template_draw_banner_bg_check.setChecked(True)
+        self.template_draw_banner_bg_check.toggled.connect(self._on_template_draw_banner_background_changed)
+        header_form.addRow("Banner底", self.template_draw_banner_bg_check)
         editor_layout.addWidget(header_group)
 
         fields_group = QGroupBox("文本项")
@@ -2682,15 +2897,25 @@ class TemplateManagerDialog(QDialog):
             self.field_color_combo.addItem(f"{label} {value}", value)
         self.field_color_combo.addItem("自定义", "custom")
         self.field_color_combo.currentIndexChanged.connect(self._on_color_preset_changed)
+        self.field_color_combo.currentIndexChanged.connect(self._refresh_field_color_swatch)
         color_row_layout.addWidget(self.field_color_combo, stretch=1)
 
         self.field_color_edit = QLineEdit("#FFFFFF")
         self.field_color_edit.textChanged.connect(self._apply_field_changes)
+        self.field_color_edit.textChanged.connect(self._refresh_field_color_swatch)
         color_row_layout.addWidget(self.field_color_edit, stretch=1)
+
+        self.field_color_swatch = _build_color_preview_swatch()
+        color_row_layout.addWidget(self.field_color_swatch)
+        self._refresh_field_color_swatch()
 
         pick_color_btn = QPushButton("调色板")
         pick_color_btn.clicked.connect(self._pick_field_color)
         color_row_layout.addWidget(pick_color_btn)
+
+        pick_field_screen_color_btn = QPushButton("吸管")
+        pick_field_screen_color_btn.clicked.connect(self._pick_field_color_from_screen)
+        color_row_layout.addWidget(pick_field_screen_color_btn)
         edit_form.addRow("文本颜色", color_row)
 
         self.field_font_filter_edit = QLineEdit()
@@ -2786,9 +3011,12 @@ class TemplateManagerDialog(QDialog):
             return
         menu = QMenu(self)
         rename_action = menu.addAction("重命名")
+        delete_action = menu.addAction("删除")
         selected = menu.exec(self.template_list.mapToGlobal(pos))
         if selected is rename_action:
             self._rename_template(item.text())
+        elif selected is delete_action:
+            self._delete_template(item.text())
 
     def _rename_template(self, source_name: str | None = None) -> None:
         origin_name = str(source_name or self.current_template_name or "").strip()
@@ -2824,6 +3052,14 @@ class TemplateManagerDialog(QDialog):
 
         self._reload_template_list(preferred=target_name)
 
+    def _selected_template_name(self) -> str:
+        item = self.template_list.currentItem()
+        if item is not None:
+            name = str(item.text() or "").strip()
+            if name:
+                return name
+        return str(self.current_template_name or "").strip()
+
     def _on_template_selected(self, current: QListWidgetItem | None, _previous: QListWidgetItem | None) -> None:
         if not current:
             return
@@ -2844,6 +3080,7 @@ class TemplateManagerDialog(QDialog):
         try:
             self._set_template_ratio_combo_value(payload.get("ratio"))
             self._set_template_banner_color_value(payload.get("banner_color"))
+            self._set_template_draw_banner_background_value(payload.get("draw_banner_background"))
         finally:
             self._updating = False
         self._populate_field_list(payload.get("fields") or [])
@@ -2939,6 +3176,25 @@ class TemplateManagerDialog(QDialog):
             preferred_font_type=normalized,
         )
 
+    def _refresh_template_banner_color_swatch(self, *_args: Any) -> None:
+        selected = str(self.template_banner_color_combo.currentData() or "").strip().lower()
+        if selected == _TEMPLATE_BANNER_COLOR_NONE:
+            value = _TEMPLATE_BANNER_COLOR_NONE
+        elif selected and selected != _TEMPLATE_BANNER_COLOR_CUSTOM:
+            value = selected
+        else:
+            typed = self.template_banner_color_edit.text().strip()
+            value = typed if typed else _DEFAULT_TEMPLATE_BANNER_COLOR
+        _set_color_preview_swatch(
+            self.template_banner_color_swatch,
+            value,
+            fallback=_DEFAULT_TEMPLATE_BANNER_COLOR,
+            allow_none=True,
+        )
+
+    def _refresh_field_color_swatch(self, *_args: Any) -> None:
+        _set_color_preview_swatch(self.field_color_swatch, self.field_color_edit.text().strip(), fallback="#FFFFFF")
+
     def _template_banner_color_combo_index_for_value(self, value: str) -> int:
         target = str(value or "").strip().lower()
         for idx in range(self.template_banner_color_combo.count()):
@@ -2959,6 +3215,7 @@ class TemplateManagerDialog(QDialog):
                 idx = custom_idx
             self.template_banner_color_combo.setCurrentIndex(idx)
             self.template_banner_color_edit.setText("")
+            self._refresh_template_banner_color_swatch()
             return
 
         idx = self._template_banner_color_combo_index_for_value(normalized)
@@ -2966,6 +3223,17 @@ class TemplateManagerDialog(QDialog):
             idx = custom_idx
         self.template_banner_color_combo.setCurrentIndex(idx)
         self.template_banner_color_edit.setText(normalized)
+        self._refresh_template_banner_color_swatch()
+
+    def _set_template_draw_banner_background_value(self, value: Any) -> None:
+        self.template_draw_banner_bg_check.setChecked(_parse_bool_value(value, True))
+
+    def _on_template_draw_banner_background_changed(self, *_args: Any) -> None:
+        if self._updating or not self.current_payload:
+            return
+        self.current_payload["draw_banner_background"] = bool(self.template_draw_banner_bg_check.isChecked())
+        self._save_current_template()
+        self._refresh_preview()
 
     def _apply_template_banner_color(self) -> None:
         if self._updating or not self.current_payload:
@@ -2987,6 +3255,7 @@ class TemplateManagerDialog(QDialog):
         self.current_payload["banner_color"] = banner_color
         self._save_current_template()
         self._refresh_preview()
+        self._refresh_template_banner_color_swatch()
 
     def _on_template_banner_color_preset_changed(self, *_args: Any) -> None:
         if self._updating or not self.current_payload:
@@ -3036,6 +3305,15 @@ class TemplateManagerDialog(QDialog):
         if custom_idx >= 0:
             self.template_banner_color_combo.setCurrentIndex(custom_idx)
         self.template_banner_color_edit.setText(chosen.name())
+
+    def _pick_template_banner_color_from_screen(self) -> None:
+        def _apply(color_hex: str) -> None:
+            custom_idx = self._template_banner_color_combo_index_for_value(_TEMPLATE_BANNER_COLOR_CUSTOM)
+            if custom_idx >= 0:
+                self.template_banner_color_combo.setCurrentIndex(custom_idx)
+            self.template_banner_color_edit.setText(_safe_color(color_hex, _DEFAULT_TEMPLATE_BANNER_COLOR))
+
+        _start_screen_color_picker(parent=self, on_picked=_apply)
 
     def _populate_field_list(self, fields: list[dict[str, Any]]) -> None:
         self.field_list.blockSignals(True)
@@ -3119,6 +3397,7 @@ class TemplateManagerDialog(QDialog):
             self.field_color_combo.setCurrentIndex(preset_index)
         finally:
             self._updating = False
+            self._refresh_field_color_swatch()
 
     def _on_color_preset_changed(self, *_args: Any) -> None:
         if self._updating:
@@ -3133,6 +3412,15 @@ class TemplateManagerDialog(QDialog):
         if not chosen.isValid():
             return
         self.field_color_edit.setText(chosen.name())
+
+    def _pick_field_color_from_screen(self) -> None:
+        def _apply(color_hex: str) -> None:
+            custom_idx = self.field_color_combo.findData("custom")
+            if custom_idx >= 0:
+                self.field_color_combo.setCurrentIndex(custom_idx)
+            self.field_color_edit.setText(_safe_color(color_hex, "#FFFFFF"))
+
+        _start_screen_color_picker(parent=self, on_picked=_apply)
 
     def _apply_field_changes(self, *_args: Any) -> None:
         if self._updating:
@@ -3238,14 +3526,15 @@ class TemplateManagerDialog(QDialog):
         _save_template_payload(self.template_dir / f"{candidate}.json", payload)
         self._reload_template_list(preferred=candidate)
 
-    def _delete_template(self) -> None:
-        if not self.current_template_name:
+    def _delete_template(self, source_name: str | None = None) -> None:
+        target_name = str(source_name or self._selected_template_name()).strip()
+        if not target_name:
             return
         if len(self.template_paths) <= 1:
             QMessageBox.warning(self, "模板管理", "至少保留一个模板")
             return
 
-        path = self.template_paths.get(self.current_template_name)
+        path = self.template_paths.get(target_name)
         if not path:
             return
 
@@ -3474,13 +3763,10 @@ class BirdStampEditorWindow(QMainWindow):
         if self.max_edge_combo.count() == 0:
             self.max_edge_combo.addItem("不限制", 0)
 
-        default_max_edge_idx = self.max_edge_combo.findData(1920)
+        default_max_edge_idx = 0 #self.max_edge_combo.findData(1920)
         if default_max_edge_idx >= 0:
             self.max_edge_combo.setCurrentIndex(default_max_edge_idx)
-        elif self.max_edge_combo.count() > 1:
-            self.max_edge_combo.setCurrentIndex(1)
-        else:
-            self.max_edge_combo.setCurrentIndex(0)
+
         self.max_edge_combo.currentIndexChanged.connect(self._on_output_settings_changed)
         output_form.addRow("最大长边", self.max_edge_combo)
 
@@ -3522,7 +3808,7 @@ class BirdStampEditorWindow(QMainWindow):
             wrapper_layout.addWidget(spin)
 
             slider = QSlider(Qt.Orientation.Horizontal)
-            slider.setRange(-512, 512)
+            slider.setRange(-2048, 2048)
             slider.setSingleStep(1)
             slider.setPageStep(16)
             slider.setValue(max(slider.minimum(), min(slider.maximum(), pad_default)))
@@ -3544,6 +3830,11 @@ class BirdStampEditorWindow(QMainWindow):
         crop_padding_grid.addWidget(bottom_widget, 2, 1, Qt.AlignmentFlag.AlignCenter)
         output_form.addRow("裁切边界内填充（像素）", crop_padding_widget)
 
+        crop_fill_row = QWidget()
+        crop_fill_row_layout = QHBoxLayout(crop_fill_row)
+        crop_fill_row_layout.setContentsMargins(0, 0, 0, 0)
+        crop_fill_row_layout.setSpacing(6)
+
         self.crop_padding_fill_combo = QComboBox()
         for label, value in COLOR_PRESETS:
             self.crop_padding_fill_combo.addItem(label, value)
@@ -3553,8 +3844,23 @@ class BirdStampEditorWindow(QMainWindow):
         if idx_white >= 0:
             self.crop_padding_fill_combo.setCurrentIndex(idx_white)
         self.crop_padding_fill_combo.currentIndexChanged.connect(self._on_output_settings_changed)
+        self.crop_padding_fill_combo.currentIndexChanged.connect(self._refresh_crop_padding_fill_swatch)
         self.crop_padding_fill_combo.setToolTip("自动根据鸟体计算时用于图像外圈自动填充色。")
-        output_form.addRow("图像外圈填充色", self.crop_padding_fill_combo)
+        crop_fill_row_layout.addWidget(self.crop_padding_fill_combo, stretch=1)
+
+        self.crop_padding_fill_swatch = _build_color_preview_swatch()
+        crop_fill_row_layout.addWidget(self.crop_padding_fill_swatch)
+        self._refresh_crop_padding_fill_swatch()
+
+        crop_fill_palette_btn = QPushButton("调色板")
+        crop_fill_palette_btn.clicked.connect(self._pick_crop_padding_fill_color)
+        crop_fill_row_layout.addWidget(crop_fill_palette_btn)
+
+        crop_fill_screen_btn = QPushButton("吸管")
+        crop_fill_screen_btn.clicked.connect(self._pick_crop_padding_fill_color_from_screen)
+        crop_fill_row_layout.addWidget(crop_fill_screen_btn)
+
+        output_form.addRow("图像外圈填充色", crop_fill_row)
 
         apply_row = QHBoxLayout()
 
@@ -3774,6 +4080,37 @@ class BirdStampEditorWindow(QMainWindow):
             self._update_photo_list_item_display(self.current_path, settings=snapshot)
             self._invalidate_original_mode_cache()
         self.render_preview()
+
+    def _refresh_crop_padding_fill_swatch(self, *_args: Any) -> None:
+        value = str(self.crop_padding_fill_combo.currentData() or "#FFFFFF")
+        _set_color_preview_swatch(self.crop_padding_fill_swatch, value, fallback="#FFFFFF")
+
+    def _set_crop_padding_fill_color(self, color_text: str) -> None:
+        """设置图像外圈填充色，若为新颜色则加入下拉选项。"""
+        normalized = _safe_color(color_text, "#FFFFFF")
+        for idx in range(self.crop_padding_fill_combo.count()):
+            data = str(self.crop_padding_fill_combo.itemData(idx) or "").strip()
+            if data.lower() == normalized.lower():
+                self.crop_padding_fill_combo.setCurrentIndex(idx)
+                self._refresh_crop_padding_fill_swatch()
+                return
+        self.crop_padding_fill_combo.addItem(normalized.upper(), normalized)
+        self.crop_padding_fill_combo.setCurrentIndex(self.crop_padding_fill_combo.count() - 1)
+        self._refresh_crop_padding_fill_swatch()
+
+    def _pick_crop_padding_fill_color(self) -> None:
+        current_text = str(self.crop_padding_fill_combo.currentData() or "#FFFFFF")
+        initial = QColor(_safe_color(current_text, "#FFFFFF"))
+        chosen = QColorDialog.getColor(initial, self, "选择图像外圈填充色")
+        if not chosen.isValid():
+            return
+        self._set_crop_padding_fill_color(chosen.name())
+
+    def _pick_crop_padding_fill_color_from_screen(self) -> None:
+        def _apply(color_hex: str) -> None:
+            self._set_crop_padding_fill_color(color_hex)
+
+        _start_screen_color_picker(parent=self, on_picked=_apply)
 
     def _start_bird_detector_preload(self) -> None:
         if self._bird_detector_preload_started:
@@ -4631,6 +4968,7 @@ class BirdStampEditorWindow(QMainWindow):
             self.draw_template_overlay_check.blockSignals(False)
             self.template_combo.blockSignals(False)
 
+        self._refresh_crop_padding_fill_swatch()
         self.current_template_payload = _normalize_template_payload(
             normalized["template_payload"],
             fallback_name=template_name,
