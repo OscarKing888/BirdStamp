@@ -13,6 +13,7 @@ from birdstamp.config import load_config, write_default_config
 from birdstamp.constants import DEFAULT_SHOW_FIELDS, VALID_FRAME_STYLES, VALID_MODES
 from birdstamp.decoders.image_decoder import decode_image
 from birdstamp.discover import discover_inputs
+from birdstamp.gui.editor_core import CENTER_MODE_BIRD, CENTER_MODE_FOCUS, apply_editor_crop
 from birdstamp.meta.exiftool import extract_many
 from birdstamp.meta.normalize import normalize_metadata
 from birdstamp.meta.pillow_fallback import extract_pillow_metadata
@@ -87,6 +88,11 @@ def render(
     bird_regex: str | None = typer.Option(None, "--bird-regex", help="Regex used for filename bird extraction."),
     time_format: str | None = typer.Option(None, "--time-format", help="Datetime output format."),
     mode: str | None = typer.Option(None, "--mode", help="Output mode: keep|fit|square|vertical"),
+    center: str | None = typer.Option(
+        None,
+        "--center",
+        help="Crop center for square/vertical: image|focus|bird (focus=EXIF focus, bird=detect bird).",
+    ),
     frame_style: str | None = typer.Option(None, "--frame-style", help="For square/vertical: crop|pad"),
     max_long_edge: int | None = typer.Option(None, "--max-long-edge", min=0),
     jobs: int | None = typer.Option(None, "--jobs", min=1, help="Parallel workers."),
@@ -124,6 +130,10 @@ def render(
     frame_style_value = (frame_style or str(cfg.get("frame_style", "crop"))).lower()
     if frame_style_value not in VALID_FRAME_STYLES:
         raise typer.BadParameter(f"frame-style must be one of: {', '.join(sorted(VALID_FRAME_STYLES))}")
+
+    center_value = (center or str(cfg.get("center", "image"))).lower()
+    if center_value not in ("image", "focus", "bird"):
+        raise typer.BadParameter("center must be one of: image, focus, bird")
 
     max_long_edge_value = int(max_long_edge if max_long_edge is not None else cfg.get("max_long_edge", 2048))
     jobs_value = int(jobs if jobs is not None else cfg.get("jobs", 1))
@@ -190,13 +200,28 @@ def render(
                 return ProcessResult(source=source, status="skipped", output=output_file, elapsed=time.perf_counter() - started)
 
             image = decode_image(source, decoder=decoder_value)
-            image = apply_output_mode(
-                image,
-                mode=mode_value,
-                max_long_edge=max_long_edge_value,
-                frame_style=frame_style_value,
-                fill_color=template_spec.colors.get("background", "#FFFFFF"),
-            )
+            fill_color = template_spec.colors.get("background", "#FFFFFF")
+            if mode_value in ("square", "vertical") and center_value in (CENTER_MODE_FOCUS, CENTER_MODE_BIRD):
+                ratio = 1.0 if mode_value == "square" else (9.0 / 16.0)
+                image = apply_editor_crop(
+                    image,
+                    source_path=source,
+                    raw_metadata=raw_meta,
+                    ratio=ratio,
+                    center_mode=center_value,
+                    crop_padding_px=0,
+                    max_long_edge=max_long_edge_value,
+                    fill_color=fill_color,
+                    use_bird_auto=(center_value == CENTER_MODE_BIRD),
+                )
+            else:
+                image = apply_output_mode(
+                    image,
+                    mode=mode_value,
+                    max_long_edge=max_long_edge_value,
+                    frame_style=frame_style_value,
+                    fill_color=fill_color,
+                )
             rendered = render_banner(image, metadata, template_spec, render_options)
             _save_image(rendered, output_file, pil_format=pil_format, quality=quality_value)
             return ProcessResult(source=source, status="ok", output=output_file, elapsed=time.perf_counter() - started)

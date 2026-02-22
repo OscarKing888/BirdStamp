@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import os
 import platform
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -39,12 +40,20 @@ DEFAULT_CONFIG: dict[str, Any] = {
 }
 
 
+def get_app_dir() -> Path:
+    """Return the application root directory.
+
+    - Frozen (PyInstaller): directory containing the executable.
+    - Development: project root (two levels up from this file).
+    """
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    # birdstamp/config.py → birdstamp/ → project_root/
+    return Path(__file__).resolve().parent.parent
+
+
 def get_config_path() -> Path:
-    if platform.system().lower().startswith("win"):
-        appdata = os.environ.get("APPDATA")
-        if appdata:
-            return Path(appdata) / "birdstamp" / "config.yaml"
-    return Path.home() / ".birdstamp" / "config.yaml"
+    return get_app_dir() / "Config" / "config.yaml"
 
 
 def _deep_merge(base: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:

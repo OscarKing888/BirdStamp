@@ -1,0 +1,1764 @@
+"""editor_template_dialog.py
+
+Contains widget helpers and TemplateManagerDialog used by the main editor.
+
+Extracted classes:
+  _GradientBarWidget      – horizontal gradient preview bar
+  _GradientEditorWidget   – Photoshop-style gradient stop editor
+  _CropPaddingEditorWidget – four-direction crop padding + fill color editor
+  TemplateManagerDialog   – full template management dialog
+"""
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+from PIL import Image
+from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtGui import QColor, QImage, QLinearGradient, QPainter, QPixmap
+from PyQt6.QtWidgets import (
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QDoubleSpinBox,
+    QFormLayout,
+    QGridLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QInputDialog,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QMenu,
+    QMessageBox,
+    QPushButton,
+    QScrollArea,
+    QSlider,
+    QSpinBox,
+    QSplitter,
+    QVBoxLayout,
+    QWidget,
+    QColorDialog,
+)
+
+from birdstamp.gui import editor_core, editor_options, editor_template, editor_utils
+
+# ---------------------------------------------------------------------------
+# Local aliases (mirrors the pattern used in editor.py)
+# ---------------------------------------------------------------------------
+RATIO_OPTIONS = editor_options.RATIO_OPTIONS
+MAX_LONG_EDGE_OPTIONS = editor_options.MAX_LONG_EDGE_OPTIONS
+COLOR_PRESETS = editor_options.COLOR_PRESETS
+TAG_OPTIONS = editor_options.TAG_OPTIONS
+SAMPLE_RAW_METADATA = editor_options.SAMPLE_RAW_METADATA
+DEFAULT_FIELD_TAG = editor_options.DEFAULT_FIELD_TAG
+STYLE_OPTIONS = editor_options.STYLE_OPTIONS
+
+ALIGN_OPTIONS_HORIZONTAL = editor_utils.ALIGN_OPTIONS_HORIZONTAL
+ALIGN_OPTIONS_VERTICAL = editor_utils.ALIGN_OPTIONS_VERTICAL
+_FALLBACK_CONTEXT_VARS = editor_utils.FALLBACK_CONTEXT_VARS
+_DEFAULT_TEMPLATE_FONT_TYPE = editor_utils.DEFAULT_TEMPLATE_FONT_TYPE
+_normalize_template_font_type = editor_utils.normalize_template_font_type
+_template_font_choices = editor_utils.template_font_choices
+_normalize_template_banner_color = editor_utils.normalize_template_banner_color
+_build_color_preview_swatch = editor_utils.build_color_preview_swatch
+_set_color_preview_swatch = editor_utils.set_color_preview_swatch
+_safe_color = editor_utils.safe_color
+_start_screen_color_picker = editor_utils.start_screen_color_picker
+_build_placeholder_image = editor_utils.build_placeholder_image
+_sanitize_template_name = editor_utils.sanitize_template_name
+_DEFAULT_TEMPLATE_BANNER_COLOR = editor_utils.DEFAULT_TEMPLATE_BANNER_COLOR
+_TEMPLATE_BANNER_COLOR_NONE = editor_utils.TEMPLATE_BANNER_COLOR_NONE
+_TEMPLATE_BANNER_COLOR_CUSTOM = editor_utils.TEMPLATE_BANNER_COLOR_CUSTOM
+
+_CENTER_MODE_BIRD = editor_core.CENTER_MODE_BIRD
+_CENTER_MODE_FOCUS = editor_core.CENTER_MODE_FOCUS
+_CENTER_MODE_IMAGE = editor_core.CENTER_MODE_IMAGE
+_DEFAULT_CROP_PADDING_PX = editor_core.DEFAULT_CROP_PADDING_PX
+_normalize_center_mode = editor_core.normalize_center_mode
+_parse_bool_value = editor_core.parse_bool_value
+_parse_ratio_value = editor_core.parse_ratio_value
+_crop_to_ratio_with_anchor = editor_core.crop_to_ratio_with_anchor
+
+_BANNER_BACKGROUND_STYLE_SOLID = editor_template.BANNER_BACKGROUND_STYLE_SOLID
+_BANNER_BACKGROUND_STYLE_GRADIENT_BOTTOM = editor_template.BANNER_BACKGROUND_STYLE_GRADIENT_BOTTOM
+_normalize_banner_background_style = editor_template.normalize_banner_background_style
+_BANNER_GRADIENT_HEIGHT_PCT_DEFAULT = editor_template.BANNER_GRADIENT_HEIGHT_PCT_DEFAULT
+_BANNER_GRADIENT_HEIGHT_PCT_MIN = editor_template.BANNER_GRADIENT_HEIGHT_PCT_MIN
+_BANNER_GRADIENT_HEIGHT_PCT_MAX = editor_template.BANNER_GRADIENT_HEIGHT_PCT_MAX
+_BANNER_GRADIENT_TOP_OPACITY_PCT_DEFAULT = editor_template.BANNER_GRADIENT_TOP_OPACITY_PCT_DEFAULT
+_BANNER_GRADIENT_BOTTOM_OPACITY_PCT_DEFAULT = editor_template.BANNER_GRADIENT_BOTTOM_OPACITY_PCT_DEFAULT
+_BANNER_GRADIENT_TOP_COLOR_DEFAULT = editor_template.BANNER_GRADIENT_TOP_COLOR_DEFAULT
+_BANNER_GRADIENT_BOTTOM_COLOR_DEFAULT = editor_template.BANNER_GRADIENT_BOTTOM_COLOR_DEFAULT
+_DEFAULT_TEMPLATE_CENTER_MODE = editor_template.DEFAULT_TEMPLATE_CENTER_MODE
+_DEFAULT_TEMPLATE_AUTO_CROP_BY_BIRD = editor_template.DEFAULT_TEMPLATE_AUTO_CROP_BY_BIRD
+_DEFAULT_TEMPLATE_MAX_LONG_EDGE = editor_template.DEFAULT_TEMPLATE_MAX_LONG_EDGE
+_normalize_template_field = editor_template.normalize_template_field
+_normalize_template_payload = editor_template.normalize_template_payload
+_ensure_template_repository = editor_template.ensure_template_repository
+_list_template_names = editor_template.list_template_names
+_load_template_payload = editor_template.load_template_payload
+_save_template_payload = editor_template.save_template_payload
+_default_template_payload = editor_template.default_template_payload
+render_template_overlay = editor_template.render_template_overlay
+
+
+def _pil_to_qpixmap(image: Image.Image) -> QPixmap:
+    rgba = image.convert("RGBA")
+    data = rgba.tobytes("raw", "RGBA")
+    q_image = QImage(data, rgba.width, rgba.height, QImage.Format.Format_RGBA8888)
+    return QPixmap.fromImage(q_image.copy())
+
+
+# ---------------------------------------------------------------------------
+# _GradientBarWidget
+# ---------------------------------------------------------------------------
+
+class _GradientBarWidget(QWidget):
+    """Horizontal gradient preview bar (left = image-top stop, right = image-bottom stop)."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setFixedHeight(28)
+        self.setMinimumWidth(120)
+        self._top_color = QColor("#000000")
+        self._top_alpha = 0
+        self._bot_color = QColor("#000000")
+        self._bot_alpha = int(round(62 * 2.55))
+
+    def set_top(self, color: QColor, opacity_pct: float) -> None:
+        self._top_color = QColor(color)
+        self._top_alpha = int(round(max(0.0, min(100.0, opacity_pct)) * 2.55))
+        self.update()
+
+    def set_bottom(self, color: QColor, opacity_pct: float) -> None:
+        self._bot_color = QColor(color)
+        self._bot_alpha = int(round(max(0.0, min(100.0, opacity_pct)) * 2.55))
+        self.update()
+
+    def paintEvent(self, _event: Any) -> None:
+        painter = QPainter(self)
+        rect = self.rect()
+        checker = 6
+        light, dark = QColor(200, 200, 200), QColor(160, 160, 160)
+        for row in range(0, rect.height(), checker):
+            for col in range(0, rect.width(), checker):
+                c = light if (row // checker + col // checker) % 2 == 0 else dark
+                painter.fillRect(col, row, checker, checker, c)
+        grad = QLinearGradient(0.0, 0.0, float(rect.width()), 0.0)
+        c0 = QColor(self._top_color)
+        c0.setAlpha(self._top_alpha)
+        c1 = QColor(self._bot_color)
+        c1.setAlpha(self._bot_alpha)
+        grad.setColorAt(0.0, c0)
+        grad.setColorAt(1.0, c1)
+        painter.fillRect(rect, grad)
+        painter.setPen(QColor(120, 120, 120))
+        painter.drawRect(rect.adjusted(0, 0, -1, -1))
+        painter.end()
+
+
+# ---------------------------------------------------------------------------
+# _GradientEditorWidget
+# ---------------------------------------------------------------------------
+
+class _GradientEditorWidget(QWidget):
+    """Photoshop-style gradient editor: preview bar + two color stops (top/bottom) + height."""
+
+    changed = pyqtSignal()
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+
+        self._bar = _GradientBarWidget()
+        layout.addWidget(self._bar)
+
+        top_row = QHBoxLayout()
+        top_row.setSpacing(4)
+        top_lbl = QLabel("顶端")
+        top_lbl.setFixedWidth(36)
+        top_row.addWidget(top_lbl)
+        self._top_swatch = _build_color_preview_swatch()
+        top_row.addWidget(self._top_swatch)
+        top_pick = QPushButton("选色")
+        top_pick.setFixedWidth(42)
+        top_pick.clicked.connect(self._pick_top_color)
+        top_row.addWidget(top_pick)
+        top_screen = QPushButton("吸管")
+        top_screen.setFixedWidth(42)
+        top_screen.clicked.connect(self._pick_top_screen)
+        top_row.addWidget(top_screen)
+        top_row.addWidget(QLabel("不透明度"))
+        self._top_opacity_slider = QSlider(Qt.Orientation.Horizontal)
+        self._top_opacity_slider.setRange(0, 100)
+        self._top_opacity_slider.valueChanged.connect(self._on_top_slider)
+        top_row.addWidget(self._top_opacity_slider, stretch=1)
+        self._top_opacity_spin = QSpinBox()
+        self._top_opacity_spin.setRange(0, 100)
+        self._top_opacity_spin.setSuffix(" %")
+        self._top_opacity_spin.setFixedWidth(60)
+        self._top_opacity_spin.valueChanged.connect(self._on_top_spin)
+        top_row.addWidget(self._top_opacity_spin)
+        layout.addLayout(top_row)
+
+        bot_row = QHBoxLayout()
+        bot_row.setSpacing(4)
+        bot_lbl = QLabel("底端")
+        bot_lbl.setFixedWidth(36)
+        bot_row.addWidget(bot_lbl)
+        self._bot_swatch = _build_color_preview_swatch()
+        bot_row.addWidget(self._bot_swatch)
+        bot_pick = QPushButton("选色")
+        bot_pick.setFixedWidth(42)
+        bot_pick.clicked.connect(self._pick_bot_color)
+        bot_row.addWidget(bot_pick)
+        bot_screen = QPushButton("吸管")
+        bot_screen.setFixedWidth(42)
+        bot_screen.clicked.connect(self._pick_bot_screen)
+        bot_row.addWidget(bot_screen)
+        bot_row.addWidget(QLabel("不透明度"))
+        self._bot_opacity_slider = QSlider(Qt.Orientation.Horizontal)
+        self._bot_opacity_slider.setRange(0, 100)
+        self._bot_opacity_slider.valueChanged.connect(self._on_bot_slider)
+        bot_row.addWidget(self._bot_opacity_slider, stretch=1)
+        self._bot_opacity_spin = QSpinBox()
+        self._bot_opacity_spin.setRange(0, 100)
+        self._bot_opacity_spin.setSuffix(" %")
+        self._bot_opacity_spin.setFixedWidth(60)
+        self._bot_opacity_spin.valueChanged.connect(self._on_bot_spin)
+        bot_row.addWidget(self._bot_opacity_spin)
+        layout.addLayout(bot_row)
+
+        h_row = QHBoxLayout()
+        h_row.setSpacing(4)
+        h_row.addWidget(QLabel("渐变高度"))
+        self._height_slider = QSlider(Qt.Orientation.Horizontal)
+        self._height_slider.setRange(int(_BANNER_GRADIENT_HEIGHT_PCT_MIN), int(_BANNER_GRADIENT_HEIGHT_PCT_MAX))
+        self._height_slider.valueChanged.connect(self._on_height_slider)
+        h_row.addWidget(self._height_slider, stretch=1)
+        self._height_spin = QSpinBox()
+        self._height_spin.setRange(int(_BANNER_GRADIENT_HEIGHT_PCT_MIN), int(_BANNER_GRADIENT_HEIGHT_PCT_MAX))
+        self._height_spin.setSuffix(" %")
+        self._height_spin.setFixedWidth(60)
+        self._height_spin.valueChanged.connect(self._on_height_spin)
+        h_row.addWidget(self._height_spin)
+        layout.addLayout(h_row)
+
+        self._top_hex = _BANNER_GRADIENT_TOP_COLOR_DEFAULT
+        self._bot_hex = _BANNER_GRADIENT_BOTTOM_COLOR_DEFAULT
+        self._blocking = False
+        self._load_defaults()
+
+    def _load_defaults(self) -> None:
+        self.set_values(
+            top_color=_BANNER_GRADIENT_TOP_COLOR_DEFAULT,
+            top_opacity_pct=_BANNER_GRADIENT_TOP_OPACITY_PCT_DEFAULT,
+            bot_color=_BANNER_GRADIENT_BOTTOM_COLOR_DEFAULT,
+            bot_opacity_pct=_BANNER_GRADIENT_BOTTOM_OPACITY_PCT_DEFAULT,
+            height_pct=_BANNER_GRADIENT_HEIGHT_PCT_DEFAULT,
+        )
+
+    def set_values(
+        self,
+        *,
+        top_color: str,
+        top_opacity_pct: float,
+        bot_color: str,
+        bot_opacity_pct: float,
+        height_pct: float,
+    ) -> None:
+        self._blocking = True
+        try:
+            self._top_hex = _safe_color(top_color, _BANNER_GRADIENT_TOP_COLOR_DEFAULT)
+            self._bot_hex = _safe_color(bot_color, _BANNER_GRADIENT_BOTTOM_COLOR_DEFAULT)
+            top_op = max(0, min(100, int(round(top_opacity_pct))))
+            bot_op = max(0, min(100, int(round(bot_opacity_pct))))
+            h_pct = max(
+                int(_BANNER_GRADIENT_HEIGHT_PCT_MIN),
+                min(int(_BANNER_GRADIENT_HEIGHT_PCT_MAX), int(round(height_pct))),
+            )
+            self._top_opacity_slider.setValue(top_op)
+            self._top_opacity_spin.setValue(top_op)
+            self._bot_opacity_slider.setValue(bot_op)
+            self._bot_opacity_spin.setValue(bot_op)
+            self._height_slider.setValue(h_pct)
+            self._height_spin.setValue(h_pct)
+            _set_color_preview_swatch(self._top_swatch, self._top_hex)
+            _set_color_preview_swatch(self._bot_swatch, self._bot_hex)
+            self._bar.set_top(QColor(self._top_hex), float(top_op))
+            self._bar.set_bottom(QColor(self._bot_hex), float(bot_op))
+        finally:
+            self._blocking = False
+
+    def get_values(self) -> dict[str, Any]:
+        return {
+            "banner_gradient_top_color": self._top_hex,
+            "banner_gradient_top_opacity_pct": float(self._top_opacity_spin.value()),
+            "banner_gradient_bottom_color": self._bot_hex,
+            "banner_gradient_bottom_opacity_pct": float(self._bot_opacity_spin.value()),
+            "banner_gradient_height_pct": float(self._height_spin.value()),
+        }
+
+    def _refresh_bar(self) -> None:
+        self._bar.set_top(QColor(self._top_hex), float(self._top_opacity_spin.value()))
+        self._bar.set_bottom(QColor(self._bot_hex), float(self._bot_opacity_spin.value()))
+
+    def _on_top_slider(self, v: int) -> None:
+        if self._blocking:
+            return
+        self._blocking = True
+        try:
+            self._top_opacity_spin.setValue(v)
+        finally:
+            self._blocking = False
+        self._refresh_bar()
+        self.changed.emit()
+
+    def _on_top_spin(self, v: int) -> None:
+        if self._blocking:
+            return
+        self._blocking = True
+        try:
+            self._top_opacity_slider.setValue(v)
+        finally:
+            self._blocking = False
+        self._refresh_bar()
+        self.changed.emit()
+
+    def _on_bot_slider(self, v: int) -> None:
+        if self._blocking:
+            return
+        self._blocking = True
+        try:
+            self._bot_opacity_spin.setValue(v)
+        finally:
+            self._blocking = False
+        self._refresh_bar()
+        self.changed.emit()
+
+    def _on_bot_spin(self, v: int) -> None:
+        if self._blocking:
+            return
+        self._blocking = True
+        try:
+            self._bot_opacity_slider.setValue(v)
+        finally:
+            self._blocking = False
+        self._refresh_bar()
+        self.changed.emit()
+
+    def _on_height_slider(self, v: int) -> None:
+        if self._blocking:
+            return
+        self._blocking = True
+        try:
+            self._height_spin.setValue(v)
+        finally:
+            self._blocking = False
+        self.changed.emit()
+
+    def _on_height_spin(self, v: int) -> None:
+        if self._blocking:
+            return
+        self._blocking = True
+        try:
+            self._height_slider.setValue(v)
+        finally:
+            self._blocking = False
+        self.changed.emit()
+
+    def _pick_top_color(self) -> None:
+        color = QColorDialog.getColor(QColor(self._top_hex), self, "选择顶端颜色")
+        if color.isValid():
+            self._top_hex = color.name()
+            _set_color_preview_swatch(self._top_swatch, self._top_hex)
+            self._refresh_bar()
+            self.changed.emit()
+
+    def _pick_top_screen(self) -> None:
+        def _apply(hex_: str) -> None:
+            self._top_hex = _safe_color(hex_, _BANNER_GRADIENT_TOP_COLOR_DEFAULT)
+            _set_color_preview_swatch(self._top_swatch, self._top_hex)
+            self._refresh_bar()
+            self.changed.emit()
+        _start_screen_color_picker(parent=self, on_picked=_apply)
+
+    def _pick_bot_color(self) -> None:
+        color = QColorDialog.getColor(QColor(self._bot_hex), self, "选择底端颜色")
+        if color.isValid():
+            self._bot_hex = color.name()
+            _set_color_preview_swatch(self._bot_swatch, self._bot_hex)
+            self._refresh_bar()
+            self.changed.emit()
+
+    def _pick_bot_screen(self) -> None:
+        def _apply(hex_: str) -> None:
+            self._bot_hex = _safe_color(hex_, _BANNER_GRADIENT_BOTTOM_COLOR_DEFAULT)
+            _set_color_preview_swatch(self._bot_swatch, self._bot_hex)
+            self._refresh_bar()
+            self.changed.emit()
+        _start_screen_color_picker(parent=self, on_picked=_apply)
+
+
+# ---------------------------------------------------------------------------
+# _CropPaddingEditorWidget
+# ---------------------------------------------------------------------------
+
+class _CropPaddingEditorWidget(QWidget):
+    """可复用的裁切边界填充 + 外圈填充色编辑 Widget。"""
+
+    changed = pyqtSignal()
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+
+        grid_widget = QWidget()
+        grid = QGridLayout(grid_widget)
+        grid.setContentsMargins(0, 2, 0, 2)
+        grid.setSpacing(4)
+
+        def _make_spin_slider(label: str) -> tuple[QWidget, QSpinBox, QSlider]:
+            w = QWidget()
+            wl = QVBoxLayout(w)
+            wl.setContentsMargins(0, 0, 0, 0)
+            wl.setSpacing(2)
+            spin = QSpinBox()
+            spin.setRange(-9999, 9999)
+            spin.setValue(_DEFAULT_CROP_PADDING_PX)
+            spin.setSuffix(" px")
+            spin.setAccessibleName(label)
+            spin.setFixedWidth(72)
+            wl.addWidget(spin)
+            slider = QSlider(Qt.Orientation.Horizontal)
+            slider.setRange(-2048, 2048)
+            slider.setSingleStep(1)
+            slider.setPageStep(16)
+            slider.setValue(max(slider.minimum(), min(slider.maximum(), _DEFAULT_CROP_PADDING_PX)))
+            slider.setFixedWidth(72)
+            wl.addWidget(slider)
+            spin.valueChanged.connect(lambda v, s=slider: self._sync_slider(s, v))
+            slider.valueChanged.connect(lambda v, sp=spin: self._sync_spin(sp, v))
+            spin.valueChanged.connect(self._emit_changed)
+            return w, spin, slider
+
+        top_w, self.top_spin, self.top_slider = _make_spin_slider("上")
+        left_w, self.left_spin, self.left_slider = _make_spin_slider("左")
+        right_w, self.right_spin, self.right_slider = _make_spin_slider("右")
+        bot_w, self.bottom_spin, self.bottom_slider = _make_spin_slider("下")
+
+        grid.addWidget(top_w, 0, 1, Qt.AlignmentFlag.AlignCenter)
+        grid.addWidget(left_w, 1, 0, Qt.AlignmentFlag.AlignCenter)
+        grid.addWidget(right_w, 1, 2, Qt.AlignmentFlag.AlignCenter)
+        grid.addWidget(bot_w, 2, 1, Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(grid_widget)
+
+        fill_row = QHBoxLayout()
+        fill_row.setSpacing(4)
+        self.fill_combo = QComboBox()
+        for lbl, val in COLOR_PRESETS:
+            self.fill_combo.addItem(lbl, val)
+        if self.fill_combo.count() == 0:
+            self.fill_combo.addItem("白色", "#FFFFFF")
+        idx_white = self.fill_combo.findData("#FFFFFF")
+        if idx_white >= 0:
+            self.fill_combo.setCurrentIndex(idx_white)
+        self.fill_combo.currentIndexChanged.connect(self._on_fill_combo_changed)
+        fill_row.addWidget(self.fill_combo, stretch=1)
+        self.fill_swatch = _build_color_preview_swatch()
+        fill_row.addWidget(self.fill_swatch)
+        self._refresh_fill_swatch()
+        pick_btn = QPushButton("调色板")
+        pick_btn.clicked.connect(self._pick_fill_color)
+        fill_row.addWidget(pick_btn)
+        screen_btn = QPushButton("吸管")
+        screen_btn.clicked.connect(self._pick_fill_screen)
+        fill_row.addWidget(screen_btn)
+        layout.addLayout(fill_row)
+
+        self._blocking = False
+
+    def _sync_slider(self, slider: QSlider, value: int) -> None:
+        clamped = max(slider.minimum(), min(slider.maximum(), value))
+        if slider.value() == clamped:
+            return
+        slider.blockSignals(True)
+        try:
+            slider.setValue(clamped)
+        finally:
+            slider.blockSignals(False)
+
+    def _sync_spin(self, spin: QSpinBox, value: int) -> None:
+        if spin.value() == value:
+            return
+        spin.setValue(value)
+
+    def _on_fill_combo_changed(self, *_: Any) -> None:
+        self._refresh_fill_swatch()
+        self._emit_changed()
+
+    def _refresh_fill_swatch(self) -> None:
+        _set_color_preview_swatch(
+            self.fill_swatch,
+            str(self.fill_combo.currentData() or "#FFFFFF"),
+            fallback="#FFFFFF",
+        )
+
+    def _emit_changed(self, *_: Any) -> None:
+        if not self._blocking:
+            self.changed.emit()
+
+    def _set_fill_value(self, color: str) -> None:
+        normalized = _safe_color(color, "#FFFFFF")
+        for idx in range(self.fill_combo.count()):
+            if str(self.fill_combo.itemData(idx) or "").strip().lower() == normalized.lower():
+                self.fill_combo.setCurrentIndex(idx)
+                self._refresh_fill_swatch()
+                return
+        self.fill_combo.addItem(normalized.upper(), normalized)
+        self.fill_combo.setCurrentIndex(self.fill_combo.count() - 1)
+        self._refresh_fill_swatch()
+
+    def _pick_fill_color(self) -> None:
+        current = _safe_color(str(self.fill_combo.currentData() or "#FFFFFF"), "#FFFFFF")
+        chosen = QColorDialog.getColor(QColor(current), self, "选择图像外圈填充色")
+        if chosen.isValid():
+            self._set_fill_value(chosen.name())
+
+    def _pick_fill_screen(self) -> None:
+        _start_screen_color_picker(parent=self, on_picked=lambda h: self._set_fill_value(h))
+
+    def set_values(self, *, top: int, bottom: int, left: int, right: int, fill: str) -> None:
+        """Set all values without emitting changed."""
+        self._blocking = True
+        try:
+            for spin, slider, val in (
+                (self.top_spin, self.top_slider, top),
+                (self.bottom_spin, self.bottom_slider, bottom),
+                (self.left_spin, self.left_slider, left),
+                (self.right_spin, self.right_slider, right),
+            ):
+                spin.blockSignals(True)
+                slider.blockSignals(True)
+                try:
+                    spin.setValue(val)
+                    slider.setValue(max(slider.minimum(), min(slider.maximum(), val)))
+                finally:
+                    spin.blockSignals(False)
+                    slider.blockSignals(False)
+            self.fill_combo.blockSignals(True)
+            try:
+                self._set_fill_value(fill)
+            finally:
+                self.fill_combo.blockSignals(False)
+            self._refresh_fill_swatch()
+        finally:
+            self._blocking = False
+
+    def get_values(self) -> dict[str, Any]:
+        return {
+            "crop_padding_top": self.top_spin.value(),
+            "crop_padding_bottom": self.bottom_spin.value(),
+            "crop_padding_left": self.left_spin.value(),
+            "crop_padding_right": self.right_spin.value(),
+            "crop_padding_fill": _safe_color(
+                str(self.fill_combo.currentData() or "#FFFFFF"), "#FFFFFF"
+            ),
+        }
+
+
+# ---------------------------------------------------------------------------
+# TemplateManagerDialog
+# ---------------------------------------------------------------------------
+
+class TemplateManagerDialog(QDialog):
+    def __init__(
+        self,
+        template_dir: Path,
+        placeholder: Image.Image | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("模板管理")
+        self.resize(1180, 780)
+        self.setMinimumSize(640, 500)
+
+        self.template_dir = template_dir
+        self.placeholder = placeholder.copy() if placeholder else _build_placeholder_image()
+        self.preview_pixmap: QPixmap | None = None
+
+        self.template_paths: dict[str, Path] = {}
+        self.current_template_name: str | None = None
+        self.current_payload: dict[str, Any] | None = None
+        self._field_font_all_choices: list[tuple[str, str]] = []
+        self._updating = False
+
+        self._setup_ui()
+        self._reload_template_list(preferred=None)
+        self._refresh_preview_label()
+
+    # ------------------------------------------------------------------
+    # UI construction
+    # ------------------------------------------------------------------
+
+    def _setup_ui(self) -> None:
+        root_layout = QHBoxLayout(self)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        root_layout.addWidget(splitter)
+
+        left_panel = self._build_template_list_panel()
+
+        editor_panel = self._build_editor_panel()
+        editor_scroll = QScrollArea()
+        editor_scroll.setWidgetResizable(True)
+        editor_scroll.setWidget(editor_panel)
+        editor_scroll.setMinimumWidth(0)
+
+        preview_panel = self._build_preview_panel()
+
+        splitter.addWidget(left_panel)
+        splitter.addWidget(editor_scroll)
+        splitter.addWidget(preview_panel)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 3)
+        splitter.setStretchFactor(2, 6)
+        splitter.setSizes([220, 300, 640])
+        splitter.setChildrenCollapsible(False)
+
+    def _build_template_list_panel(self) -> QWidget:
+        """左侧面板：模板列表 + 新增/复制/删除按钮。"""
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
+
+        layout.addWidget(QLabel("模板列表"))
+
+        self.template_list = QListWidget()
+        self.template_list.currentItemChanged.connect(self._on_template_selected)
+        self.template_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.template_list.customContextMenuRequested.connect(self._on_template_list_context_menu)
+        layout.addWidget(self.template_list, stretch=1)
+
+        buttons = QHBoxLayout()
+        btn_new = QPushButton("新增")
+        btn_new.clicked.connect(self._create_template)
+        buttons.addWidget(btn_new)
+
+        btn_copy = QPushButton("复制")
+        btn_copy.clicked.connect(self._copy_template)
+        buttons.addWidget(btn_copy)
+
+        btn_delete = QPushButton("删除")
+        btn_delete.clicked.connect(self._delete_template)
+        buttons.addWidget(btn_delete)
+
+        layout.addLayout(buttons)
+        return panel
+
+    def _build_editor_panel(self) -> QWidget:
+        """中间面板：当前模板各分组。"""
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
+
+        layout.addWidget(self._build_header_group())
+        layout.addWidget(self._build_crop_group())
+        layout.addWidget(self._build_fields_group(), stretch=1)
+        layout.addWidget(self._build_field_edit_group())
+        return panel
+
+    def _build_preview_panel(self) -> QWidget:
+        """右侧面板：预览图。"""
+        panel = QWidget()
+        panel.setMinimumWidth(120)
+        panel.setMaximumWidth(1024)
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
+
+        preview_group = QGroupBox("预览")
+        preview_layout = QVBoxLayout(preview_group)
+        self.preview_label = QLabel("暂无预览")
+        self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        preview_layout.addWidget(self.preview_label, stretch=1)
+        layout.addWidget(preview_group, stretch=1)
+        return panel
+
+    def _build_header_group(self) -> QGroupBox:
+        """当前模板 GroupBox：裁切参数 + Banner 颜色/样式/渐变。"""
+        group = QGroupBox("当前模板")
+        form = QFormLayout(group)
+
+        self.template_name_edit = QLineEdit()
+        self.template_name_edit.setReadOnly(True)
+        form.addRow("模板文件", self.template_name_edit)
+
+        self.template_ratio_combo = QComboBox()
+        for label, ratio in RATIO_OPTIONS:
+            self.template_ratio_combo.addItem(label, ratio)
+        if self.template_ratio_combo.count() == 0:
+            self.template_ratio_combo.addItem("原比例", None)
+        self.template_ratio_combo.currentIndexChanged.connect(self._on_template_ratio_changed)
+        form.addRow("裁切比例", self.template_ratio_combo)
+
+        self.template_center_mode_combo = QComboBox()
+        self.template_center_mode_combo.addItem("鸟体", _CENTER_MODE_BIRD)
+        self.template_center_mode_combo.addItem("焦点", _CENTER_MODE_FOCUS)
+        self.template_center_mode_combo.addItem("图像中心", _CENTER_MODE_IMAGE)
+        self.template_center_mode_combo.currentIndexChanged.connect(self._on_tmpl_center_mode_changed)
+        form.addRow("裁切中心", self.template_center_mode_combo)
+
+        self.template_auto_crop_check = QCheckBox("自动根据鸟体计算")
+        self.template_auto_crop_check.setChecked(_DEFAULT_TEMPLATE_AUTO_CROP_BY_BIRD)
+        self.template_auto_crop_check.toggled.connect(self._on_tmpl_auto_crop_changed)
+        form.addRow("裁切策略", self.template_auto_crop_check)
+
+        self.template_max_long_edge_combo = QComboBox()
+        seen_edges: set[int] = set()
+        for _val in MAX_LONG_EDGE_OPTIONS:
+            try:
+                edge = int(_val)
+            except Exception:
+                continue
+            if edge in seen_edges:
+                continue
+            seen_edges.add(edge)
+            self.template_max_long_edge_combo.addItem("不限制" if edge <= 0 else str(edge), edge)
+        if self.template_max_long_edge_combo.count() == 0:
+            self.template_max_long_edge_combo.addItem("不限制", 0)
+        self.template_max_long_edge_combo.currentIndexChanged.connect(self._on_tmpl_max_long_edge_changed)
+        form.addRow("最大长边", self.template_max_long_edge_combo)
+
+        form.addRow("Banner颜色", self._build_banner_color_row())
+
+        self.template_draw_banner_bg_check = QCheckBox("绘制 Banner 底")
+        self.template_draw_banner_bg_check.setChecked(True)
+        self.template_draw_banner_bg_check.toggled.connect(self._on_template_draw_banner_background_changed)
+        form.addRow("Banner底", self.template_draw_banner_bg_check)
+
+        self.banner_bg_style_combo = QComboBox()
+        self.banner_bg_style_combo.addItem("实心", _BANNER_BACKGROUND_STYLE_SOLID)
+        self.banner_bg_style_combo.addItem("底部渐变", _BANNER_BACKGROUND_STYLE_GRADIENT_BOTTOM)
+        self.banner_bg_style_combo.currentIndexChanged.connect(self._on_banner_bg_style_changed)
+        form.addRow("Banner样式", self.banner_bg_style_combo)
+
+        self._gradient_editor = _GradientEditorWidget()
+        self._gradient_editor.changed.connect(self._on_banner_gradient_widget_changed)
+        self._gradient_editor_label = QLabel("渐变颜色")
+        form.addRow(self._gradient_editor_label, self._gradient_editor)
+
+        self._header_form = form
+        self._update_banner_style_ui_visibility()
+        return group
+
+    def _build_banner_color_row(self) -> QWidget:
+        """Banner 颜色行：预设下拉 + 文本输入 + 色块 + 调色板 + 吸管。"""
+        row = QWidget()
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
+        self.template_banner_color_combo = QComboBox()
+        self.template_banner_color_combo.addItem("无(透明)", _TEMPLATE_BANNER_COLOR_NONE)
+        for label, value in COLOR_PRESETS:
+            self.template_banner_color_combo.addItem(f"{label} {value}", value)
+        self.template_banner_color_combo.addItem("自定义", _TEMPLATE_BANNER_COLOR_CUSTOM)
+        self.template_banner_color_combo.currentIndexChanged.connect(
+            self._on_template_banner_color_preset_changed
+        )
+        self.template_banner_color_combo.currentIndexChanged.connect(
+            self._refresh_template_banner_color_swatch
+        )
+        layout.addWidget(self.template_banner_color_combo, stretch=1)
+
+        self.template_banner_color_edit = QLineEdit(_DEFAULT_TEMPLATE_BANNER_COLOR)
+        self.template_banner_color_edit.textChanged.connect(self._on_template_banner_color_text_changed)
+        self.template_banner_color_edit.textChanged.connect(self._refresh_template_banner_color_swatch)
+        layout.addWidget(self.template_banner_color_edit, stretch=1)
+
+        self.template_banner_color_swatch = _build_color_preview_swatch()
+        layout.addWidget(self.template_banner_color_swatch)
+        self._refresh_template_banner_color_swatch()
+
+        btn_palette = QPushButton("调色板")
+        btn_palette.clicked.connect(self._pick_template_banner_color)
+        layout.addWidget(btn_palette)
+
+        btn_screen = QPushButton("吸管")
+        btn_screen.clicked.connect(self._pick_template_banner_color_from_screen)
+        layout.addWidget(btn_screen)
+
+        self._banner_color_row_widget = row
+        return row
+
+    def _build_crop_group(self) -> QGroupBox:
+        """裁切填充 GroupBox：边界填充 + 外圈颜色。"""
+        group = QGroupBox("裁切填充")
+        form = QFormLayout(group)
+        self._tmpl_crop_padding_widget = _CropPaddingEditorWidget()
+        self._tmpl_crop_padding_widget.changed.connect(self._on_tmpl_crop_padding_changed)
+        form.addRow("边界填充 / 外圈颜色", self._tmpl_crop_padding_widget)
+        return group
+
+    def _build_fields_group(self) -> QGroupBox:
+        """文本项 GroupBox：列表 + 新增/删除按钮。"""
+        group = QGroupBox("文本项")
+        layout = QVBoxLayout(group)
+
+        self.field_list = QListWidget()
+        self.field_list.currentItemChanged.connect(self._on_field_selected)
+        layout.addWidget(self.field_list)
+
+        buttons = QHBoxLayout()
+        btn_add = QPushButton("新增文本项")
+        btn_add.clicked.connect(self._add_field)
+        buttons.addWidget(btn_add)
+
+        btn_remove = QPushButton("删除文本项")
+        btn_remove.clicked.connect(self._remove_field)
+        buttons.addWidget(btn_remove)
+
+        layout.addLayout(buttons)
+        return group
+
+    def _build_field_edit_group(self) -> QGroupBox:
+        """文本项编辑 GroupBox：所有文本项属性控件。"""
+        group = QGroupBox("文本项编辑")
+        form = QFormLayout(group)
+
+        self.field_name_edit = QLineEdit()
+        self.field_name_edit.textChanged.connect(self._apply_field_changes)
+        form.addRow("名称", self.field_name_edit)
+
+        self.field_tag_combo = QComboBox()
+        for label, value in TAG_OPTIONS:
+            self.field_tag_combo.addItem(label, value)
+        self.field_tag_combo.currentIndexChanged.connect(self._apply_field_changes)
+        form.addRow("Exif标签", self.field_tag_combo)
+
+        self._field_fallback_combo = QComboBox()
+        self._field_fallback_combo.setEditable(True)
+        self._field_fallback_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self._field_fallback_combo.addItem("（空）", "")
+        for expr, label in _FALLBACK_CONTEXT_VARS:
+            self._field_fallback_combo.addItem(f"{expr}  —  {label}", expr)
+        self._field_fallback_combo.setCurrentIndex(0)
+        if self._field_fallback_combo.lineEdit():
+            self._field_fallback_combo.lineEdit().setPlaceholderText("留空则不使用 Fallback")
+        self.field_fallback_edit = self._field_fallback_combo.lineEdit()
+        self._field_fallback_combo.currentIndexChanged.connect(self._on_fallback_var_selected)
+        self.field_fallback_edit.textChanged.connect(self._apply_field_changes)
+        form.addRow("Fallback", self._field_fallback_combo)
+
+        self.field_align_h_combo = QComboBox()
+        self.field_align_h_combo.addItems(list(ALIGN_OPTIONS_HORIZONTAL))
+        self.field_align_h_combo.currentTextChanged.connect(self._apply_field_changes)
+        form.addRow("水平对齐", self.field_align_h_combo)
+
+        self.field_align_v_combo = QComboBox()
+        self.field_align_v_combo.addItems(list(ALIGN_OPTIONS_VERTICAL))
+        self.field_align_v_combo.currentTextChanged.connect(self._apply_field_changes)
+        form.addRow("垂直对齐", self.field_align_v_combo)
+
+        self.field_x_spin = QDoubleSpinBox()
+        self.field_x_spin.setRange(-100.0, 100.0)
+        self.field_x_spin.setDecimals(2)
+        self.field_x_spin.setSingleStep(0.5)
+        self.field_x_spin.valueChanged.connect(self._apply_field_changes)
+        form.addRow("X偏移(%)", self.field_x_spin)
+
+        self.field_y_spin = QDoubleSpinBox()
+        self.field_y_spin.setRange(-100.0, 100.0)
+        self.field_y_spin.setDecimals(2)
+        self.field_y_spin.setSingleStep(0.5)
+        self.field_y_spin.valueChanged.connect(self._apply_field_changes)
+        form.addRow("Y偏移(%)", self.field_y_spin)
+
+        form.addRow("文本颜色", self._build_field_color_row())
+
+        self.field_font_filter_edit = QLineEdit()
+        self.field_font_filter_edit.setPlaceholderText("过滤字体，如：微软雅黑 / PingFang / Arial")
+        self.field_font_filter_edit.textChanged.connect(self._on_field_font_filter_changed)
+        form.addRow("字体过滤", self.field_font_filter_edit)
+
+        self.field_font_combo = QComboBox()
+        self.field_font_combo.setMaxVisibleItems(24)
+        self.field_font_combo.currentIndexChanged.connect(self._apply_field_changes)
+        form.addRow("字体类型", self.field_font_combo)
+        self._field_font_all_choices = list(_template_font_choices())
+        self._rebuild_field_font_combo(
+            filter_text="",
+            preferred_font_type=_DEFAULT_TEMPLATE_FONT_TYPE,
+        )
+
+        self.field_font_size_spin = QSpinBox()
+        self.field_font_size_spin.setRange(8, 300)
+        self.field_font_size_spin.valueChanged.connect(self._apply_field_changes)
+        form.addRow("字体大小", self.field_font_size_spin)
+
+        self.field_style_combo = QComboBox()
+        self.field_style_combo.addItems(list(STYLE_OPTIONS))
+        self.field_style_combo.currentTextChanged.connect(self._apply_field_changes)
+        form.addRow("字体样式", self.field_style_combo)
+
+        return group
+
+    def _build_field_color_row(self) -> QWidget:
+        """文本颜色行：预设下拉 + 文本输入 + 色块 + 调色板 + 吸管。"""
+        row = QWidget()
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
+        self.field_color_combo = QComboBox()
+        for label, value in COLOR_PRESETS:
+            self.field_color_combo.addItem(f"{label} {value}", value)
+        self.field_color_combo.addItem("自定义", "custom")
+        self.field_color_combo.currentIndexChanged.connect(self._on_color_preset_changed)
+        self.field_color_combo.currentIndexChanged.connect(self._refresh_field_color_swatch)
+        layout.addWidget(self.field_color_combo, stretch=1)
+
+        self.field_color_edit = QLineEdit("#FFFFFF")
+        self.field_color_edit.textChanged.connect(self._apply_field_changes)
+        self.field_color_edit.textChanged.connect(self._refresh_field_color_swatch)
+        layout.addWidget(self.field_color_edit, stretch=1)
+
+        self.field_color_swatch = _build_color_preview_swatch()
+        layout.addWidget(self.field_color_swatch)
+        self._refresh_field_color_swatch()
+
+        btn_palette = QPushButton("调色板")
+        btn_palette.clicked.connect(self._pick_field_color)
+        layout.addWidget(btn_palette)
+
+        btn_screen = QPushButton("吸管")
+        btn_screen.clicked.connect(self._pick_field_color_from_screen)
+        layout.addWidget(btn_screen)
+
+        return row
+
+    def resizeEvent(self, event: Any) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
+        self._refresh_preview_label()
+
+    # ------------------------------------------------------------------
+    # Template list management
+    # ------------------------------------------------------------------
+
+    def _reload_template_list(self, preferred: str | None) -> None:
+        _ensure_template_repository(self.template_dir)
+        names = _list_template_names(self.template_dir)
+        self.template_paths = {name: self.template_dir / f"{name}.json" for name in names}
+
+        self.template_list.blockSignals(True)
+        self.template_list.clear()
+        for name in names:
+            self.template_list.addItem(name)
+        self.template_list.blockSignals(False)
+
+        if not names:
+            self.current_template_name = None
+            self.current_payload = None
+            self._populate_field_list([])
+            self._refresh_preview()
+            return
+
+        target = preferred if preferred in self.template_paths else names[0]
+        for idx in range(self.template_list.count()):
+            item = self.template_list.item(idx)
+            if item and item.text() == target:
+                self.template_list.setCurrentRow(idx)
+                break
+
+    def _on_template_list_context_menu(self, pos: Any) -> None:
+        item = self.template_list.itemAt(pos)
+        if item is None:
+            return
+        menu = QMenu(self)
+        rename_action = menu.addAction("重命名")
+        delete_action = menu.addAction("删除")
+        selected = menu.exec(self.template_list.mapToGlobal(pos))
+        if selected is rename_action:
+            self._rename_template(item.text())
+        elif selected is delete_action:
+            self._delete_template(item.text())
+
+    def _rename_template(self, source_name: str | None = None) -> None:
+        origin_name = str(source_name or self.current_template_name or "").strip()
+        if not origin_name:
+            return
+        source_path = self.template_paths.get(origin_name)
+        if not source_path:
+            return
+
+        raw_name, ok = QInputDialog.getText(self, "重命名模板", "新模板名(仅文件名):", text=origin_name)
+        if not ok:
+            return
+        target_name = _sanitize_template_name(raw_name)
+        if not target_name:
+            QMessageBox.warning(self, "模板管理", "模板名不能为空")
+            return
+        if target_name == origin_name:
+            return
+
+        target_path = self.template_dir / f"{target_name}.json"
+        if target_path.exists():
+            QMessageBox.warning(self, "模板管理", f"模板已存在: {target_path.name}")
+            return
+
+        try:
+            payload = _load_template_payload(source_path)
+            payload["name"] = target_name
+            _save_template_payload(target_path, payload)
+            source_path.unlink(missing_ok=True)
+        except Exception as exc:
+            QMessageBox.critical(self, "重命名失败", str(exc))
+            return
+
+        self._reload_template_list(preferred=target_name)
+
+    def _selected_template_name(self) -> str:
+        item = self.template_list.currentItem()
+        if item is not None:
+            name = str(item.text() or "").strip()
+            if name:
+                return name
+        return str(self.current_template_name or "").strip()
+
+    def _on_template_selected(
+        self, current: QListWidgetItem | None, _previous: QListWidgetItem | None
+    ) -> None:
+        if not current:
+            return
+        name = current.text()
+        path = self.template_paths.get(name)
+        if not path:
+            return
+        try:
+            payload = _load_template_payload(path)
+        except Exception as exc:
+            QMessageBox.critical(self, "模板错误", str(exc))
+            return
+
+        self.current_template_name = name
+        self.current_payload = payload
+        self.template_name_edit.setText(path.name)
+        self._updating = True
+        try:
+            self._set_template_ratio_combo_value(payload.get("ratio"))
+            self._set_tmpl_center_mode_value(payload.get("center_mode", _DEFAULT_TEMPLATE_CENTER_MODE))
+            self.template_auto_crop_check.setChecked(
+                _parse_bool_value(payload.get("auto_crop_by_bird"), _DEFAULT_TEMPLATE_AUTO_CROP_BY_BIRD)
+            )
+            self._set_tmpl_max_long_edge_value(
+                int(payload.get("max_long_edge") or _DEFAULT_TEMPLATE_MAX_LONG_EDGE)
+            )
+            self._set_template_banner_color_value(payload.get("banner_color"))
+            self._set_template_draw_banner_background_value(payload.get("draw_banner_background"))
+            self._set_banner_bg_style_value(payload.get("banner_background_style"))
+            self._gradient_editor.set_values(
+                top_color=str(
+                    payload.get("banner_gradient_top_color") or _BANNER_GRADIENT_TOP_COLOR_DEFAULT
+                ),
+                top_opacity_pct=float(
+                    payload.get("banner_gradient_top_opacity_pct")
+                    or _BANNER_GRADIENT_TOP_OPACITY_PCT_DEFAULT
+                ),
+                bot_color=str(
+                    payload.get("banner_gradient_bottom_color") or _BANNER_GRADIENT_BOTTOM_COLOR_DEFAULT
+                ),
+                bot_opacity_pct=float(
+                    payload.get("banner_gradient_bottom_opacity_pct")
+                    or _BANNER_GRADIENT_BOTTOM_OPACITY_PCT_DEFAULT
+                ),
+                height_pct=float(
+                    payload.get("banner_gradient_height_pct") or _BANNER_GRADIENT_HEIGHT_PCT_DEFAULT
+                ),
+            )
+            self._tmpl_crop_padding_widget.set_values(
+                top=int(payload.get("crop_padding_top") or 0),
+                bottom=int(payload.get("crop_padding_bottom") or 0),
+                left=int(payload.get("crop_padding_left") or 0),
+                right=int(payload.get("crop_padding_right") or 0),
+                fill=str(payload.get("crop_padding_fill") or "#FFFFFF"),
+            )
+        finally:
+            self._updating = False
+        self._populate_field_list(payload.get("fields") or [])
+        self._refresh_preview()
+
+    # ------------------------------------------------------------------
+    # Ratio / center mode / auto crop / max edge
+    # ------------------------------------------------------------------
+
+    def _template_ratio_combo_index_for_value(self, ratio: float | None) -> int:
+        for idx in range(self.template_ratio_combo.count()):
+            data = self.template_ratio_combo.itemData(idx)
+            if data is None and ratio is None:
+                return idx
+            if data is None or ratio is None:
+                continue
+            try:
+                if abs(float(data) - float(ratio)) <= 0.0001:
+                    return idx
+            except Exception:
+                continue
+        return -1
+
+    def _set_template_ratio_combo_value(self, ratio: Any) -> None:
+        parsed = _parse_ratio_value(ratio)
+        idx = self._template_ratio_combo_index_for_value(parsed)
+        if idx < 0:
+            return
+        self.template_ratio_combo.setCurrentIndex(idx)
+
+    def _on_template_ratio_changed(self, *_args: Any) -> None:
+        if self._updating or not self.current_payload:
+            return
+        ratio = _parse_ratio_value(self.template_ratio_combo.currentData())
+        self.current_payload["ratio"] = ratio
+        self._save_current_template()
+        self._refresh_preview()
+
+    def _set_tmpl_center_mode_value(self, value: Any) -> None:
+        mode = _normalize_center_mode(value)
+        for idx in range(self.template_center_mode_combo.count()):
+            if self.template_center_mode_combo.itemData(idx) == mode:
+                self.template_center_mode_combo.setCurrentIndex(idx)
+                return
+
+    def _on_tmpl_center_mode_changed(self, *_args: Any) -> None:
+        if self._updating or not self.current_payload:
+            return
+        self.current_payload["center_mode"] = str(
+            self.template_center_mode_combo.currentData() or _DEFAULT_TEMPLATE_CENTER_MODE
+        )
+        self._save_current_template()
+
+    def _on_tmpl_auto_crop_changed(self, *_args: Any) -> None:
+        if self._updating or not self.current_payload:
+            return
+        self.current_payload["auto_crop_by_bird"] = bool(self.template_auto_crop_check.isChecked())
+        self._save_current_template()
+
+    def _set_tmpl_max_long_edge_value(self, value: int) -> None:
+        edge = max(0, int(value))
+        idx = self.template_max_long_edge_combo.findData(edge)
+        if idx < 0:
+            label = "不限制" if edge == 0 else str(edge)
+            self.template_max_long_edge_combo.addItem(label, edge)
+            idx = self.template_max_long_edge_combo.findData(edge)
+        if idx >= 0:
+            self.template_max_long_edge_combo.setCurrentIndex(idx)
+
+    def _on_tmpl_max_long_edge_changed(self, *_args: Any) -> None:
+        if self._updating or not self.current_payload:
+            return
+        try:
+            edge = max(0, int(self.template_max_long_edge_combo.currentData() or 0))
+        except Exception:
+            edge = 0
+        self.current_payload["max_long_edge"] = edge
+        self._save_current_template()
+
+    # ------------------------------------------------------------------
+    # Font helpers
+    # ------------------------------------------------------------------
+
+    def _filtered_field_font_choices(self, filter_text: str) -> list[tuple[str, str]]:
+        all_choices = self._field_font_all_choices or [("自动(系统默认)", _DEFAULT_TEMPLATE_FONT_TYPE)]
+        query = str(filter_text or "").strip().lower()
+        if not query:
+            return list(all_choices)
+
+        filtered: list[tuple[str, str]] = []
+        for label, font_type in all_choices:
+            if font_type == _DEFAULT_TEMPLATE_FONT_TYPE:
+                filtered.append((label, font_type))
+                continue
+            haystack = f"{label} {font_type}".lower()
+            if query in haystack:
+                filtered.append((label, font_type))
+        if not filtered:
+            filtered.append(("自动(系统默认)", _DEFAULT_TEMPLATE_FONT_TYPE))
+        return filtered
+
+    def _field_font_combo_index_for_value(self, value: Any) -> int:
+        target = _normalize_template_font_type(value)
+        for idx in range(self.field_font_combo.count()):
+            data = _normalize_template_font_type(self.field_font_combo.itemData(idx))
+            if data == target:
+                return idx
+        return -1
+
+    def _rebuild_field_font_combo(self, *, filter_text: str, preferred_font_type: Any) -> None:
+        choices = self._filtered_field_font_choices(filter_text)
+        target = _normalize_template_font_type(preferred_font_type)
+        self.field_font_combo.blockSignals(True)
+        try:
+            self.field_font_combo.clear()
+            for label, font_type in choices:
+                self.field_font_combo.addItem(label, font_type)
+
+            idx = self._field_font_combo_index_for_value(target)
+            if idx < 0 and target != _DEFAULT_TEMPLATE_FONT_TYPE:
+                self.field_font_combo.addItem(f"当前字体: {target}", target)
+                idx = self.field_font_combo.count() - 1
+            if idx < 0:
+                idx = 0 if self.field_font_combo.count() > 0 else -1
+            if idx >= 0:
+                self.field_font_combo.setCurrentIndex(idx)
+        finally:
+            self.field_font_combo.blockSignals(False)
+
+    def _on_field_font_filter_changed(self, *_args: Any) -> None:
+        preferred = _normalize_template_font_type(self.field_font_combo.currentData())
+        self._rebuild_field_font_combo(
+            filter_text=self.field_font_filter_edit.text(),
+            preferred_font_type=preferred,
+        )
+
+    def _set_field_font_combo_value(self, value: Any) -> None:
+        normalized = _normalize_template_font_type(value)
+        filter_text = self.field_font_filter_edit.text() if hasattr(self, "field_font_filter_edit") else ""
+        self._rebuild_field_font_combo(
+            filter_text=filter_text,
+            preferred_font_type=normalized,
+        )
+
+    # ------------------------------------------------------------------
+    # Banner color
+    # ------------------------------------------------------------------
+
+    def _refresh_template_banner_color_swatch(self, *_args: Any) -> None:
+        selected = str(self.template_banner_color_combo.currentData() or "").strip().lower()
+        if selected == _TEMPLATE_BANNER_COLOR_NONE:
+            value = _TEMPLATE_BANNER_COLOR_NONE
+        elif selected and selected != _TEMPLATE_BANNER_COLOR_CUSTOM:
+            value = selected
+        else:
+            typed = self.template_banner_color_edit.text().strip()
+            value = typed if typed else _DEFAULT_TEMPLATE_BANNER_COLOR
+        _set_color_preview_swatch(
+            self.template_banner_color_swatch,
+            value,
+            fallback=_DEFAULT_TEMPLATE_BANNER_COLOR,
+            allow_none=True,
+        )
+
+    def _template_banner_color_combo_index_for_value(self, value: str) -> int:
+        target = str(value or "").strip().lower()
+        for idx in range(self.template_banner_color_combo.count()):
+            data = str(self.template_banner_color_combo.itemData(idx) or "").strip().lower()
+            if data == target:
+                return idx
+        return -1
+
+    def _set_template_banner_color_value(self, value: Any) -> None:
+        normalized = _normalize_template_banner_color(value)
+        custom_idx = self._template_banner_color_combo_index_for_value(_TEMPLATE_BANNER_COLOR_CUSTOM)
+        if custom_idx < 0:
+            custom_idx = max(0, self.template_banner_color_combo.count() - 1)
+
+        if normalized == _TEMPLATE_BANNER_COLOR_NONE:
+            idx = self._template_banner_color_combo_index_for_value(_TEMPLATE_BANNER_COLOR_NONE)
+            if idx < 0:
+                idx = custom_idx
+            self.template_banner_color_combo.setCurrentIndex(idx)
+            self.template_banner_color_edit.setText("")
+            self._refresh_template_banner_color_swatch()
+            return
+
+        idx = self._template_banner_color_combo_index_for_value(normalized)
+        if idx < 0:
+            idx = custom_idx
+        self.template_banner_color_combo.setCurrentIndex(idx)
+        self.template_banner_color_edit.setText(normalized)
+        self._refresh_template_banner_color_swatch()
+
+    def _set_template_draw_banner_background_value(self, value: Any) -> None:
+        self.template_draw_banner_bg_check.setChecked(_parse_bool_value(value, True))
+
+    def _on_template_draw_banner_background_changed(self, *_args: Any) -> None:
+        if self._updating or not self.current_payload:
+            return
+        self.current_payload["draw_banner_background"] = bool(
+            self.template_draw_banner_bg_check.isChecked()
+        )
+        self._save_current_template()
+        self._refresh_preview()
+
+    def _update_banner_style_ui_visibility(self) -> None:
+        is_gradient = (
+            self.banner_bg_style_combo.currentData() == _BANNER_BACKGROUND_STYLE_GRADIENT_BOTTOM
+        )
+        lbl = self._header_form.labelForField(self._banner_color_row_widget)
+        if lbl:
+            lbl.setVisible(not is_gradient)
+        self._banner_color_row_widget.setVisible(not is_gradient)
+        self._gradient_editor_label.setVisible(is_gradient)
+        self._gradient_editor.setVisible(is_gradient)
+
+    def _on_banner_bg_style_changed(self, *_args: Any) -> None:
+        self._update_banner_style_ui_visibility()
+        if self._updating or not self.current_payload:
+            return
+        self.current_payload["banner_background_style"] = str(
+            self.banner_bg_style_combo.currentData() or _BANNER_BACKGROUND_STYLE_SOLID
+        )
+        self._save_current_template()
+        self._refresh_preview()
+
+    def _on_banner_gradient_widget_changed(self) -> None:
+        if self._updating or not self.current_payload:
+            return
+        self.current_payload.update(self._gradient_editor.get_values())
+        self._save_current_template()
+        self._refresh_preview()
+
+    def _on_tmpl_crop_padding_changed(self) -> None:
+        if self._updating or not self.current_payload:
+            return
+        self.current_payload.update(self._tmpl_crop_padding_widget.get_values())
+        self._save_current_template()
+        self._refresh_preview()
+
+    def _set_banner_bg_style_value(self, value: Any) -> None:
+        style = _normalize_banner_background_style(value)
+        for idx in range(self.banner_bg_style_combo.count()):
+            if self.banner_bg_style_combo.itemData(idx) == style:
+                self.banner_bg_style_combo.setCurrentIndex(idx)
+                break
+        self._update_banner_style_ui_visibility()
+
+    def _apply_template_banner_color(self) -> None:
+        if self._updating or not self.current_payload:
+            return
+
+        selected = str(self.template_banner_color_combo.currentData() or "").strip().lower()
+        if selected == _TEMPLATE_BANNER_COLOR_NONE:
+            banner_color = _TEMPLATE_BANNER_COLOR_NONE
+        elif selected == _TEMPLATE_BANNER_COLOR_CUSTOM:
+            typed = self.template_banner_color_edit.text().strip()
+            banner_color = _normalize_template_banner_color(
+                typed if typed else _DEFAULT_TEMPLATE_BANNER_COLOR
+            )
+            if banner_color == _TEMPLATE_BANNER_COLOR_NONE:
+                banner_color = _normalize_template_banner_color(_DEFAULT_TEMPLATE_BANNER_COLOR)
+        else:
+            banner_color = _normalize_template_banner_color(selected)
+
+        self.current_payload["banner_color"] = banner_color
+        self._save_current_template()
+        self._refresh_preview()
+        self._refresh_template_banner_color_swatch()
+
+    def _on_template_banner_color_preset_changed(self, *_args: Any) -> None:
+        if self._updating or not self.current_payload:
+            return
+
+        selected = str(self.template_banner_color_combo.currentData() or "").strip().lower()
+        self._updating = True
+        try:
+            if selected == _TEMPLATE_BANNER_COLOR_NONE:
+                self.template_banner_color_edit.setText("")
+            elif selected and selected != _TEMPLATE_BANNER_COLOR_CUSTOM:
+                self.template_banner_color_edit.setText(selected)
+        finally:
+            self._updating = False
+        self._apply_template_banner_color()
+
+    def _on_template_banner_color_text_changed(self, *_args: Any) -> None:
+        if self._updating or not self.current_payload:
+            return
+
+        selected = str(self.template_banner_color_combo.currentData() or "").strip().lower()
+        text = self.template_banner_color_edit.text().strip()
+        should_switch_to_custom = False
+        if text:
+            if selected == _TEMPLATE_BANNER_COLOR_NONE:
+                should_switch_to_custom = True
+            elif selected not in {_TEMPLATE_BANNER_COLOR_CUSTOM, ""} and text.lower() != selected:
+                should_switch_to_custom = True
+        if should_switch_to_custom:
+            custom_idx = self._template_banner_color_combo_index_for_value(_TEMPLATE_BANNER_COLOR_CUSTOM)
+            if custom_idx >= 0:
+                self.template_banner_color_combo.blockSignals(True)
+                try:
+                    self.template_banner_color_combo.setCurrentIndex(custom_idx)
+                finally:
+                    self.template_banner_color_combo.blockSignals(False)
+        self._apply_template_banner_color()
+
+    def _pick_template_banner_color(self) -> None:
+        initial_text = self.template_banner_color_edit.text().strip() or _DEFAULT_TEMPLATE_BANNER_COLOR
+        initial = QColor(initial_text)
+        chosen = QColorDialog.getColor(initial, self, "选择 Banner 颜色")
+        if not chosen.isValid():
+            return
+
+        custom_idx = self._template_banner_color_combo_index_for_value(_TEMPLATE_BANNER_COLOR_CUSTOM)
+        if custom_idx >= 0:
+            self.template_banner_color_combo.setCurrentIndex(custom_idx)
+        self.template_banner_color_edit.setText(chosen.name())
+
+    def _pick_template_banner_color_from_screen(self) -> None:
+        def _apply(color_hex: str) -> None:
+            custom_idx = self._template_banner_color_combo_index_for_value(_TEMPLATE_BANNER_COLOR_CUSTOM)
+            if custom_idx >= 0:
+                self.template_banner_color_combo.setCurrentIndex(custom_idx)
+            self.template_banner_color_edit.setText(
+                _safe_color(color_hex, _DEFAULT_TEMPLATE_BANNER_COLOR)
+            )
+
+        _start_screen_color_picker(parent=self, on_picked=_apply)
+
+    # ------------------------------------------------------------------
+    # Field list / editor
+    # ------------------------------------------------------------------
+
+    def _populate_field_list(self, fields: list[dict[str, Any]]) -> None:
+        self.field_list.blockSignals(True)
+        self.field_list.clear()
+        for idx, field in enumerate(fields):
+            display = str(field.get("name") or f"字段{idx + 1}")
+            self.field_list.addItem(display)
+        self.field_list.blockSignals(False)
+
+        if self.field_list.count() > 0:
+            self.field_list.setCurrentRow(0)
+        else:
+            self._apply_field_to_editor(None)
+
+    def _selected_field_index(self) -> int:
+        return self.field_list.currentRow()
+
+    def _selected_field(self) -> dict[str, Any] | None:
+        if not self.current_payload:
+            return None
+        fields = self.current_payload.get("fields") or []
+        idx = self._selected_field_index()
+        if idx < 0 or idx >= len(fields):
+            return None
+        field = fields[idx]
+        if not isinstance(field, dict):
+            return None
+        return field
+
+    def _on_field_selected(
+        self, current: QListWidgetItem | None, _previous: QListWidgetItem | None
+    ) -> None:
+        if not current:
+            self._apply_field_to_editor(None)
+            return
+        self._apply_field_to_editor(self._selected_field())
+
+    def _set_tag_combo_value(self, tag: str) -> None:
+        target = (tag or DEFAULT_FIELD_TAG).strip()
+        idx = self.field_tag_combo.findData(target)
+        if idx < 0:
+            self.field_tag_combo.addItem(f"保留旧标签: {target}", target)
+            idx = self.field_tag_combo.count() - 1
+        self.field_tag_combo.setCurrentIndex(idx)
+
+    def _apply_field_to_editor(self, field: dict[str, Any] | None) -> None:
+        self._updating = True
+        try:
+            if not field:
+                self.field_name_edit.clear()
+                self._set_tag_combo_value(DEFAULT_FIELD_TAG)
+                self._set_fallback_combo_value("")
+                self.field_align_h_combo.setCurrentText("left")
+                self.field_align_v_combo.setCurrentText("top")
+                self.field_x_spin.setValue(0.0)
+                self.field_y_spin.setValue(0.0)
+                self.field_color_edit.setText("#FFFFFF")
+                self._set_field_font_combo_value(_DEFAULT_TEMPLATE_FONT_TYPE)
+                self.field_font_size_spin.setValue(24)
+                self.field_style_combo.setCurrentText(STYLE_OPTIONS[0])
+                self.field_color_combo.setCurrentIndex(0)
+                return
+
+            normalized = _normalize_template_field(field, 0)
+            self.field_name_edit.setText(normalized["name"])
+            self._set_tag_combo_value(normalized["tag"])
+            self._set_fallback_combo_value(normalized["fallback"])
+            self.field_align_h_combo.setCurrentText(normalized["align_horizontal"])
+            self.field_align_v_combo.setCurrentText(normalized["align_vertical"])
+            self.field_x_spin.setValue(float(normalized["x_offset_pct"]))
+            self.field_y_spin.setValue(float(normalized["y_offset_pct"]))
+            self.field_color_edit.setText(normalized["color"])
+            self._set_field_font_combo_value(normalized.get("font_type"))
+            self.field_font_size_spin.setValue(int(normalized["font_size"]))
+            self.field_style_combo.setCurrentText(normalized["style"])
+
+            preset_index = self.field_color_combo.count() - 1
+            for idx in range(self.field_color_combo.count() - 1):
+                value = str(self.field_color_combo.itemData(idx) or "")
+                if value.lower() == normalized["color"].lower():
+                    preset_index = idx
+                    break
+            self.field_color_combo.setCurrentIndex(preset_index)
+        finally:
+            self._updating = False
+            self._refresh_field_color_swatch()
+
+    def _refresh_field_color_swatch(self, *_args: Any) -> None:
+        _set_color_preview_swatch(
+            self.field_color_swatch, self.field_color_edit.text().strip(), fallback="#FFFFFF"
+        )
+
+    def _on_color_preset_changed(self, *_args: Any) -> None:
+        if self._updating:
+            return
+        value = str(self.field_color_combo.currentData() or "")
+        if value and value != "custom":
+            self.field_color_edit.setText(value)
+
+    def _pick_field_color(self) -> None:
+        initial = QColor(self.field_color_edit.text().strip() or "#ffffff")
+        chosen = QColorDialog.getColor(initial, self, "选择文本颜色")
+        if not chosen.isValid():
+            return
+        self.field_color_edit.setText(chosen.name())
+
+    def _pick_field_color_from_screen(self) -> None:
+        def _apply(color_hex: str) -> None:
+            custom_idx = self.field_color_combo.findData("custom")
+            if custom_idx >= 0:
+                self.field_color_combo.setCurrentIndex(custom_idx)
+            self.field_color_edit.setText(_safe_color(color_hex, "#FFFFFF"))
+
+        _start_screen_color_picker(parent=self, on_picked=_apply)
+
+    def _set_fallback_combo_value(self, value: str) -> None:
+        old = self._updating
+        self._updating = True
+        try:
+            combo = self._field_fallback_combo
+            matched = -1
+            for i in range(combo.count()):
+                if combo.itemData(i) == value:
+                    matched = i
+                    break
+            if matched >= 0:
+                combo.setCurrentIndex(matched)
+            else:
+                combo.setCurrentIndex(0)
+                if combo.lineEdit():
+                    combo.lineEdit().setText(value)
+        finally:
+            self._updating = old
+
+    def _on_fallback_var_selected(self, index: int) -> None:
+        if self._updating:
+            return
+        data = self._field_fallback_combo.itemData(index)
+        if data is not None and self.field_fallback_edit:
+            old = self._updating
+            self._updating = True
+            self.field_fallback_edit.setText(str(data))
+            self._updating = old
+            self._apply_field_changes()
+
+    def _apply_field_changes(self, *_args: Any) -> None:
+        if self._updating:
+            return
+        field = self._selected_field()
+        if not field or not self.current_payload:
+            return
+
+        field["name"] = self.field_name_edit.text().strip() or "字段"
+        field["tag"] = str(self.field_tag_combo.currentData() or DEFAULT_FIELD_TAG)
+        field["fallback"] = self.field_fallback_edit.text().strip()
+        align_h = self.field_align_h_combo.currentText().strip().lower()
+        align_v = self.field_align_v_combo.currentText().strip().lower()
+        field["align_horizontal"] = align_h if align_h in ALIGN_OPTIONS_HORIZONTAL else "left"
+        field["align_vertical"] = align_v if align_v in ALIGN_OPTIONS_VERTICAL else "top"
+        field["x_offset_pct"] = round(self.field_x_spin.value(), 2)
+        field["y_offset_pct"] = round(self.field_y_spin.value(), 2)
+        field["color"] = _safe_color(self.field_color_edit.text(), "#FFFFFF")
+        field["font_type"] = _normalize_template_font_type(self.field_font_combo.currentData())
+        field["font_size"] = int(self.field_font_size_spin.value())
+        style = self.field_style_combo.currentText().strip().lower()
+        field["style"] = style if style in STYLE_OPTIONS else STYLE_OPTIONS[0]
+
+        idx = self._selected_field_index()
+        if idx >= 0:
+            item = self.field_list.item(idx)
+            if item:
+                item.setText(field["name"])
+
+        self._save_current_template()
+        self._refresh_preview()
+
+    def _add_field(self) -> None:
+        if not self.current_payload:
+            return
+        fields = self.current_payload.setdefault("fields", [])
+        if not isinstance(fields, list):
+            fields = []
+            self.current_payload["fields"] = fields
+
+        default_field = _normalize_template_field({}, len(fields))
+        fields.append(default_field)
+        self._populate_field_list(fields)
+        self.field_list.setCurrentRow(len(fields) - 1)
+        self._save_current_template()
+        self._refresh_preview()
+
+    def _remove_field(self) -> None:
+        if not self.current_payload:
+            return
+        fields = self.current_payload.get("fields") or []
+        if not isinstance(fields, list) or not fields:
+            return
+
+        idx = self._selected_field_index()
+        if idx < 0 or idx >= len(fields):
+            return
+
+        fields.pop(idx)
+        if not fields:
+            fields.append(_normalize_template_field({}, 0))
+        self.current_payload["fields"] = fields
+
+        self._populate_field_list(fields)
+        self.field_list.setCurrentRow(max(0, idx - 1))
+        self._save_current_template()
+        self._refresh_preview()
+
+    # ------------------------------------------------------------------
+    # Template CRUD
+    # ------------------------------------------------------------------
+
+    def _create_template(self) -> None:
+        name, ok = QInputDialog.getText(self, "新增模板", "模板名(仅文件名):")
+        if not ok:
+            return
+        safe_name = _sanitize_template_name(name)
+        if not safe_name:
+            QMessageBox.warning(self, "模板管理", "模板名不能为空")
+            return
+
+        path = self.template_dir / f"{safe_name}.json"
+        if path.exists():
+            QMessageBox.warning(self, "模板管理", f"模板已存在: {path.name}")
+            return
+
+        payload = _default_template_payload(name=safe_name)
+        _save_template_payload(path, payload)
+        self._reload_template_list(preferred=safe_name)
+
+    def _copy_template(self) -> None:
+        if not self.current_template_name:
+            return
+        source_path = self.template_paths.get(self.current_template_name)
+        if not source_path:
+            return
+
+        base_name = f"{self.current_template_name}_copy"
+        candidate = base_name
+        suffix = 1
+        while (self.template_dir / f"{candidate}.json").exists():
+            suffix += 1
+            candidate = f"{base_name}_{suffix}"
+
+        payload = _load_template_payload(source_path)
+        payload["name"] = candidate
+        _save_template_payload(self.template_dir / f"{candidate}.json", payload)
+        self._reload_template_list(preferred=candidate)
+
+    def _delete_template(self, source_name: str | None = None) -> None:
+        target_name = str(source_name or self._selected_template_name()).strip()
+        if not target_name:
+            return
+        if len(self.template_paths) <= 1:
+            QMessageBox.warning(self, "模板管理", "至少保留一个模板")
+            return
+
+        path = self.template_paths.get(target_name)
+        if not path:
+            return
+
+        confirm = QMessageBox.question(self, "删除模板", f"确定删除 {path.name} ?")
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+
+        try:
+            path.unlink(missing_ok=True)
+        except Exception as exc:
+            QMessageBox.critical(self, "删除失败", str(exc))
+            return
+
+        self._reload_template_list(preferred=None)
+
+    def _save_current_template(self) -> None:
+        if not self.current_template_name or not self.current_payload:
+            return
+        path = self.template_paths.get(self.current_template_name)
+        if not path:
+            return
+
+        payload = _normalize_template_payload(
+            self.current_payload, fallback_name=self.current_template_name
+        )
+        payload["name"] = self.current_template_name
+        self.current_payload = payload
+        _save_template_payload(path, payload)
+
+    # ------------------------------------------------------------------
+    # Preview
+    # ------------------------------------------------------------------
+
+    def _refresh_preview(self) -> None:
+        if not self.current_payload:
+            image = self.placeholder.copy()
+        else:
+            metadata_context = {
+                "bird": "灰喜鹊",
+                "capture_text": "2026-02-16 09:14",
+                "location": "北京海淀",
+                "gps_text": "39.12345, 116.12345",
+                "camera": "Sony ILCE-1M2",
+                "lens": "FE 600mm F4 GM OSS",
+                "settings_text": "f/4  1/2000s  ISO800  600mm",
+                "stem": "sample",
+                "filename": "sample.jpg",
+            }
+            preview_base = self.placeholder.copy()
+            ratio = _parse_ratio_value(self.current_payload.get("ratio"))
+            if ratio is not None:
+                preview_base = _crop_to_ratio_with_anchor(preview_base, ratio, (0.5, 0.5))
+            image = render_template_overlay(
+                preview_base,
+                raw_metadata=SAMPLE_RAW_METADATA,
+                metadata_context=metadata_context,
+                template_payload=self.current_payload,
+            )
+
+        self.preview_pixmap = _pil_to_qpixmap(image)
+        self._refresh_preview_label()
+
+    def _refresh_preview_label(self) -> None:
+        if not self.preview_pixmap:
+            self.preview_label.setPixmap(QPixmap())
+            self.preview_label.setText("暂无预览")
+            return
+
+        target = self.preview_label.size()
+        scaled = self.preview_pixmap.scaled(
+            target,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self.preview_label.setPixmap(scaled)
+        self.preview_label.setText("")

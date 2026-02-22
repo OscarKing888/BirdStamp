@@ -1,0 +1,1058 @@
+# Core editor algorithms: focus extraction, crop math, bird detection.
+# No Qt/GUI dependencies; safe for CLI use.
+from __future__ import annotations
+
+import math
+import re
+import xml.etree.ElementTree as ET
+from functools import lru_cache
+from pathlib import Path
+from typing import Any
+
+from PIL import Image, ImageColor, ImageOps
+
+# Center mode constants (used by CLI and GUI)
+CENTER_MODE_IMAGE = "image"
+CENTER_MODE_FOCUS = "focus"
+CENTER_MODE_BIRD = "bird"
+CENTER_MODE_OPTIONS = (CENTER_MODE_IMAGE, CENTER_MODE_FOCUS, CENTER_MODE_BIRD)
+
+DEFAULT_CROP_PADDING_PX = 128
+DEFAULT_FOCUS_BOX_SHORT_EDGE_RATIO = 0.12
+
+_BIRD_MODEL_CANDIDATES = ("yolo11n.pt", "yolo11s.pt", "yolov8n.pt")
+_BIRD_CLASS_NAME = "bird"
+_COCO_FALLBACK_BIRD_CLASS_ID = 14
+_BIRD_DETECT_CONFIDENCE = 0.25
+_BIRD_DETECTOR_ERROR_MESSAGE = ""
+
+_RDF_NS = "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+_RDF_DESC_TAG = f"{{{_RDF_NS}}}Description"
+_RDF_LI_TAG = f"{{{_RDF_NS}}}li"
+_RDF_RESOURCE_ATTR = f"{{{_RDF_NS}}}resource"
+_XML_LANG_ATTR = "{http://www.w3.org/XML/1998/namespace}lang"
+_XMP_NS_TO_PREFIX = {
+    "http://purl.org/dc/elements/1.1/": "XMP-dc",
+    "http://ns.adobe.com/photoshop/1.0/": "XMP-photoshop",
+    "http://ns.adobe.com/xap/1.0/": "XMP",
+    "http://ns.adobe.com/xmp/1.0/DynamicMedia/": "XMP-xmpDM",
+}
+
+
+def clean_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, bytes):
+        for codec in ("utf-8", "utf-16le", "latin1"):
+            try:
+                value = value.decode(codec, errors="ignore")
+                break
+            except Exception:
+                continue
+    if isinstance(value, (list, tuple)):
+        items = [str(v).strip() for v in value if str(v).strip()]
+        value = " ".join(items)
+    text = str(value).replace("\x00", " ").strip()
+    text = re.sub(r"\s+", " ", text)
+    return text or None
+
+
+def normalize_lookup(raw: dict[str, Any]) -> dict[str, Any]:
+    lookup: dict[str, Any] = {}
+    for key, value in raw.items():
+        key_text = str(key).strip().lower()
+        if not key_text:
+            continue
+        lookup.setdefault(key_text, value)
+        if ":" in key_text:
+            lookup.setdefault(key_text.split(":")[-1], value)
+    return lookup
+
+
+def _split_xml_tag(tag: str) -> tuple[str, str]:
+    if not isinstance(tag, str):
+        return ("", "")
+    if tag.startswith("{") and "}" in tag:
+        uri, local = tag[1:].split("}", 1)
+        return (uri, local)
+    return ("", tag)
+
+
+def find_sidecar_xmp_path(source_path: Path) -> Path | None:
+    candidates = (
+        source_path.with_suffix(".xmp"),
+        source_path.with_suffix(".XMP"),
+    )
+    for candidate in candidates:
+        if candidate.exists() and candidate.is_file():
+            return candidate
+    try:
+        for sibling in source_path.parent.iterdir():
+            if not sibling.is_file():
+                continue
+            if sibling.stem != source_path.stem:
+                continue
+            if sibling.suffix.lower() == ".xmp":
+                return sibling
+    except Exception:
+        return None
+    return None
+
+
+def _extract_xmp_property_value(node: ET.Element) -> Any | None:
+    li_nodes = node.findall(f".//{_RDF_LI_TAG}")
+    if li_nodes:
+        default_text: str | None = None
+        values: list[str] = []
+        for li in li_nodes:
+            text = clean_text(li.text)
+            if not text:
+                continue
+            values.append(text)
+            lang = str(li.attrib.get(_XML_LANG_ATTR) or "").strip().lower()
+            if lang == "x-default" and default_text is None:
+                default_text = text
+        if default_text:
+            return default_text
+        if values:
+            return values[0] if len(values) == 1 else values
+    resource_text = clean_text(node.attrib.get(_RDF_RESOURCE_ATTR))
+    if resource_text:
+        return resource_text
+    direct_text = clean_text(node.text)
+    if direct_text:
+        return direct_text
+    all_text = clean_text(" ".join(part for part in node.itertext() if isinstance(part, str)))
+    if all_text:
+        return all_text
+    return None
+
+
+def load_sidecar_xmp_metadata(source_path: Path) -> dict[str, Any]:
+    xmp_path = find_sidecar_xmp_path(source_path)
+    if xmp_path is None:
+        return {}
+    try:
+        payload = xmp_path.read_bytes()
+    except Exception:
+        return {}
+    try:
+        root = ET.fromstring(payload)
+    except Exception:
+        try:
+            root = ET.fromstring(payload.decode("utf-8", errors="ignore"))
+        except Exception:
+            return {}
+    parsed: dict[str, Any] = {}
+    for desc in root.findall(f".//{_RDF_DESC_TAG}"):
+        for child in list(desc):
+            if not isinstance(child.tag, str):
+                continue
+            namespace_uri, local_name = _split_xml_tag(child.tag)
+            local = str(local_name or "").strip()
+            if not local:
+                continue
+            value = _extract_xmp_property_value(child)
+            if value is None:
+                continue
+            prefix = _XMP_NS_TO_PREFIX.get(namespace_uri, "XMP")
+            parsed[f"{prefix}:{local}"] = value
+            if namespace_uri == "http://purl.org/dc/elements/1.1/" and local.lower() == "title":
+                parsed.setdefault("XMP:Title", value)
+                parsed.setdefault("Title", value)
+            if namespace_uri == "http://purl.org/dc/elements/1.1/" and local.lower() == "description":
+                parsed.setdefault("XMP:Description", value)
+    if parsed:
+        parsed["XMP:SidecarFile"] = str(xmp_path)
+    return parsed
+
+
+def _extract_numbers(value: Any) -> list[float]:
+    if value is None:
+        return []
+    if isinstance(value, (int, float)):
+        return [float(value)]
+    if isinstance(value, (list, tuple)):
+        numbers: list[float] = []
+        for item in value:
+            numbers.extend(_extract_numbers(item))
+        return numbers
+    text = str(value)
+    tokens = re.findall(r"[-+]?\d+(?:\.\d+)?", text)
+    result: list[float] = []
+    for token in tokens:
+        try:
+            result.append(float(token))
+        except ValueError:
+            continue
+    return result
+
+
+def _is_dimension_like(value: float, size: int) -> bool:
+    if size <= 0:
+        return False
+    if value <= 1.0:
+        return False
+    size_f = float(size)
+    return abs(value - size_f) <= 3.0 or abs(value - (size_f + 1.0)) <= 3.0
+
+
+def clamp01(value: float) -> float:
+    return max(0.0, min(1.0, value))
+
+
+def _normalize_focus_coordinate(x: float, y: float, width: int, height: int) -> tuple[float, float]:
+    if x > 1.0 or y > 1.0:
+        if width > 0 and height > 0:
+            return (clamp01(x / float(width)), clamp01(y / float(height)))
+    return (clamp01(x), clamp01(y))
+
+
+def _decode_focus_numbers_layout(
+    numbers: list[float], width: int, height: int
+) -> tuple[float, float, float | None, float | None] | None:
+    if len(numbers) < 2:
+        return None
+    if len(numbers) >= 4 and _is_dimension_like(numbers[0], width) and _is_dimension_like(numbers[1], height):
+        center_x = numbers[2]
+        center_y = numbers[3]
+        span_start = 4
+    else:
+        center_x = numbers[0]
+        center_y = numbers[1]
+        span_start = 2
+    span_x: float | None = None
+    span_y: float | None = None
+    if len(numbers) >= span_start + 2:
+        span_x = numbers[span_start]
+        span_y = numbers[span_start + 1]
+    elif len(numbers) >= span_start + 1:
+        span_x = numbers[span_start]
+        span_y = numbers[span_start]
+    return (center_x, center_y, span_x, span_y)
+
+
+def _extract_focus_frame_size(value: Any) -> tuple[float, float] | None:
+    numbers = _extract_numbers(value)
+    if len(numbers) < 2:
+        return None
+    width = numbers[0]
+    height = numbers[1]
+    if width <= 0 or height <= 0:
+        return None
+    return (float(width), float(height))
+
+
+def get_focus_point(raw: dict[str, Any], width: int, height: int) -> tuple[float, float] | None:
+    """Return normalized (x,y) focus point from metadata, or None."""
+    return _extract_focus_point_impl(raw, width, height)
+
+
+def _extract_focus_point_impl(raw: dict[str, Any], width: int, height: int) -> tuple[float, float] | None:
+    if width <= 0 or height <= 0:
+        return None
+    lookup = normalize_lookup(raw)
+    key_pairs = [
+        ("composite:focusx", "composite:focusy"),
+        ("focusx", "focusy"),
+        ("regioninfo:regionsregionlistregionareax", "regioninfo:regionsregionlistregionareay"),
+        ("regionareax", "regionareay"),
+    ]
+    for x_key, y_key in key_pairs:
+        if x_key in lookup and y_key in lookup:
+            xs = _extract_numbers(lookup[x_key])
+            ys = _extract_numbers(lookup[y_key])
+            if xs and ys:
+                x, y = xs[0], ys[0]
+                if x > 1.0 or y > 1.0:
+                    return (max(0.0, min(1.0, x / width)), max(0.0, min(1.0, y / height)))
+                return (max(0.0, min(1.0, x)), max(0.0, min(1.0, y)))
+    for key in ("subjectarea", "subjectlocation", "focuslocation", "focuslocation2", "afpoint"):
+        if key not in lookup:
+            continue
+        nums = _extract_numbers(lookup[key])
+        decoded = _decode_focus_numbers_layout(nums, width, height)
+        if decoded is None:
+            continue
+        x, y, _span_x, _span_y = decoded
+        return _normalize_focus_coordinate(x, y, width, height)
+    return None
+
+
+def _extract_focus_point(raw: dict[str, Any], width: int, height: int) -> tuple[float, float] | None:
+    """Alias for backward compatibility in editor_core internals."""
+    return _extract_focus_point_impl(raw, width, height)
+
+
+def _normalize_focus_span(value: float | None, full_size: int, fallback: float) -> float:
+    if full_size <= 0:
+        return max(0.01, min(1.0, fallback))
+    if value is None or value <= 0:
+        return max(0.01, min(1.0, fallback))
+    span = float(value)
+    if span > 1.0:
+        span = span / float(full_size)
+    return max(0.01, min(1.0, span))
+
+
+def _focus_box_from_center(center_x: float, center_y: float, span_x: float, span_y: float) -> tuple[float, float, float, float]:
+    cx = clamp01(center_x)
+    cy = clamp01(center_y)
+    sx = max(0.01, min(1.0, span_x))
+    sy = max(0.01, min(1.0, span_y))
+    half_x = sx * 0.5
+    half_y = sy * 0.5
+    left = cx - half_x
+    right = cx + half_x
+    top = cy - half_y
+    bottom = cy + half_y
+    if left < 0.0:
+        right = min(1.0, right - left)
+        left = 0.0
+    if right > 1.0:
+        left = max(0.0, left - (right - 1.0))
+        right = 1.0
+    if top < 0.0:
+        bottom = min(1.0, bottom - top)
+        top = 0.0
+    if bottom > 1.0:
+        top = max(0.0, top - (bottom - 1.0))
+        bottom = 1.0
+    return (left, top, right, bottom)
+
+
+def _focus_box_from_numbers(
+    numbers: list[float],
+    width: int,
+    height: int,
+    fallback_span_px: tuple[float, float] | None = None,
+) -> tuple[float, float, float, float] | None:
+    if width <= 0 or height <= 0:
+        return None
+    decoded = _decode_focus_numbers_layout(numbers, width, height)
+    if decoded is None:
+        return None
+    x, y, span_x_raw, span_y_raw = decoded
+    center_x, center_y = _normalize_focus_coordinate(x, y, width, height)
+    default_side_px = max(24.0, min(width, height) * DEFAULT_FOCUS_BOX_SHORT_EDGE_RATIO)
+    if fallback_span_px is not None and fallback_span_px[0] > 0 and fallback_span_px[1] > 0:
+        fallback_span_x = fallback_span_px[0] / float(width)
+        fallback_span_y = fallback_span_px[1] / float(height)
+    else:
+        fallback_span_x = default_side_px / float(width)
+        fallback_span_y = default_side_px / float(height)
+    span_x = _normalize_focus_span(span_x_raw, width, fallback_span_x)
+    span_y = _normalize_focus_span(span_y_raw, height, fallback_span_y)
+    return _focus_box_from_center(center_x, center_y, span_x, span_y)
+
+
+def extract_focus_box(raw: dict[str, Any], width: int, height: int) -> tuple[float, float, float, float] | None:
+    if width <= 0 or height <= 0:
+        return None
+    lookup = normalize_lookup(raw)
+    focus_frame_span_px: tuple[float, float] | None = None
+    for key in ("focusframesize", "focusframesize2"):
+        if key not in lookup:
+            continue
+        parsed = _extract_focus_frame_size(lookup[key])
+        if parsed is not None:
+            focus_frame_span_px = parsed
+            break
+    subject_area = lookup.get("subjectarea")
+    if subject_area is not None:
+        box = _focus_box_from_numbers(_extract_numbers(subject_area), width, height, fallback_span_px=focus_frame_span_px)
+        if box is not None:
+            return box
+    box_key_groups = [
+        ("composite:focusx", "composite:focusy", "composite:focusw", "composite:focush"),
+        ("focusx", "focusy", "focusw", "focush"),
+        (
+            "regioninfo:regionsregionlistregionareax",
+            "regioninfo:regionsregionlistregionareay",
+            "regioninfo:regionsregionlistregionareaw",
+            "regioninfo:regionsregionlistregionareah",
+        ),
+        ("regionareax", "regionareay", "regionareaw", "regionareah"),
+    ]
+    for x_key, y_key, w_key, h_key in box_key_groups:
+        if x_key not in lookup or y_key not in lookup:
+            continue
+        xs = _extract_numbers(lookup[x_key])
+        ys = _extract_numbers(lookup[y_key])
+        if not xs or not ys:
+            continue
+        nums = [xs[0], ys[0]]
+        ws = _extract_numbers(lookup.get(w_key))
+        hs = _extract_numbers(lookup.get(h_key))
+        if ws and hs:
+            nums.extend([ws[0], hs[0]])
+        box = _focus_box_from_numbers(nums, width, height, fallback_span_px=focus_frame_span_px)
+        if box is not None:
+            return box
+    for key in ("subjectlocation", "focuslocation", "focuslocation2", "afpoint"):
+        if key not in lookup:
+            continue
+        box = _focus_box_from_numbers(_extract_numbers(lookup[key]), width, height, fallback_span_px=focus_frame_span_px)
+        if box is not None:
+            return box
+    focus_point = _extract_focus_point(raw, width, height)
+    if focus_point is None:
+        return None
+    default_side_px = max(24.0, min(width, height) * DEFAULT_FOCUS_BOX_SHORT_EDGE_RATIO)
+    return _focus_box_from_center(
+        focus_point[0],
+        focus_point[1],
+        default_side_px / float(width),
+        default_side_px / float(height),
+    )
+
+
+def transform_focus_box_after_crop(
+    focus_box: tuple[float, float, float, float],
+    *,
+    source_width: int,
+    source_height: int,
+    ratio: float | None,
+    anchor: tuple[float, float],
+) -> tuple[float, float, float, float] | None:
+    if source_width <= 0 or source_height <= 0:
+        return None
+    left = focus_box[0] * source_width
+    top = focus_box[1] * source_height
+    right = focus_box[2] * source_width
+    bottom = focus_box[3] * source_height
+    width_ref = float(source_width)
+    height_ref = float(source_height)
+    if ratio is not None and ratio > 0:
+        current_ratio = source_width / float(source_height)
+        if abs(current_ratio - ratio) >= 0.0001:
+            anchor_x = clamp01(anchor[0])
+            anchor_y = clamp01(anchor[1])
+            if current_ratio > ratio:
+                new_width = max(1, int(round(source_height * ratio)))
+                center_x = int(round(anchor_x * source_width))
+                crop_left = max(0, min(source_width - new_width, center_x - (new_width // 2)))
+                left -= crop_left
+                right -= crop_left
+                width_ref = float(new_width)
+                height_ref = float(source_height)
+            else:
+                new_height = max(1, int(round(source_width / ratio)))
+                center_y = int(round(anchor_y * source_height))
+                crop_top = max(0, min(source_height - new_height, center_y - (new_height // 2)))
+                top -= crop_top
+                bottom -= crop_top
+                width_ref = float(source_width)
+                height_ref = float(new_height)
+    left_n = left / width_ref
+    right_n = right / width_ref
+    top_n = top / height_ref
+    bottom_n = bottom / height_ref
+    if right_n <= 0.0 or left_n >= 1.0 or bottom_n <= 0.0 or top_n >= 1.0:
+        return None
+    left_n = clamp01(left_n)
+    right_n = clamp01(right_n)
+    top_n = clamp01(top_n)
+    bottom_n = clamp01(bottom_n)
+    if right_n <= left_n or bottom_n <= top_n:
+        return None
+    return (left_n, top_n, right_n, bottom_n)
+
+
+def normalize_unit_box(box: tuple[float, float, float, float] | None) -> tuple[float, float, float, float] | None:
+    if box is None:
+        return None
+    try:
+        left = clamp01(float(box[0]))
+        top = clamp01(float(box[1]))
+        right = clamp01(float(box[2]))
+        bottom = clamp01(float(box[3]))
+    except Exception:
+        return None
+    if right < left:
+        left, right = right, left
+    if bottom < top:
+        top, bottom = bottom, top
+    if right - left <= 0.0001 or bottom - top <= 0.0001:
+        return None
+    return (left, top, right, bottom)
+
+
+def normalized_box_to_pixel_box(
+    box: tuple[float, float, float, float] | None,
+    width: int,
+    height: int,
+    *,
+    fallback_full: bool = False,
+) -> tuple[int, int, int, int] | None:
+    if width <= 0 or height <= 0:
+        return None
+    normalized = normalize_unit_box(box)
+    if normalized is None:
+        if not fallback_full:
+            return None
+        normalized = (0.0, 0.0, 1.0, 1.0)
+    left = int(round(normalized[0] * width))
+    top = int(round(normalized[1] * height))
+    right = int(round(normalized[2] * width))
+    bottom = int(round(normalized[3] * height))
+    left = max(0, min(width - 1, left))
+    top = max(0, min(height - 1, top))
+    right = max(left + 1, min(width, right))
+    bottom = max(top + 1, min(height, bottom))
+    return (left, top, right, bottom)
+
+
+def transform_source_box_after_crop_padding(
+    source_box: tuple[float, float, float, float] | None,
+    *,
+    crop_box: tuple[float, float, float, float] | None,
+    source_width: int,
+    source_height: int,
+    pt: int,
+    pb: int,
+    pl: int,
+    pr: int,
+) -> tuple[float, float, float, float] | None:
+    source_px = normalized_box_to_pixel_box(source_box, source_width, source_height)
+    if source_px is None:
+        return None
+    crop_px = normalized_box_to_pixel_box(crop_box, source_width, source_height, fallback_full=True)
+    if crop_px is None:
+        return None
+    crop_left, crop_top, crop_right, crop_bottom = crop_px
+    crop_w = crop_right - crop_left
+    crop_h = crop_bottom - crop_top
+    if crop_w <= 0 or crop_h <= 0:
+        return None
+    pad_top = max(0, int(pt))
+    pad_bottom = max(0, int(pb))
+    pad_left = max(0, int(pl))
+    pad_right = max(0, int(pr))
+    padded_w = crop_w + pad_left + pad_right
+    padded_h = crop_h + pad_top + pad_bottom
+    if padded_w <= 0 or padded_h <= 0:
+        return None
+    src_left, src_top, src_right, src_bottom = source_px
+    clipped_left = max(crop_left, min(crop_right, src_left))
+    clipped_top = max(crop_top, min(crop_bottom, src_top))
+    clipped_right = max(crop_left, min(crop_right, src_right))
+    clipped_bottom = max(crop_top, min(crop_bottom, src_bottom))
+    if clipped_right <= clipped_left or clipped_bottom <= clipped_top:
+        return None
+    mapped_left = (pad_left + (clipped_left - crop_left)) / float(padded_w)
+    mapped_top = (pad_top + (clipped_top - crop_top)) / float(padded_h)
+    mapped_right = (pad_left + (clipped_right - crop_left)) / float(padded_w)
+    mapped_bottom = (pad_top + (clipped_bottom - crop_top)) / float(padded_h)
+    left_n = clamp01(mapped_left)
+    top_n = clamp01(mapped_top)
+    right_n = clamp01(mapped_right)
+    bottom_n = clamp01(mapped_bottom)
+    if right_n <= left_n or bottom_n <= top_n:
+        return None
+    return (left_n, top_n, right_n, bottom_n)
+
+
+def resize_fit(image: Image.Image, max_long_edge: int) -> Image.Image:
+    if max_long_edge <= 0:
+        return image
+    width, height = image.size
+    long_edge = max(width, height)
+    if long_edge <= max_long_edge:
+        return image
+    scale = max_long_edge / float(long_edge)
+    new_size = (max(1, int(round(width * scale))), max(1, int(round(height * scale))))
+    return image.resize(new_size, Image.Resampling.LANCZOS)
+
+
+def pad_image(
+    image: Image.Image,
+    top: int,
+    bottom: int,
+    left: int,
+    right: int,
+    fill: str = "#FFFFFF",
+) -> Image.Image:
+    if top <= 0 and bottom <= 0 and left <= 0 and right <= 0:
+        return image
+    top = max(0, top)
+    bottom = max(0, bottom)
+    left = max(0, left)
+    right = max(0, right)
+    rgb = ImageColor.getrgb(fill)
+    if image.mode == "RGBA":
+        fill_color: tuple[int, ...] = (*rgb, 255)
+    elif image.mode == "L":
+        fill_color = (int(0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2]),)
+    else:
+        fill_color = rgb
+    return ImageOps.expand(image, border=(left, top, right, bottom), fill=fill_color)
+
+
+def parse_ratio_value(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        ratio = float(value)
+    except Exception:
+        return None
+    if ratio <= 0:
+        return None
+    return ratio
+
+
+def parse_bool_value(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
+
+
+def parse_padding_value(value: Any, default: int = DEFAULT_CROP_PADDING_PX) -> int:
+    try:
+        parsed = int(value)
+    except Exception:
+        parsed = int(default)
+    return max(-9999, min(9999, parsed))
+
+
+def expand_unit_box_to_unclamped_pixels(
+    box: tuple[float, float, float, float] | None,
+    *,
+    width: int,
+    height: int,
+    top: int,
+    bottom: int,
+    left: int,
+    right: int,
+) -> tuple[float, float, float, float] | None:
+    normalized = normalize_unit_box(box)
+    if normalized is None or width <= 0 or height <= 0:
+        return None
+    left_px = normalized[0] * width - int(left)
+    top_px = normalized[1] * height - int(top)
+    right_px = normalized[2] * width + int(right)
+    bottom_px = normalized[3] * height + int(bottom)
+    if right_px <= left_px:
+        center_x = ((normalized[0] + normalized[2]) * 0.5) * width
+        left_px = center_x - 0.5
+        right_px = center_x + 0.5
+    if bottom_px <= top_px:
+        center_y = ((normalized[1] + normalized[3]) * 0.5) * height
+        top_px = center_y - 0.5
+        bottom_px = center_y + 0.5
+    return (left_px, top_px, right_px, bottom_px)
+
+
+def normalize_center_mode(value: Any) -> str:
+    text = str(value or CENTER_MODE_IMAGE).strip().lower()
+    if text not in CENTER_MODE_OPTIONS:
+        return CENTER_MODE_IMAGE
+    return text
+
+
+def box_center(box: tuple[float, float, float, float]) -> tuple[float, float]:
+    return ((box[0] + box[2]) * 0.5, (box[1] + box[3]) * 0.5)
+
+
+def solve_axis_crop_start(
+    *,
+    full_size: int,
+    crop_size: int,
+    anchor_center: float,
+    keep_start: float | None = None,
+    keep_end: float | None = None,
+) -> int:
+    if full_size <= 0 or crop_size >= full_size:
+        return 0
+    max_start = full_size - crop_size
+    target_center = clamp01(anchor_center) * float(full_size)
+    start = int(round(target_center - (crop_size * 0.5)))
+    start = max(0, min(max_start, start))
+    if keep_start is None or keep_end is None:
+        return start
+    low = min(keep_start, keep_end)
+    high = max(keep_start, keep_end)
+    feasible_min = max(0, int(math.ceil(high - crop_size)))
+    feasible_max = min(max_start, int(math.floor(low)))
+    if feasible_min <= feasible_max:
+        return max(feasible_min, min(feasible_max, start))
+    keep_center = (low + high) * 0.5
+    centered = int(round(keep_center - (crop_size * 0.5)))
+    return max(0, min(max_start, centered))
+
+
+def compute_ratio_crop_box(
+    *,
+    width: int,
+    height: int,
+    ratio: float | None,
+    anchor: tuple[float, float] = (0.5, 0.5),
+    keep_box: tuple[float, float, float, float] | None = None,
+) -> tuple[float, float, float, float]:
+    if width <= 0 or height <= 0 or ratio is None or ratio <= 0:
+        return (0.0, 0.0, 1.0, 1.0)
+    current = width / float(height)
+    if abs(current - ratio) < 0.0001:
+        return (0.0, 0.0, 1.0, 1.0)
+    keep = normalize_unit_box(keep_box)
+    anchor_x = clamp01(anchor[0])
+    anchor_y = clamp01(anchor[1])
+    if current > ratio:
+        crop_w = max(1, min(width, int(round(height * ratio))))
+        left = solve_axis_crop_start(
+            full_size=width,
+            crop_size=crop_w,
+            anchor_center=anchor_x,
+            keep_start=(keep[0] * width) if keep else None,
+            keep_end=(keep[2] * width) if keep else None,
+        )
+        right = left + crop_w
+        return (
+            clamp01(left / float(width)),
+            0.0,
+            clamp01(right / float(width)),
+            1.0,
+        )
+    crop_h = max(1, min(height, int(round(width / ratio))))
+    top = solve_axis_crop_start(
+        full_size=height,
+        crop_size=crop_h,
+        anchor_center=anchor_y,
+        keep_start=(keep[1] * height) if keep else None,
+        keep_end=(keep[3] * height) if keep else None,
+    )
+    bottom = top + crop_h
+    return (
+        0.0,
+        clamp01(top / float(height)),
+        1.0,
+        clamp01(bottom / float(height)),
+    )
+
+
+def crop_box_has_effect(crop_box: tuple[float, float, float, float] | None) -> bool:
+    normalized = normalize_unit_box(crop_box)
+    if normalized is None:
+        return False
+    eps = 0.0005
+    return (
+        normalized[0] > eps
+        or normalized[1] > eps
+        or normalized[2] < (1.0 - eps)
+        or normalized[3] < (1.0 - eps)
+    )
+
+
+def crop_image_by_normalized_box(
+    image: Image.Image,
+    crop_box: tuple[float, float, float, float] | None,
+) -> Image.Image:
+    width, height = image.size
+    crop_px = normalized_box_to_pixel_box(crop_box, width, height)
+    if crop_px is None:
+        return image
+    left, top, right, bottom = crop_px
+    if left <= 0 and top <= 0 and right >= width and bottom >= height:
+        return image
+    return image.crop((left, top, right, bottom))
+
+
+def crop_to_ratio_with_anchor(image: Image.Image, ratio: float, anchor: tuple[float, float]) -> Image.Image:
+    crop_box = compute_ratio_crop_box(
+        width=image.width,
+        height=image.height,
+        ratio=ratio,
+        anchor=anchor,
+        keep_box=None,
+    )
+    return crop_image_by_normalized_box(image, crop_box)
+
+
+def _resolve_bird_class_ids(names: Any) -> set[int]:
+    if names is None:
+        return {_COCO_FALLBACK_BIRD_CLASS_ID}
+    if isinstance(names, dict):
+        ids: set[int] = set()
+        for k, v in names.items():
+            try:
+                key_int = int(k)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(v, str) and _BIRD_CLASS_NAME in v.lower():
+                ids.add(key_int)
+        if ids:
+            return ids
+        return {_COCO_FALLBACK_BIRD_CLASS_ID}
+    if isinstance(names, (list, tuple)):
+        for i, item in enumerate(names):
+            if isinstance(item, str) and _BIRD_CLASS_NAME in item.lower():
+                return {i}
+    return {_COCO_FALLBACK_BIRD_CLASS_ID}
+
+
+def _short_error_text(exc: Exception) -> str:
+    text = str(exc).strip()
+    if not text:
+        return type(exc).__name__
+    if len(text) > 120:
+        return text[:117] + "..."
+    return text
+
+
+def _best_bird_box_from_result(result: Any, bird_class_ids: set[int]) -> tuple[float, float, float, float] | None:
+    boxes = getattr(result, "boxes", None)
+    if boxes is None:
+        return None
+    xyxy = getattr(boxes, "xyxy", None)
+    cls = getattr(boxes, "cls", None)
+    conf = getattr(boxes, "conf", None)
+    if xyxy is None:
+        return None
+    try:
+        xyxy_arr = xyxy.cpu().numpy()
+    except Exception:
+        return None
+    if xyxy_arr.size == 0:
+        return None
+    cls_arr = None
+    if cls is not None:
+        try:
+            cls_arr = cls.cpu().numpy()
+        except Exception:
+            pass
+    conf_arr = None
+    if conf is not None:
+        try:
+            conf_arr = conf.cpu().numpy()
+        except Exception:
+            pass
+    best: tuple[float, float, float, float, float] | None = None
+    for idx in range(xyxy_arr.shape[0]):
+        row = xyxy_arr[idx]
+        if row.size < 4:
+            continue
+        if cls_arr is not None and idx < cls_arr.size:
+            c = int(cls_arr.flat[idx])
+            if c not in bird_class_ids:
+                continue
+        x1, y1, x2, y2 = float(row[0]), float(row[1]), float(row[2]), float(row[3])
+        area = (x2 - x1) * (y2 - y1)
+        score = conf_arr.flat[idx] if conf_arr is not None and idx < conf_arr.size else 1.0
+        combined = area * score
+        if best is None or combined > best[4]:
+            best = (x1, y1, x2, y2, combined)
+    if best is None:
+        return None
+    return (best[0], best[1], best[2], best[3])
+
+
+def _normalize_xyxy_box(
+    box: tuple[float, float, float, float], width: int, height: int
+) -> tuple[float, float, float, float]:
+    x1, y1, x2, y2 = box[0], box[1], box[2], box[3]
+    if width <= 0 or height <= 0:
+        return (clamp01(x1), clamp01(y1), clamp01(x2), clamp01(y2))
+    return (
+        clamp01(x1 / width),
+        clamp01(y1 / height),
+        clamp01(x2 / width),
+        clamp01(y2 / height),
+    )
+
+
+@lru_cache(maxsize=1)
+def _load_torch_module() -> Any | None:
+    global _BIRD_DETECTOR_ERROR_MESSAGE
+    try:
+        import torch as torch_module
+    except Exception as exc:
+        text = _short_error_text(exc)
+        if "numpy" in text.lower():
+            _BIRD_DETECTOR_ERROR_MESSAGE = "Torch/NumPy version incompatible (try numpy<2 or matching versions)"
+        else:
+            _BIRD_DETECTOR_ERROR_MESSAGE = f"Failed to load torch: {text}"
+        return None
+    return torch_module
+
+
+@lru_cache(maxsize=1)
+def _load_yolo_class() -> Any | None:
+    global _BIRD_DETECTOR_ERROR_MESSAGE
+    try:
+        from ultralytics import YOLO as yolo_class
+    except Exception as exc:
+        text = _short_error_text(exc)
+        if "numpy" in text.lower():
+            _BIRD_DETECTOR_ERROR_MESSAGE = "Torch/NumPy version incompatible (try numpy<2 or matching versions)"
+        else:
+            _BIRD_DETECTOR_ERROR_MESSAGE = f"ultralytics not installed or failed: {text}"
+        return None
+    return yolo_class
+
+
+def _preferred_bird_detect_device() -> str | int:
+    torch_module = _load_torch_module()
+    if torch_module is None:
+        return "cpu"
+    try:
+        if torch_module.cuda.is_available():
+            return 0
+    except Exception:
+        pass
+    try:
+        backends = getattr(torch_module, "backends", None)
+        mps = getattr(backends, "mps", None)
+        if mps is not None and mps.is_available():
+            return "mps"
+    except Exception:
+        pass
+    return "cpu"
+
+
+@lru_cache(maxsize=1)
+def _load_bird_detector() -> tuple[Any, set[int]] | None:
+    global _BIRD_DETECTOR_ERROR_MESSAGE
+    _BIRD_DETECTOR_ERROR_MESSAGE = ""
+    yolo_class = _load_yolo_class()
+    if yolo_class is None:
+        if not _BIRD_DETECTOR_ERROR_MESSAGE:
+            _BIRD_DETECTOR_ERROR_MESSAGE = "ultralytics not installed (pip install ultralytics)"
+        return None
+    last_error = ""
+    for model_name in _BIRD_MODEL_CANDIDATES:
+        try:
+            model = yolo_class(f"models/{model_name}")
+        except Exception as exc:
+            last_error = f"{model_name}: {_short_error_text(exc)}"
+            continue
+        bird_class_ids = _resolve_bird_class_ids(getattr(model, "names", None))
+        if not bird_class_ids:
+            last_error = f"{model_name}: no bird class"
+            continue
+        return (model, bird_class_ids)
+    _BIRD_DETECTOR_ERROR_MESSAGE = last_error or "Bird detection model failed to load"
+    return None
+
+
+def get_bird_detector_error_message() -> str:
+    return _BIRD_DETECTOR_ERROR_MESSAGE
+
+
+def preload_bird_detector() -> None:
+    """Preload bird detector (for GUI)."""
+    _load_bird_detector()
+
+
+def detect_primary_bird_box(image: Image.Image) -> tuple[float, float, float, float] | None:
+    global _BIRD_DETECTOR_ERROR_MESSAGE
+    detector = _load_bird_detector()
+    if detector is None:
+        return None
+    _BIRD_DETECTOR_ERROR_MESSAGE = ""
+    model, bird_class_ids = detector
+    source = image if image.mode == "RGB" else image.convert("RGB")
+    detect_device = _preferred_bird_detect_device()
+    predict_kwargs = {
+        "source": source,
+        "conf": _BIRD_DETECT_CONFIDENCE,
+        "verbose": False,
+    }
+    try:
+        results = model.predict(device=detect_device, **predict_kwargs)
+    except Exception as primary_exc:
+        primary_text = _short_error_text(primary_exc)
+        if detect_device == "cpu":
+            if "Numpy is not available" in primary_text:
+                _BIRD_DETECTOR_ERROR_MESSAGE = "Torch/NumPy version incompatible (try numpy<2 or matching versions)"
+            else:
+                _BIRD_DETECTOR_ERROR_MESSAGE = f"Bird detection inference failed: {primary_text}"
+            return None
+        try:
+            results = model.predict(device="cpu", **predict_kwargs)
+        except Exception as fallback_exc:
+            fallback_text = _short_error_text(fallback_exc)
+            if "Numpy is not available" in fallback_text:
+                _BIRD_DETECTOR_ERROR_MESSAGE = "Torch/NumPy version incompatible (try numpy<2 or matching versions)"
+            else:
+                _BIRD_DETECTOR_ERROR_MESSAGE = f"Bird detection failed: {primary_text}; CPU fallback: {fallback_text}"
+            return None
+    if not results:
+        return None
+    best_box = _best_bird_box_from_result(results[0], bird_class_ids)
+    if best_box is None:
+        return None
+    return _normalize_xyxy_box(best_box, source.width, source.height)
+
+
+def apply_editor_crop(
+    image: Image.Image,
+    *,
+    source_path: Path,
+    raw_metadata: dict[str, Any],
+    ratio: float | None,
+    center_mode: str,
+    crop_padding_px: int = DEFAULT_CROP_PADDING_PX,
+    max_long_edge: int = 0,
+    fill_color: str = "#FFFFFF",
+    use_bird_auto: bool = True,
+) -> Image.Image:
+    """Apply editor-style crop (focus/bird/image center) for CLI or batch use."""
+    w, h = image.width, image.height
+    if w <= 0 or h <= 0:
+        return image
+    center_mode = normalize_center_mode(center_mode)
+    anchor: tuple[float, float] = (0.5, 0.5)
+    keep_box: tuple[float, float, float, float] | None = None
+
+    if center_mode == CENTER_MODE_FOCUS:
+        focus_box = extract_focus_box(raw_metadata, w, h)
+        if focus_box is not None:
+            if ratio is not None and ratio > 0:
+                focus_box = transform_focus_box_after_crop(
+                    focus_box,
+                    source_width=w,
+                    source_height=h,
+                    ratio=ratio,
+                    anchor=box_center(focus_box),
+                )
+            if focus_box is not None:
+                keep_box = focus_box
+                anchor = box_center(focus_box)
+    elif center_mode == CENTER_MODE_BIRD and use_bird_auto:
+        bird_box = detect_primary_bird_box(image)
+        if bird_box is not None:
+            keep_box = bird_box
+            anchor = box_center(bird_box)
+
+    crop_box = compute_ratio_crop_box(
+        width=w,
+        height=h,
+        ratio=ratio,
+        anchor=anchor,
+        keep_box=keep_box,
+    )
+    if not crop_box_has_effect(crop_box):
+        out = image
+    else:
+        out = crop_image_by_normalized_box(image, crop_box)
+    if crop_padding_px > 0 and crop_box_has_effect(crop_box):
+        out = pad_image(
+            out,
+            crop_padding_px,
+            crop_padding_px,
+            crop_padding_px,
+            crop_padding_px,
+            fill=fill_color,
+        )
+    if max_long_edge > 0:
+        out = resize_fit(out, max_long_edge)
+    return out
