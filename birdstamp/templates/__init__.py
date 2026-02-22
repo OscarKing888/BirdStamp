@@ -1,2 +1,0 @@
-# Built-in template package.
-

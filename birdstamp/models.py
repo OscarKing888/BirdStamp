@@ -43,26 +43,3 @@ class NormalizedMetadata:
             "focal35_mm": self.focal35_mm,
             "settings_text": self.settings_text,
         }
-
-
-@dataclass(slots=True)
-class RenderTemplate:
-    name: str
-    banner_height: int
-    left_ratio: float
-    padding_x: int
-    padding_y: int
-    colors: dict[str, str]
-    fonts: dict[str, int]
-    divider: bool = True
-    logo: str | None = None
-
-
-@dataclass(slots=True)
-class RenderOptions:
-    show_fields: set[str]
-    lang: str = "zh"
-    font_path: Path | None = None
-    show_eq_focal: bool = True
-    fallback_text: str = "N/A"
-

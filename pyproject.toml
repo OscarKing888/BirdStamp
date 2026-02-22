@@ -30,9 +30,7 @@ packages = [
   "birdstamp.gui",
   "birdstamp.meta",
   "birdstamp.render",
-  "birdstamp.templates",
 ]
 
 [tool.setuptools.package-data]
-birdstamp = ["templates/*.yaml"]
 "birdstamp.gui" = ["resources/*.json", "resources/*.png", "resources/*.ico", "resources/*.icns"]
