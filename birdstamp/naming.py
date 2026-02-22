@@ -30,6 +30,7 @@ def build_output_name(
     source: Path,
     meta: NormalizedMetadata,
     extension: str,
+    template_name: str = "banner",
 ) -> str:
     ext = extension.lower().lstrip(".")
     capture = meta.capture_dt.strftime("%Y%m%d_%H%M") if meta.capture_dt else "unknown_date"
@@ -40,6 +41,7 @@ def build_output_name(
         "lens": sanitize_token(meta.lens),
         "bird": sanitize_token(meta.bird),
         "location": sanitize_token(meta.location),
+        "template": sanitize_token(template_name, fallback="banner"),
         "ext": ext,
     }
     try:

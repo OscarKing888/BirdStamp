@@ -17,7 +17,7 @@ from birdstamp.meta.normalize import normalize_metadata
 from birdstamp.meta.pillow_fallback import extract_pillow_metadata
 from birdstamp.naming import build_output_name
 
-app = typer.Typer(add_completion=False, no_args_is_help=True, help="BirdStamp / 鸟印 photo banner CLI.")
+app = typer.Typer(add_completion=False, no_args_is_help=True, help="极速鸟框 photo banner CLI.")
 LOGGER = logging.getLogger("birdstamp")
 
 
@@ -152,6 +152,9 @@ def render(
         template_payload = default_template_payload(name=template or "default")
         LOGGER.info("Template: built-in default")
 
+    # Resolved template name used in output filename {template} placeholder
+    tpl_name: str = str(template_payload.get("name") or template or "banner")
+
     # Discover files
     files = discover_inputs(input_path, recursive=recursive)
     if not files:
@@ -183,13 +186,36 @@ def render(
                 bird_priority=["meta", "filename"],
                 bird_regex=r"(?P<bird>[^_]+)_",
             )
-            output_name = build_output_name(name_tmpl, source, norm_meta, extension=out_ext)
+            output_name = build_output_name(name_tmpl, source, norm_meta, extension=out_ext, template_name=tpl_name)
             output_file = out_dir / output_name
             if skip_existing and output_file.exists():
                 return _Result(source=source, status="skipped", output=output_file, elapsed=time.perf_counter() - t0)
             image = decode_image(source)
-            if max_edge_val > 0:
-                image = resize_fit(image, max_edge_val)
+
+            # Apply ratio crop from template (e.g. 9:16 portrait)
+            tpl_ratio = _parse_ratio(template_payload.get("ratio"))
+            tpl_center = str(template_payload.get("center_mode") or "image")
+            tpl_auto_bird = _parse_bool(template_payload.get("auto_crop_by_bird"), False)
+            tpl_fill = str(template_payload.get("crop_padding_fill") or "#FFFFFF")
+            # Effective max_long_edge: CLI arg overrides template; 0 = unlimited
+            tpl_max_edge = max(0, int(template_payload.get("max_long_edge") or 0))
+            effective_max_edge = max_edge_val if max_edge_val > 0 else tpl_max_edge
+
+            if tpl_ratio is not None:
+                image = apply_editor_crop(
+                    image,
+                    source_path=source,
+                    raw_metadata=raw_meta,
+                    ratio=tpl_ratio,
+                    center_mode=tpl_center,
+                    crop_padding_px=0,   # 模板的 crop_padding_* 是鸟检测内缩偏移，不是外边距
+                    max_long_edge=effective_max_edge,
+                    fill_color=tpl_fill,
+                    use_bird_auto=tpl_auto_bird,
+                )
+            elif effective_max_edge > 0:
+                image = resize_fit(image, effective_max_edge)
+
             metadata_ctx = build_metadata_context(source, raw_meta)
             rendered = render_template_overlay(
                 image,

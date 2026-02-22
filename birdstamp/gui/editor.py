@@ -65,7 +65,7 @@ from PyQt6.QtWidgets import (
     QColorDialog,
 )
 
-from app_common.about_dialog import load_about_info, show_about_dialog
+from app_common.about_dialog import load_about_info, load_about_images, show_about_dialog
 from app_common.app_info_bar import AppInfoBar
 
 import birdstamp
@@ -244,6 +244,8 @@ class BirdStampEditorWindow(QMainWindow, _BirdStampCropMixin, _BirdStampRenderer
         self.current_metadata_context: dict[str, str] = {}
         self.raw_metadata_cache: dict[str, dict[str, Any]] = {}
         self._pending_preview_fit_reset: bool = False
+        # 占位图路径标记：非 None 时表示当前预览的是默认占位图而非用户照片
+        self.placeholder_path: Path | None = None
 
         self.placeholder = _build_placeholder_image(1400, 900)
 
@@ -642,12 +644,21 @@ class BirdStampEditorWindow(QMainWindow, _BirdStampCropMixin, _BirdStampRenderer
 
     def _show_about_dialog(self) -> None:
         override_path = get_config_path().parent / "about.cfg"
+        override_str = str(override_path) if override_path.exists() else None
+        # base_dir: 优先用工程根目录，使 about.cfg 中的相对图片路径（如 images/download.png）可正确解析
+        import sys
+        from pathlib import Path as _Path
+        if getattr(sys, "frozen", False):
+            base_dir = str(_Path(sys.executable).resolve().parent)
+        else:
+            base_dir = str(_Path(__file__).resolve().parent.parent.parent)
         about_info = load_about_info(
-            override_path=str(override_path) if override_path.exists() else None,
-            app_name="BirdStamp",
+            override_path=override_str,
+            app_name="极速鸟框",
             version=birdstamp.__version__,
         )
-        show_about_dialog(self, about_info, logo_path=None, banner_path=None)
+        about_images = load_about_images(override_path=override_str, base_dir=base_dir)
+        show_about_dialog(self, about_info, logo_path=None, banner_path=None, images=about_images)
 
     def resizeEvent(self, event) -> None:  # type: ignore[override]
         super().resizeEvent(event)
@@ -680,8 +691,12 @@ class BirdStampEditorWindow(QMainWindow, _BirdStampCropMixin, _BirdStampRenderer
         self._pending_preview_fit_reset = True
         self._on_output_settings_changed(*_args)
 
+    def _is_placeholder_active(self) -> bool:
+        """当前预览是否为占位默认图（不是用户加载的真实照片）。"""
+        return self.placeholder_path is not None and self.current_path == self.placeholder_path
+
     def _on_output_settings_changed(self, *_args: Any) -> None:
-        if self.current_path is not None:
+        if self.current_path is not None and not self._is_placeholder_active():
             key = _path_key(self.current_path)
             snapshot = self._clone_render_settings(self._build_current_render_settings())
             self.photo_render_overrides[key] = snapshot
@@ -1115,6 +1130,7 @@ class BirdStampEditorWindow(QMainWindow, _BirdStampCropMixin, _BirdStampRenderer
             self._bird_box_cache.clear()
 
         if self.photo_list.topLevelItemCount() == 0:
+            self.placeholder_path = None
             self.current_path = None
             self.current_source_image = None
             self.current_raw_metadata = {}
@@ -1130,6 +1146,7 @@ class BirdStampEditorWindow(QMainWindow, _BirdStampCropMixin, _BirdStampRenderer
         self.raw_metadata_cache.clear()
         self.photo_render_overrides.clear()
         self._bird_box_cache.clear()
+        self.placeholder_path = None
         self.current_path = None
         self.current_source_image = None
         self.current_raw_metadata = {}
@@ -1156,6 +1173,7 @@ class BirdStampEditorWindow(QMainWindow, _BirdStampCropMixin, _BirdStampRenderer
             self._show_error("读取失败", str(exc))
             return
 
+        self.placeholder_path = None
         self.current_path = path
         self.current_source_image = image
         self._invalidate_original_mode_cache()
@@ -1207,7 +1225,7 @@ class BirdStampEditorWindow(QMainWindow, _BirdStampCropMixin, _BirdStampRenderer
                 raw = item.data(0, Qt.ItemDataRole.UserRole)
                 if isinstance(raw, str):
                     paths.append(Path(raw))
-        elif self.current_path is not None:
+        elif self.current_path is not None and not self._is_placeholder_active():
             paths.append(self.current_path)
 
         ordered: list[Path] = []

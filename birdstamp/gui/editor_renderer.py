@@ -13,12 +13,14 @@ from typing import Any
 from PIL import Image
 from PyQt6.QtGui import QPixmap
 
+from birdstamp.decoders.image_decoder import decode_image
 from birdstamp.gui import editor_core, editor_options, editor_template, editor_utils
 
 _pil_to_qpixmap                     = editor_utils.pil_to_qpixmap
 _path_key                           = editor_utils.path_key
 _safe_color                         = editor_utils.safe_color
 _build_metadata_context             = editor_utils.build_metadata_context
+_default_placeholder_path           = editor_utils._default_placeholder_path
 _extract_focus_box                  = editor_core.extract_focus_box
 _transform_source_box_after_crop_padding = editor_core.transform_source_box_after_crop_padding
 _normalize_center_mode              = editor_core.normalize_center_mode
@@ -187,6 +189,31 @@ class _BirdStampRendererMixin:
         return self._bird_box_for_path(self.current_path, source_image=self.current_source_image)
 
     def _show_placeholder_preview(self) -> None:
+        """激活 images/default.jpg 作为当前图像，走与真实照片完全相同的渲染流程。
+        不将其加入照片列表，self.placeholder_path 标记当前处于占位状态。
+        若 default.jpg 不存在则回退到裸 PIL 占位图。
+        """
+        src = _default_placeholder_path()
+        if src.exists():
+            try:
+                image = decode_image(src, decoder="auto")
+                self.placeholder_path: "Path | None" = src
+                self.current_path = src
+                self.current_source_image = image
+                self._invalidate_original_mode_cache()
+                self.current_raw_metadata = self._load_raw_metadata(src)
+                self.current_metadata_context = _build_metadata_context(src, self.current_raw_metadata)
+                # 走正常渲染流程（current_path 已设置，不会再次调用本函数）
+                self.render_preview()
+                return
+            except Exception:
+                pass
+        # 回退：default.jpg 不可用，显示裸 PIL 占位图
+        self.placeholder_path = None
+        self.current_path = None
+        self.current_source_image = None
+        self.current_raw_metadata = {}
+        self.current_metadata_context = {}
         self.preview_pixmap = _pil_to_qpixmap(self.placeholder)
         self.preview_focus_box = None
         self.preview_focus_box_original = None
@@ -604,7 +631,7 @@ class _BirdStampRendererMixin:
 
     def render_preview(self, *_args: Any) -> None:
         if not self.current_path:
-            self._show_placeholder_preview()
+            # default.jpg 不可用时的降级路径；正常情况由 _show_placeholder_preview 负责激活占位图
             self._set_status("请选择照片后再预览。")
             return
 

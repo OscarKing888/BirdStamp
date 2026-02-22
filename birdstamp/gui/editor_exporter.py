@@ -20,7 +20,7 @@ class _BirdStampExporterMixin:
     """Mixin: export_current, export_all, _save_image."""
 
     def export_current(self) -> None:
-        if not self.current_path:
+        if not self.current_path or self._is_placeholder_active():
             self._set_status("没有可导出的照片。")
             return
 
