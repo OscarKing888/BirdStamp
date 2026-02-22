@@ -55,6 +55,14 @@ This document defines project-level rules for any coding assistant (Codex, Claud
 - Make minimal, task-scoped diffs.
 - Do not touch unrelated files.
 - If unexpected unrelated modifications are detected, pause and confirm direction.
+- When implementing new features, always evaluate modularization / encapsulation first:
+  - prefer reusable module-level functions or class-based (OOP) encapsulation for coherent responsibilities
+  - avoid embedding core logic directly in GUI/event handlers or one-off scripts when it can be extracted
+  - design APIs so they are testable and reusable from GUI, CLI, and batch workflows
+- For core features (rendering, metadata processing, detection, export, etc.), provide or preserve CLI support whenever practical:
+  - core logic should live in non-UI modules first, with GUI calling into the same API
+  - if a feature is GUI-triggered, consider whether a CLI flag/subcommand should expose the same capability
+  - document notable reasons when CLI support is intentionally deferred (e.g., high UI coupling, unclear UX contract)
 
 ## 7) Required Validation for Code Changes
 
@@ -86,4 +94,3 @@ If rules conflict, apply this order:
 2. Runtime stability (no crash/leak)
 3. Cross-platform compatibility
 4. Performance optimization
-
