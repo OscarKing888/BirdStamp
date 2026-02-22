@@ -1,4 +1,4 @@
-# BirdStamp / 鸟印
+# 极速鸟框
 
 `birdstamp` is a cross-platform Python tool for batch rendering bird-photo outputs with a metadata banner.
 

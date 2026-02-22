@@ -68,6 +68,7 @@ from PyQt6.QtWidgets import (
 from app_common.about_dialog import load_about_info, show_about_dialog
 from app_common.app_info_bar import AppInfoBar
 
+import birdstamp
 from birdstamp.config import get_config_path
 from birdstamp.constants import SUPPORTED_EXTENSIONS
 from birdstamp.decoders.image_decoder import decode_image
@@ -214,7 +215,7 @@ _pil_to_qpixmap = editor_utils.pil_to_qpixmap
 class BirdStampEditorWindow(QMainWindow, _BirdStampCropMixin, _BirdStampRendererMixin, _BirdStampExporterMixin):
     def __init__(self, startup_file: Path | None = None) -> None:
         super().__init__()
-        self.setWindowTitle("BirdStamp")
+        self.setWindowTitle("极速鸟框")
         self.resize(1420, 920)
         self.setMinimumSize(1120, 720)
 
@@ -282,8 +283,8 @@ class BirdStampEditorWindow(QMainWindow, _BirdStampCropMixin, _BirdStampRenderer
             self.setWindowIcon(_app_icon)
         self._info_bar = AppInfoBar(
             self,
-            title="BirdStamp",
-            subtitle="照片水印与裁切",
+            title="极速鸟框",
+            subtitle="自动裁切鸟类照片",
             icon_path=str(_info_bar_icon_path) if _info_bar_icon_path.exists() else None,
             on_about_clicked=self._show_about_dialog,
         )
@@ -641,9 +642,11 @@ class BirdStampEditorWindow(QMainWindow, _BirdStampCropMixin, _BirdStampRenderer
 
     def _show_about_dialog(self) -> None:
         override_path = get_config_path().parent / "about.cfg"
-        about_info = load_about_info(override_path=str(override_path) if override_path.exists() else None)
-        if not about_info.get("app_name"):
-            about_info = dict(about_info, app_name="BirdStamp", version="1.0.0")
+        about_info = load_about_info(
+            override_path=str(override_path) if override_path.exists() else None,
+            app_name="BirdStamp",
+            version=birdstamp.__version__,
+        )
         show_about_dialog(self, about_info, logo_path=None, banner_path=None)
 
     def resizeEvent(self, event) -> None:  # type: ignore[override]

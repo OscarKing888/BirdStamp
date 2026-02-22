@@ -112,6 +112,32 @@ def _pil_to_qpixmap(image: Image.Image) -> QPixmap:
 
 
 # ---------------------------------------------------------------------------
+# _CheckerPreviewLabel
+# ---------------------------------------------------------------------------
+
+class _CheckerPreviewLabel(QLabel):
+    """QLabel with a Photoshop-style checkerboard background.
+
+    Draws the checker pattern behind any pixmap (or placeholder text) so
+    transparent/semi-transparent areas are clearly visible.
+    """
+
+    def paintEvent(self, event: Any) -> None:  # type: ignore[override]
+        painter = QPainter(self)
+        r = self.rect()
+        editor_utils.draw_checker_background(painter, r)
+        pm = self.pixmap()
+        if pm and not pm.isNull():
+            x = (r.width() - pm.width()) // 2
+            y = (r.height() - pm.height()) // 2
+            painter.drawPixmap(x, y, pm)
+        elif self.text():
+            painter.setPen(QColor(150, 150, 150))
+            painter.drawText(r, int(Qt.AlignmentFlag.AlignCenter), self.text())
+        painter.end()
+
+
+# ---------------------------------------------------------------------------
 # _GradientBarWidget
 # ---------------------------------------------------------------------------
 
@@ -686,7 +712,7 @@ class TemplateManagerDialog(QDialog):
 
         preview_group = QGroupBox("预览")
         preview_layout = QVBoxLayout(preview_group)
-        self.preview_label = QLabel("暂无预览")
+        self.preview_label = _CheckerPreviewLabel("暂无预览")
         self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         preview_layout.addWidget(self.preview_label, stretch=1)
         layout.addWidget(preview_group, stretch=1)

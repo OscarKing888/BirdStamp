@@ -5,6 +5,7 @@ Mixed into BirdStampEditorWindow via multiple inheritance.
 """
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +26,8 @@ _box_center                         = editor_core.box_center
 _expand_unit_box_to_unclamped_pixels = editor_core.expand_unit_box_to_unclamped_pixels
 _transform_source_box_after_crop_padding = editor_core.transform_source_box_after_crop_padding
 _detect_primary_bird_box            = editor_core.detect_primary_bird_box
+_get_bird_detector_error_message    = editor_core.get_bird_detector_error_message
+_extract_focus_point                = editor_core.get_focus_point
 _CENTER_MODE_BIRD                   = editor_core.CENTER_MODE_BIRD
 _CENTER_MODE_FOCUS                  = editor_core.CENTER_MODE_FOCUS
 _CENTER_MODE_IMAGE                  = editor_core.CENTER_MODE_IMAGE

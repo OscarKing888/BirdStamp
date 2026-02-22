@@ -5,7 +5,10 @@ from PyQt6.QtCore import QPointF, QRectF, Qt
 from PyQt6.QtGui import QColor, QPainter, QPainterPath, QPen, QPixmap
 from PyQt6.QtWidgets import QLabel, QWidget
 
-from birdstamp.gui.editor_utils import DEFAULT_CROP_EFFECT_ALPHA as _DEFAULT_CROP_EFFECT_ALPHA
+from birdstamp.gui.editor_utils import (
+    DEFAULT_CROP_EFFECT_ALPHA as _DEFAULT_CROP_EFFECT_ALPHA,
+    draw_checker_background as _draw_checker_background,
+)
 
 class PreviewCanvas(QLabel):
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -340,18 +343,22 @@ class PreviewCanvas(QLabel):
         super().mouseReleaseEvent(event)
 
     def paintEvent(self, event) -> None:  # type: ignore[override]
-        super().paintEvent(event)
         if self._source_pixmap is None:
+            super().paintEvent(event)
             return
 
         draw_rect = self._display_rect()
         if draw_rect is None:
+            super().paintEvent(event)
             return
 
         content = self.contentsRect()
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
         painter.setClipRect(content)
+
+        _draw_checker_background(painter, content)
+
         painter.drawPixmap(
             draw_rect,
             self._source_pixmap,

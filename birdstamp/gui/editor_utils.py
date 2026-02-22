@@ -6,7 +6,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable
 
-from PIL import Image, ImageColor, ImageDraw
+from PIL import Image, ImageColor, ImageDraw, ImageOps
 from PyQt6.QtCore import QPoint, QRect, QRectF, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QCursor, QFontDatabase, QGuiApplication, QImage, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import QApplication, QLabel, QWidget
@@ -34,6 +34,36 @@ def safe_color(value: str, fallback: str) -> str:
     except ValueError:
         return fallback
     return text
+
+
+def draw_checker_background(
+    painter: QPainter,
+    rect: "QRect | QRectF",
+    cell: int = 8,
+) -> None:
+    """Draw a Photoshop-style checkerboard pattern over *rect* using *painter*.
+
+    Light and dark cells alternate so transparent areas are clearly visible.
+    """
+    x0 = int(rect.x())
+    y0 = int(rect.y())
+    x1 = x0 + int(rect.width())
+    y1 = y0 + int(rect.height())
+    light = QColor(203, 203, 203)
+    dark = QColor(153, 153, 153)
+    ri = 0
+    row = y0
+    while row < y1:
+        row_h = min(cell, y1 - row)
+        ci = 0
+        col = x0
+        while col < x1:
+            col_w = min(cell, x1 - col)
+            painter.fillRect(col, row, col_w, row_h, light if (ri + ci) % 2 == 0 else dark)
+            col += cell
+            ci += 1
+        row += cell
+        ri += 1
 
 
 def build_color_preview_swatch() -> QLabel:
@@ -233,9 +263,31 @@ def pil_to_qpixmap(image: Image.Image) -> QPixmap:
     return QPixmap.fromImage(q_image.copy())
 
 
+def _default_placeholder_path() -> Path:
+    """Locate images/default.jpg: next to executable (frozen) or at project root (dev)."""
+    import sys
+    if getattr(sys, "frozen", False):
+        base = Path(sys.executable).resolve().parent
+    else:
+        # birdstamp/gui/editor_utils.py → birdstamp/gui/ → birdstamp/ → project root
+        base = Path(__file__).resolve().parent.parent.parent
+    return base / "images" / "default.jpg"
+
+
 def build_placeholder_image(width: int = 1600, height: int = 1000) -> Image.Image:
     width = max(320, width)
     height = max(220, height)
+    src = _default_placeholder_path()
+    if src.exists():
+        try:
+            return ImageOps.fit(
+                Image.open(src).convert("RGB"),
+                (width, height),
+                method=Image.Resampling.LANCZOS,
+            )
+        except Exception:
+            pass
+    # Fallback: simple dark gradient when image is unavailable
     image = Image.new("RGB", (width, height), color="#2C3340")
     draw = ImageDraw.Draw(image)
     for y in range(height):
@@ -244,33 +296,6 @@ def build_placeholder_image(width: int = 1600, height: int = 1000) -> Image.Imag
         g = int(49 + (70 - 49) * ratio)
         b = int(62 + (86 - 62) * ratio)
         draw.line([(0, y), (width, y)], fill=(r, g, b), width=1)
-    block_h = max(36, height // 12)
-    for row in range(0, height, block_h):
-        if (row // block_h) % 2 == 0:
-            draw.rectangle((0, row, width, min(height, row + block_h // 2)), fill=(57, 68, 83))
-    margin_x = width // 8
-    margin_y = height // 6
-    draw.rectangle(
-        (margin_x, margin_y, width - margin_x, height - margin_y),
-        outline="#9FB5CC",
-        width=max(2, width // 400),
-    )
-    text = "模板预览占位图\n(后续可替换为你提供的图片)"
-    font = load_font(None, max(20, width // 42))
-    lines = text.splitlines()
-    total_height = 0
-    line_sizes: list[tuple[int, int]] = []
-    for line in lines:
-        box = draw.textbbox((0, 0), line, font=font)
-        line_w, line_h = box[2] - box[0], box[3] - box[1]
-        line_sizes.append((line_w, line_h))
-        total_height += line_h + 8
-    y = (height - total_height) // 2
-    for idx, line in enumerate(lines):
-        line_w, line_h = line_sizes[idx]
-        x = (width - line_w) // 2
-        draw.text((x, y), line, fill="#E9EEF6", font=font)
-        y += line_h + 8
     return image
 
 
