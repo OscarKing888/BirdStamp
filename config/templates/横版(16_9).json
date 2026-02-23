@@ -1,5 +1,5 @@
 {
-  "name": "横版(9_16)",
+  "name": "横版(16_9)",
   "ratio": 1.7777777778,
   "banner_color": "#ffffff",
   "draw_banner_background": true,
@@ -13,7 +13,7 @@
   "auto_crop_by_bird": true,
   "max_long_edge": 0,
   "crop_padding_top": 128,
-  "crop_padding_bottom": 256,
+  "crop_padding_bottom": 128,
   "crop_padding_left": 0,
   "crop_padding_right": 0,
   "crop_padding_fill": "#000000",
