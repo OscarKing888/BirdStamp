@@ -24,7 +24,7 @@
       "fallback": "{bird}",
       "align_horizontal": "left",
       "align_vertical": "bottom",
-      "x_offset_pct": -2.0,
+      "x_offset_pct": 1.0,
       "y_offset_pct": -4.0,
       "color": "#FF9C45",
       "font_size": 52,
