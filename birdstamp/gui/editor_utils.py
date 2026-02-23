@@ -36,36 +36,6 @@ def safe_color(value: str, fallback: str) -> str:
     return text
 
 
-def draw_checker_background(
-    painter: QPainter,
-    rect: "QRect | QRectF",
-    cell: int = 8,
-) -> None:
-    """Draw a Photoshop-style checkerboard pattern over *rect* using *painter*.
-
-    Light and dark cells alternate so transparent areas are clearly visible.
-    """
-    x0 = int(rect.x())
-    y0 = int(rect.y())
-    x1 = x0 + int(rect.width())
-    y1 = y0 + int(rect.height())
-    light = QColor(203, 203, 203)
-    dark = QColor(153, 153, 153)
-    ri = 0
-    row = y0
-    while row < y1:
-        row_h = min(cell, y1 - row)
-        ci = 0
-        col = x0
-        while col < x1:
-            col_w = min(cell, x1 - col)
-            painter.fillRect(col, row, col_w, row_h, light if (ri + ci) % 2 == 0 else dark)
-            col += cell
-            ci += 1
-        row += cell
-        ri += 1
-
-
 def build_color_preview_swatch() -> QLabel:
     swatch = QLabel()
     swatch.setFixedSize(24, 20)

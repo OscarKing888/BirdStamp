@@ -88,7 +88,8 @@ from birdstamp.gui.editor_template_dialog import (
     _GradientEditorWidget,  # noqa: F401
     TemplateManagerDialog,
 )
-from birdstamp.gui.editor_preview_canvas import PreviewCanvas
+from app_common.preview_canvas import PreviewWithStatusBar
+from birdstamp.gui.editor_preview_canvas import EditorPreviewCanvas
 from birdstamp.gui.editor_photo_list import PhotoListWidget
 from birdstamp.gui.editor_crop_calculator import _BirdStampCropMixin
 from birdstamp.gui.editor_renderer import _BirdStampRendererMixin
@@ -542,13 +543,9 @@ class BirdStampEditorWindow(QMainWindow, _BirdStampCropMixin, _BirdStampRenderer
         preview_toolbar.addStretch(1)
         right_layout.addLayout(preview_toolbar)
 
-        self.preview_label = PreviewCanvas()
+        self.preview_label = PreviewWithStatusBar(canvas=EditorPreviewCanvas())
         self.preview_label.setObjectName("PreviewLabel")
         right_layout.addWidget(self.preview_label, stretch=1)
-
-        self.preview_info_label = QLabel("原始分辨率: - | 当前预览分辨率: -")
-        self.preview_info_label.setObjectName("PreviewInfoLabel")
-        right_layout.addWidget(self.preview_info_label)
 
         return right_panel
 
@@ -855,7 +852,17 @@ class BirdStampEditorWindow(QMainWindow, _BirdStampCropMixin, _BirdStampRenderer
             self.render_preview()
 
     def _open_template_manager(self) -> None:
+        from app_common.log import get_logger
+        from app_common.stat import stat_begin, stat_end, stat_report, stat_reset
+
+        log = get_logger("template_manager")
+        log.info("opening template manager dialog")
+        stat_reset()
+        stat_begin("template_manager_open")
         dialog = TemplateManagerDialog(template_dir=self.template_dir, placeholder=self.placeholder, parent=self)
+        stat_end("template_manager_open")
+        for line in stat_report(return_lines=True) or []:
+            log.info(line)
         dialog.showMaximized()
         dialog.exec()
         preferred = dialog.current_template_name

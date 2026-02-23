@@ -222,22 +222,6 @@ class _BirdStampRendererMixin:
         self._invalidate_original_mode_cache()
         self._refresh_preview_label(reset_view=True)
 
-    def _update_preview_info_label(self, display_pixmap: QPixmap | None, source_mode: str) -> None:
-        if self.current_source_image is None:
-            original_text = "-"
-            current_text = "-"
-        else:
-            orig_w, orig_h = self.current_source_image.size
-            original_text = f"{orig_w}x{orig_h}"
-            if display_pixmap is not None and not display_pixmap.isNull():
-                current_text = f"{display_pixmap.width()}x{display_pixmap.height()}"
-            else:
-                current_text = "-"
-
-        self.preview_info_label.setText(
-            f"原始分辨率: {original_text} | 当前预览分辨率: {current_text} ({source_mode})"
-        )
-
     def _refresh_preview_label(
         self,
         *,
@@ -274,13 +258,17 @@ class _BirdStampRendererMixin:
         self.preview_label.set_crop_effect_box(crop_effect_box)
         self.preview_label.set_focus_box(focus_box)
         self.preview_label.set_bird_box(bird_box)
+        if self.current_source_image is not None:
+            self.preview_label.set_original_size(self.current_source_image.size[0], self.current_source_image.size[1])
+        else:
+            self.preview_label.set_original_size(None, None)
+        self.preview_label.set_source_mode(source_mode)
         self.preview_label.set_source_pixmap(
             display_pixmap,
             reset_view=reset_view,
             preserve_view=preserve_view,
             preserve_scale=preserve_view,
         )
-        self._update_preview_info_label(display_pixmap, source_mode)
 
     def _selected_center_mode(self) -> str:
         return _normalize_center_mode(self.center_mode_combo.currentData())

@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from PIL import Image
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QImage, QLinearGradient, QPainter, QPixmap
 from PyQt6.QtWidgets import (
     QCheckBox,
@@ -42,6 +42,7 @@ from PyQt6.QtWidgets import (
     QColorDialog,
 )
 
+from app_common.preview_canvas import PreviewCanvas, PreviewWithStatusBar
 from birdstamp.gui import editor_core, editor_options, editor_template, editor_utils
 
 # ---------------------------------------------------------------------------
@@ -113,32 +114,6 @@ def _pil_to_qpixmap(image: Image.Image) -> QPixmap:
     data = rgba.tobytes("raw", "RGBA")
     q_image = QImage(data, rgba.width, rgba.height, QImage.Format.Format_RGBA8888)
     return QPixmap.fromImage(q_image.copy())
-
-
-# ---------------------------------------------------------------------------
-# _CheckerPreviewLabel
-# ---------------------------------------------------------------------------
-
-class _CheckerPreviewLabel(QLabel):
-    """QLabel with a Photoshop-style checkerboard background.
-
-    Draws the checker pattern behind any pixmap (or placeholder text) so
-    transparent/semi-transparent areas are clearly visible.
-    """
-
-    def paintEvent(self, event: Any) -> None:  # type: ignore[override]
-        painter = QPainter(self)
-        r = self.rect()
-        editor_utils.draw_checker_background(painter, r)
-        pm = self.pixmap()
-        if pm and not pm.isNull():
-            x = (r.width() - pm.width()) // 2
-            y = (r.height() - pm.height()) // 2
-            painter.drawPixmap(x, y, pm)
-        elif self.text():
-            painter.setPen(QColor(150, 150, 150))
-            painter.drawText(r, int(Qt.AlignmentFlag.AlignCenter), self.text())
-        painter.end()
 
 
 # ---------------------------------------------------------------------------
@@ -614,13 +589,16 @@ class TemplateManagerDialog(QDialog):
         placeholder: Image.Image | None = None,
         parent: QWidget | None = None,
     ) -> None:
+        from app_common.stat import stat_span
+
         super().__init__(parent)
         self.setWindowTitle("模板管理")
         self.resize(1180, 780)
         self.setMinimumSize(640, 500)
 
         self.template_dir = template_dir
-        self.placeholder = placeholder.copy() if placeholder else _build_placeholder_image()
+        with stat_span("tmpl_placeholder"):
+            self.placeholder = placeholder.copy() if placeholder else _build_placeholder_image()
         self.preview_pixmap: QPixmap | None = None
 
         self.template_paths: dict[str, Path] = {}
@@ -634,11 +612,15 @@ class TemplateManagerDialog(QDialog):
         self._preview_source_image: "Image.Image | None" = None
         self._preview_raw_metadata: dict[str, Any] = {}
         self._preview_metadata_context: dict[str, str] = {}
-        self._load_preview_source()
+        with stat_span("tmpl_load_preview_source"):
+            self._load_preview_source()
 
-        self._setup_ui()
-        self._reload_template_list(preferred=None)
-        self._refresh_preview_label()
+        with stat_span("tmpl_setup_ui"):
+            self._setup_ui()
+        with stat_span("tmpl_reload_template_list"):
+            self._reload_template_list(preferred=None)
+        with stat_span("tmpl_refresh_preview_label"):
+            self._refresh_preview_label()
 
     def _load_preview_source(self) -> None:
         """加载 images/default.jpg 原图及完整 EXIF 作为预览图源，与主界面保持一致。
@@ -675,19 +657,24 @@ class TemplateManagerDialog(QDialog):
     # ------------------------------------------------------------------
 
     def _setup_ui(self) -> None:
+        from app_common.stat import stat_span
+
         root_layout = QHBoxLayout(self)
         splitter = QSplitter(Qt.Orientation.Horizontal)
         root_layout.addWidget(splitter)
 
-        left_panel = self._build_template_list_panel()
+        with stat_span("tmpl_build_list_panel"):
+            left_panel = self._build_template_list_panel()
 
-        editor_panel = self._build_editor_panel()
+        with stat_span("tmpl_build_editor_panel"):
+            editor_panel = self._build_editor_panel()
         editor_scroll = QScrollArea()
         editor_scroll.setWidgetResizable(True)
         editor_scroll.setWidget(editor_panel)
         editor_scroll.setMinimumWidth(0)
 
-        preview_panel = self._build_preview_panel()
+        with stat_span("tmpl_build_preview_panel"):
+            preview_panel = self._build_preview_panel()
 
         splitter.addWidget(left_panel)
         splitter.addWidget(editor_scroll)
@@ -731,15 +718,21 @@ class TemplateManagerDialog(QDialog):
 
     def _build_editor_panel(self) -> QWidget:
         """中间面板：当前模板各分组。"""
+        from app_common.stat import stat_span
+
         panel = QWidget()
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(8)
 
-        layout.addWidget(self._build_header_group())
-        layout.addWidget(self._build_crop_group())
-        layout.addWidget(self._build_fields_group(), stretch=1)
-        layout.addWidget(self._build_field_edit_group())
+        with stat_span("tmpl_build_header_group"):
+            layout.addWidget(self._build_header_group())
+        with stat_span("tmpl_build_crop_group"):
+            layout.addWidget(self._build_crop_group())
+        with stat_span("tmpl_build_fields_group"):
+            layout.addWidget(self._build_fields_group(), stretch=1)
+        with stat_span("tmpl_build_field_edit_group"):
+            layout.addWidget(self._build_field_edit_group())
         return panel
 
     def _build_preview_panel(self) -> QWidget:
@@ -753,8 +746,12 @@ class TemplateManagerDialog(QDialog):
 
         preview_group = QGroupBox("预览")
         preview_layout = QVBoxLayout(preview_group)
-        self.preview_label = _CheckerPreviewLabel("暂无预览")
-        self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.preview_original_size_check = QCheckBox("显示原尺寸图")
+        self.preview_original_size_check.toggled.connect(self._on_template_preview_scale_toggled)
+        preview_layout.addWidget(self.preview_original_size_check)
+        self.preview_label = PreviewWithStatusBar(
+            canvas=PreviewCanvas(placeholder_text="暂无预览"),
+        )
         preview_layout.addWidget(self.preview_label, stretch=1)
         layout.addWidget(preview_group, stretch=1)
         return panel
@@ -960,11 +957,13 @@ class TemplateManagerDialog(QDialog):
         self.field_font_combo.setMaxVisibleItems(24)
         self.field_font_combo.currentIndexChanged.connect(self._apply_field_changes)
         form.addRow("字体类型", self.field_font_combo)
-        self._field_font_all_choices = list(_template_font_choices())
+        # 延迟加载字体列表，避免对话框打开时卡顿（template_font_choices 遍历系统字体约 10s）
+        self._field_font_all_choices = []
         self._rebuild_field_font_combo(
             filter_text="",
             preferred_font_type=_DEFAULT_TEMPLATE_FONT_TYPE,
         )
+        QTimer.singleShot(150, self._deferred_load_font_choices)
 
         self.field_font_size_spin = QSpinBox()
         self.field_font_size_spin.setRange(8, 300)
@@ -1265,6 +1264,23 @@ class TemplateManagerDialog(QDialog):
             if data == target:
                 return idx
         return -1
+
+    def _deferred_load_font_choices(self) -> None:
+        """延迟加载系统字体列表，避免对话框打开时卡顿。"""
+        if self._field_font_all_choices:
+            return
+        self._field_font_all_choices = list(_template_font_choices())
+        preferred = _normalize_template_font_type(
+            self.field_font_combo.currentData() if hasattr(self, "field_font_combo") else None
+        )
+        filter_text = (
+            self.field_font_filter_edit.text()
+            if hasattr(self, "field_font_filter_edit") else ""
+        )
+        self._rebuild_field_font_combo(
+            filter_text=filter_text,
+            preferred_font_type=preferred or _DEFAULT_TEMPLATE_FONT_TYPE,
+        )
 
     def _rebuild_field_font_combo(self, *, filter_text: str, preferred_font_type: Any) -> None:
         choices = self._filtered_field_font_choices(filter_text)
@@ -1832,15 +1848,15 @@ class TemplateManagerDialog(QDialog):
 
     def _refresh_preview_label(self) -> None:
         if not self.preview_pixmap:
-            self.preview_label.setPixmap(QPixmap())
-            self.preview_label.setText("暂无预览")
+            self.preview_label.set_original_size(None, None)
+            self.preview_label.set_source_pixmap(None)
             return
+        if self._preview_source_image is not None:
+            w, h = self._preview_source_image.size
+            self.preview_label.set_original_size(w, h)
+        else:
+            self.preview_label.set_original_size(None, None)
+        self.preview_label.set_source_pixmap(self.preview_pixmap, preserve_view=True)
 
-        target = self.preview_label.size()
-        scaled = self.preview_pixmap.scaled(
-            target,
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )
-        self.preview_label.setPixmap(scaled)
-        self.preview_label.setText("")
+    def _on_template_preview_scale_toggled(self, checked: bool) -> None:
+        self.preview_label.set_use_original_size(checked, preserve_view=True)
