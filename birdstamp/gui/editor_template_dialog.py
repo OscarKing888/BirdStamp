@@ -79,7 +79,11 @@ _DEFAULT_CROP_PADDING_PX = editor_core.DEFAULT_CROP_PADDING_PX
 _normalize_center_mode = editor_core.normalize_center_mode
 _parse_bool_value = editor_core.parse_bool_value
 _parse_ratio_value = editor_core.parse_ratio_value
-_crop_to_ratio_with_anchor = editor_core.crop_to_ratio_with_anchor
+_parse_padding_value = editor_core.parse_padding_value
+_apply_full_crop = editor_core.apply_full_crop
+_resize_fit = editor_core.resize_fit
+_build_metadata_context = editor_utils.build_metadata_context
+_default_placeholder_path = editor_utils._default_placeholder_path
 
 _BANNER_BACKGROUND_STYLE_SOLID = editor_template.BANNER_BACKGROUND_STYLE_SOLID
 _BANNER_BACKGROUND_STYLE_GRADIENT_BOTTOM = editor_template.BANNER_BACKGROUND_STYLE_GRADIENT_BOTTOM
@@ -625,9 +629,46 @@ class TemplateManagerDialog(QDialog):
         self._field_font_all_choices: list[tuple[str, str]] = []
         self._updating = False
 
+        # 预览图源：优先使用 images/default.jpg 原图 + 真实 EXIF（与主界面一致）
+        self._preview_source_path: Path = Path(".")
+        self._preview_source_image: "Image.Image | None" = None
+        self._preview_raw_metadata: dict[str, Any] = {}
+        self._preview_metadata_context: dict[str, str] = {}
+        self._load_preview_source()
+
         self._setup_ui()
         self._reload_template_list(preferred=None)
         self._refresh_preview_label()
+
+    def _load_preview_source(self) -> None:
+        """加载 images/default.jpg 原图及完整 EXIF 作为预览图源，与主界面保持一致。
+        优先使用 ExifTool（extract_many）获取完整字段（含 LensModel 等），
+        失败时降级为 Pillow EXIF。
+        """
+        from birdstamp.decoders.image_decoder import decode_image as _decode_image
+        from birdstamp.meta.exiftool import extract_many
+        from birdstamp.meta.pillow_fallback import extract_pillow_metadata
+
+        src = _default_placeholder_path()
+        if src.exists():
+            try:
+                self._preview_source_path = src
+                self._preview_source_image = _decode_image(src, decoder="auto")
+                resolved = src.resolve(strict=False)
+                try:
+                    raw_map = extract_many([resolved], mode="auto")
+                    raw_meta = raw_map.get(resolved) or extract_pillow_metadata(src)
+                except Exception:
+                    raw_meta = extract_pillow_metadata(src)
+                if not isinstance(raw_meta, dict):
+                    raw_meta = {}
+                self._preview_raw_metadata = raw_meta
+                self._preview_metadata_context = _build_metadata_context(src, raw_meta)
+                return
+            except Exception:
+                pass
+        # 回退：使用 placeholder PIL 图 + 空 metadata
+        self._preview_source_image = self.placeholder.copy()
 
     # ------------------------------------------------------------------
     # UI construction
@@ -1746,28 +1787,43 @@ class TemplateManagerDialog(QDialog):
     # ------------------------------------------------------------------
 
     def _refresh_preview(self) -> None:
+        source = (self._preview_source_image or self.placeholder).copy()
         if not self.current_payload:
-            image = self.placeholder.copy()
+            image = source
         else:
-            metadata_context = {
-                "bird": "灰喜鹊",
-                "capture_text": "2026-02-16 09:14",
-                "location": "北京海淀",
-                "gps_text": "39.12345, 116.12345",
-                "camera": "Sony ILCE-1M2",
-                "lens": "FE 600mm F4 GM OSS",
-                "settings_text": "f/4  1/2000s  ISO800  600mm",
-                "stem": "sample",
-                "filename": "sample.jpg",
-            }
-            preview_base = self.placeholder.copy()
             ratio = _parse_ratio_value(self.current_payload.get("ratio"))
-            if ratio is not None:
-                preview_base = _crop_to_ratio_with_anchor(preview_base, ratio, (0.5, 0.5))
+            center_mode = _normalize_center_mode(
+                str(self.current_payload.get("center_mode") or _DEFAULT_TEMPLATE_CENTER_MODE)
+            )
+            auto_crop = _parse_bool_value(
+                self.current_payload.get("auto_crop_by_bird"), _DEFAULT_TEMPLATE_AUTO_CROP_BY_BIRD
+            )
+            max_long_edge = max(0, int(self.current_payload.get("max_long_edge") or 0))
+            fill_color = str(self.current_payload.get("crop_padding_fill") or "#FFFFFF")
+            # 使用与主界面完全一致的裁切管线，含非对称内边距传入鸟体裁切算法
+            inner_top = _parse_padding_value(self.current_payload.get("crop_padding_top"), 0)
+            inner_bottom = _parse_padding_value(self.current_payload.get("crop_padding_bottom"), 0)
+            inner_left = _parse_padding_value(self.current_payload.get("crop_padding_left"), 0)
+            inner_right = _parse_padding_value(self.current_payload.get("crop_padding_right"), 0)
+
+            source = _apply_full_crop(
+                source,
+                self._preview_raw_metadata,
+                ratio=ratio,
+                center_mode=center_mode,
+                auto_crop_by_bird=auto_crop,
+                inner_top=inner_top,
+                inner_bottom=inner_bottom,
+                inner_left=inner_left,
+                inner_right=inner_right,
+                max_long_edge=max_long_edge,
+                fill_color=fill_color,
+            )
+
             image = render_template_overlay(
-                preview_base,
-                raw_metadata=SAMPLE_RAW_METADATA,
-                metadata_context=metadata_context,
+                source,
+                raw_metadata=self._preview_raw_metadata,
+                metadata_context=self._preview_metadata_context,
                 template_payload=self.current_payload,
             )
 

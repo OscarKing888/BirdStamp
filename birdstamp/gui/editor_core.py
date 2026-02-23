@@ -993,6 +993,138 @@ def detect_primary_bird_box(image: Image.Image) -> tuple[float, float, float, fl
     return _normalize_xyxy_box(best_box, source.width, source.height)
 
 
+def compute_crop_plan(
+    image: Image.Image,
+    raw_metadata: dict[str, Any],
+    *,
+    ratio: float | None,
+    center_mode: str,
+    auto_crop_by_bird: bool = True,
+    inner_top: int = 0,
+    inner_bottom: int = 0,
+    inner_left: int = 0,
+    inner_right: int = 0,
+) -> tuple[tuple[float, float, float, float] | None, tuple[int, int, int, int]]:
+    """Compute (crop_box, outer_pad) using the same logic as the main editor's pipeline.
+
+    Returns the normalised crop box (0-1 coordinates) and the outer padding
+    (top, bottom, left, right) in pixels that must be added to the image *before*
+    applying the crop. Matches ``_BirdStampCropCalculatorMixin._compute_crop_plan_for_image``.
+    """
+    if ratio is None:
+        return (None, (0, 0, 0, 0))
+    w, h = image.size
+    center_mode = normalize_center_mode(center_mode)
+    anchor: tuple[float, float] = (0.5, 0.5)
+    keep_box: tuple[float, float, float, float] | None = None
+
+    # Resolve anchor and keep_box
+    focus_point = get_focus_point(raw_metadata, w, h)
+    bird_box: tuple[float, float, float, float] | None = None
+    try:
+        bird_box = detect_primary_bird_box(image)
+    except Exception:
+        pass
+
+    if center_mode == CENTER_MODE_FOCUS:
+        if focus_point is not None:
+            anchor = focus_point
+        elif bird_box is not None:
+            anchor = box_center(bird_box)
+    elif center_mode == CENTER_MODE_BIRD:
+        if bird_box is not None:
+            anchor = box_center(bird_box)
+            keep_box = bird_box
+        elif focus_point is not None:
+            anchor = focus_point
+
+    # Auto bird crop with asymmetric inner padding
+    if auto_crop_by_bird and keep_box is not None:
+        expanded_px = expand_unit_box_to_unclamped_pixels(
+            keep_box, width=w, height=h,
+            top=inner_top, bottom=inner_bottom, left=inner_left, right=inner_right,
+        )
+        if expanded_px is not None:
+            import math as _math
+            kl, kt, kr, kb = expanded_px
+            kw = max(1.0, kr - kl)
+            kh = max(1.0, kb - kt)
+            cx = (kl + kr) * 0.5
+            cy = (kt + kb) * 0.5
+            cw = kw
+            ch = cw / ratio
+            if ch < kh:
+                ch = kh
+                cw = ch * ratio
+            cl = cx - cw * 0.5
+            ct = cy - ch * 0.5
+            cr = cl + cw
+            cb = ct + ch
+            outer_l = max(0, int(_math.ceil(-cl)))
+            outer_t = max(0, int(_math.ceil(-ct)))
+            outer_r = max(0, int(_math.ceil(cr - w)))
+            outer_b = max(0, int(_math.ceil(cb - h)))
+            pw = w + outer_l + outer_r
+            ph = h + outer_t + outer_b
+            if pw > 0 and ph > 0:
+                crop_box = normalize_unit_box((
+                    (cl + outer_l) / float(pw),
+                    (ct + outer_t) / float(ph),
+                    (cr + outer_l) / float(pw),
+                    (cb + outer_t) / float(ph),
+                ))
+                if crop_box is not None:
+                    return (crop_box, (outer_t, outer_b, outer_l, outer_r))
+
+    # Fallback: simple ratio crop from anchor
+    crop_box = compute_ratio_crop_box(
+        width=w, height=h, ratio=ratio, anchor=anchor, keep_box=None,
+    )
+    if not crop_box_has_effect(crop_box):
+        return (None, (0, 0, 0, 0))
+    return (crop_box, (0, 0, 0, 0))
+
+
+def apply_full_crop(
+    image: Image.Image,
+    raw_metadata: dict[str, Any],
+    *,
+    ratio: float | None,
+    center_mode: str,
+    auto_crop_by_bird: bool = True,
+    inner_top: int = 0,
+    inner_bottom: int = 0,
+    inner_left: int = 0,
+    inner_right: int = 0,
+    max_long_edge: int = 0,
+    fill_color: str = "#FFFFFF",
+) -> Image.Image:
+    """Apply the full main-editor crop pipeline to an image and return the result.
+
+    Supports asymmetric inner padding (``inner_*``) for the bird-crop algorithm,
+    unlike ``apply_editor_crop`` which only has a uniform ``crop_padding_px``.
+    Suitable for template dialog preview and any standalone render use case.
+    """
+    crop_box, outer_pad = compute_crop_plan(
+        image, raw_metadata,
+        ratio=ratio,
+        center_mode=center_mode,
+        auto_crop_by_bird=auto_crop_by_bird,
+        inner_top=inner_top,
+        inner_bottom=inner_bottom,
+        inner_left=inner_left,
+        inner_right=inner_right,
+    )
+    pt, pb, pl, pr = outer_pad
+    if pt or pb or pl or pr:
+        image = pad_image(image, top=pt, bottom=pb, left=pl, right=pr, fill=fill_color)
+    if crop_box is not None:
+        image = crop_image_by_normalized_box(image, crop_box)
+    if max_long_edge > 0:
+        image = resize_fit(image, max_long_edge)
+    return image
+
+
 def apply_editor_crop(
     image: Image.Image,
     *,
