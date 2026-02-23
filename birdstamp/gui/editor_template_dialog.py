@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from PIL import Image
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QImage, QLinearGradient, QPainter, QPixmap
 from PyQt6.QtWidgets import (
     QCheckBox,
@@ -114,6 +114,16 @@ def _pil_to_qpixmap(image: Image.Image) -> QPixmap:
     data = rgba.tobytes("raw", "RGBA")
     q_image = QImage(data, rgba.width, rgba.height, QImage.Format.Format_RGBA8888)
     return QPixmap.fromImage(q_image.copy())
+
+
+class _LazyLoadComboBox(QComboBox):
+    """在展开下拉前发出信号，用于首次懒加载数据。"""
+
+    popupAboutToShow = pyqtSignal()
+
+    def showPopup(self) -> None:  # type: ignore[override]
+        self.popupAboutToShow.emit()
+        super().showPopup()
 
 
 # ---------------------------------------------------------------------------
@@ -605,6 +615,7 @@ class TemplateManagerDialog(QDialog):
         self.current_template_name: str | None = None
         self.current_payload: dict[str, Any] | None = None
         self._field_font_all_choices: list[tuple[str, str]] = []
+        self._field_font_choices_loaded = False
         self._updating = False
 
         # 预览图源：优先使用 images/default.jpg 原图 + 真实 EXIF（与主界面一致）
@@ -627,9 +638,8 @@ class TemplateManagerDialog(QDialog):
         优先使用 ExifTool（extract_many）获取完整字段（含 LensModel 等），
         失败时降级为 Pillow EXIF。
         """
+        from app_common.exif_io import extract_many, extract_pillow_metadata
         from birdstamp.decoders.image_decoder import decode_image as _decode_image
-        from birdstamp.meta.exiftool import extract_many
-        from birdstamp.meta.pillow_fallback import extract_pillow_metadata
 
         src = _default_placeholder_path()
         if src.exists():
@@ -953,17 +963,18 @@ class TemplateManagerDialog(QDialog):
         self.field_font_filter_edit.textChanged.connect(self._on_field_font_filter_changed)
         form.addRow("字体过滤", self.field_font_filter_edit)
 
-        self.field_font_combo = QComboBox()
+        self.field_font_combo = _LazyLoadComboBox()
         self.field_font_combo.setMaxVisibleItems(24)
         self.field_font_combo.currentIndexChanged.connect(self._apply_field_changes)
+        self.field_font_combo.popupAboutToShow.connect(self._ensure_field_font_choices_loaded)
+        self.field_font_combo.setToolTip("首次展开时加载支持中文的字体列表")
         form.addRow("字体类型", self.field_font_combo)
-        # 延迟加载字体列表，避免对话框打开时卡顿（template_font_choices 遍历系统字体约 10s）
+        # 首次展开下拉时再加载字体列表，避免打开模板管理对话框时卡顿
         self._field_font_all_choices = []
         self._rebuild_field_font_combo(
             filter_text="",
             preferred_font_type=_DEFAULT_TEMPLATE_FONT_TYPE,
         )
-        QTimer.singleShot(150, self._deferred_load_font_choices)
 
         self.field_font_size_spin = QSpinBox()
         self.field_font_size_spin.setRange(8, 300)
@@ -1265,11 +1276,18 @@ class TemplateManagerDialog(QDialog):
                 return idx
         return -1
 
-    def _deferred_load_font_choices(self) -> None:
-        """延迟加载系统字体列表，避免对话框打开时卡顿。"""
-        if self._field_font_all_choices:
+    def _ensure_field_font_choices_loaded(self) -> None:
+        """首次展开下拉时加载字体列表（仅显示支持中文的字体）。"""
+        if self._field_font_choices_loaded and self._field_font_all_choices:
             return
-        self._field_font_all_choices = list(_template_font_choices())
+        self.field_font_combo.setEnabled(False)
+        try:
+            self._field_font_all_choices = list(
+                _template_font_choices(chinese_only=True, prefer_chinese_label=True)
+            )
+            self._field_font_choices_loaded = True
+        finally:
+            self.field_font_combo.setEnabled(True)
         preferred = _normalize_template_font_type(
             self.field_font_combo.currentData() if hasattr(self, "field_font_combo") else None
         )
@@ -1303,6 +1321,8 @@ class TemplateManagerDialog(QDialog):
             self.field_font_combo.blockSignals(False)
 
     def _on_field_font_filter_changed(self, *_args: Any) -> None:
+        if not self._field_font_choices_loaded:
+            return
         preferred = _normalize_template_font_type(self.field_font_combo.currentData())
         self._rebuild_field_font_combo(
             filter_text=self.field_font_filter_edit.text(),

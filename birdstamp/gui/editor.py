@@ -73,9 +73,13 @@ from birdstamp.config import get_config_path
 from birdstamp.constants import SUPPORTED_EXTENSIONS
 from birdstamp.decoders.image_decoder import decode_image
 from birdstamp.discover import discover_inputs
-from birdstamp.meta.exiftool import extract_many
+from app_common.exif_io import (
+    extract_many,
+    extract_pillow_metadata,
+    extract_metadata_with_xmp_priority,
+    read_batch_metadata,
+)
 from birdstamp.meta.normalize import format_settings_line, normalize_metadata
-from birdstamp.meta.pillow_fallback import extract_pillow_metadata
 from birdstamp.render.typography import list_available_font_paths, load_font
 
 from birdstamp.gui import editor_core
@@ -1200,17 +1204,31 @@ class BirdStampEditorWindow(QMainWindow, _BirdStampCropMixin, _BirdStampRenderer
         resolved = path.resolve(strict=False)
         raw_metadata: dict[str, Any]
         try:
-            raw_map = extract_many([resolved], mode="auto")
-            raw_metadata = raw_map.get(resolved) or extract_pillow_metadata(path)
+            raw_metadata = extract_metadata_with_xmp_priority(resolved, mode="auto")
         except Exception:
-            raw_metadata = extract_pillow_metadata(path)
+            try:
+                raw_map = extract_many([resolved], mode="auto")
+                raw_metadata = raw_map.get(resolved) or extract_pillow_metadata(path)
+            except Exception:
+                raw_metadata = extract_pillow_metadata(path)
         if not isinstance(raw_metadata, dict):
             raw_metadata = {"SourceFile": str(path)}
-        sidecar_metadata = _load_sidecar_xmp_metadata(path)
-        if sidecar_metadata:
-            merged = dict(raw_metadata)
-            merged.update(sidecar_metadata)
-            raw_metadata = merged
+
+        # 通过 app_common.exif_io 统一读取文件列表依赖的 XMP/sidecar 字段（Title/Rating/Pick 等）。
+        # 放在最后合并，确保列表显示与 Banner 模板字段优先使用 exif_io 的 XMP 结果。
+        try:
+            batch_map = read_batch_metadata([str(resolved)])
+        except Exception:
+            batch_map = {}
+        if isinstance(batch_map, dict) and batch_map:
+            try:
+                batch_metadata = next(iter(batch_map.values()))
+            except Exception:
+                batch_metadata = None
+            if isinstance(batch_metadata, dict):
+                merged = dict(raw_metadata)
+                merged.update(batch_metadata)
+                raw_metadata = merged
 
         self.raw_metadata_cache[key] = raw_metadata
         return raw_metadata

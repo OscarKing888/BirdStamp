@@ -53,9 +53,23 @@ def _to_float(value: Any) -> float | None:
         return None
     if isinstance(value, (int, float)):
         return float(value)
+    try:
+        return float(value)
+    except Exception:
+        pass
     text = _clean_text(value)
     if not text:
         return None
+    frac_match = re.search(r"([-+]?\d+(?:\.\d+)?)\s*/\s*([-+]?\d+(?:\.\d+)?)", text)
+    if frac_match:
+        try:
+            num = float(frac_match.group(1))
+            den = float(frac_match.group(2))
+        except ValueError:
+            return None
+        if den == 0:
+            return None
+        return num / den
     match = re.search(r"[-+]?\d+(\.\d+)?", text)
     if not match:
         return None
@@ -272,7 +286,7 @@ def normalize_metadata(
 
     aperture = _to_float(_pick(lookup, ["FNumber", "Aperture", "ApertureValue"]))
     shutter_s = _parse_exposure_seconds(_pick(lookup, ["ExposureTime", "ShutterSpeed"]))
-    iso = _to_int(_pick(lookup, ["ISO", "PhotographicSensitivity"]))
+    iso = _to_int(_pick(lookup, ["ISO", "PhotographicSensitivity", "ISOSpeedRatings"]))
     focal_mm = _to_float(_pick(lookup, ["FocalLength"]))
     focal35_mm = _to_float(_pick(lookup, ["FocalLengthIn35mmFormat", "FocalLength35efl"]))
 

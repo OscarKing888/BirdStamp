@@ -12,9 +12,13 @@ from birdstamp.config import load_config, write_default_config
 from birdstamp.constants import SUPPORTED_EXTENSIONS
 from birdstamp.decoders.image_decoder import decode_image
 from birdstamp.discover import discover_inputs
-from birdstamp.meta.exiftool import extract_many
+from app_common.exif_io import (
+    extract_many_with_xmp_priority,
+    extract_metadata_with_xmp_priority,
+    get_exiftool_executable_path,
+    find_xmp_sidecar,
+)
 from birdstamp.meta.normalize import normalize_metadata
-from birdstamp.meta.pillow_fallback import extract_pillow_metadata
 from birdstamp.naming import build_output_name
 
 app = typer.Typer(add_completion=False, no_args_is_help=True, help="极速鸟框 photo banner CLI.")
@@ -169,7 +173,7 @@ def render(
     # Batch metadata extraction
     resolved_files = [p.resolve(strict=False) for p in files]
     try:
-        raw_meta_map = extract_many(resolved_files, mode=exiftool_mode)
+        raw_meta_map = extract_many_with_xmp_priority(resolved_files, mode=exiftool_mode)
     except Exception as exc:
         typer.secho(f"Metadata extraction setup failed: {exc}", err=True, fg=typer.colors.RED)
         raise typer.Exit(1)
@@ -178,7 +182,7 @@ def render(
         t0 = time.perf_counter()
         try:
             resolved = source.resolve(strict=False)
-            raw_meta = raw_meta_map.get(resolved) or extract_pillow_metadata(source)
+            raw_meta = raw_meta_map.get(resolved) or extract_metadata_with_xmp_priority(source, mode=exiftool_mode)
             norm_meta = normalize_metadata(
                 source,
                 raw_meta,
@@ -262,14 +266,15 @@ def inspect_file(
     bird_regex: str = typer.Option(r"(?P<bird>[^_]+)_", "--bird-regex"),
     time_format: str = typer.Option("%Y-%m-%d %H:%M", "--time-format"),
     raw: bool = typer.Option(False, "--raw", help="Include raw metadata payload."),
+    sources: bool = typer.Option(False, "--sources", help="Include metadata source diagnostics."),
 ) -> None:
     resolved = file.resolve(strict=False)
+    mode = use_exiftool.lower()
     try:
-        raw_map = extract_many([resolved], mode=use_exiftool.lower())
+        raw_metadata = extract_metadata_with_xmp_priority(file, mode=mode)
     except Exception as exc:
         typer.secho(f"Metadata extraction failed: {exc}", err=True, fg=typer.colors.RED)
         raise typer.Exit(1)
-    raw_metadata = raw_map.get(resolved) or extract_pillow_metadata(file)
     metadata = normalize_metadata(
         file,
         raw_metadata,
@@ -281,6 +286,12 @@ def inspect_file(
     payload = metadata.to_dict()
     if raw:
         payload["raw_metadata"] = raw_metadata
+    if sources:
+        payload["metadata_sources"] = {
+            "requested_mode": mode,
+            "resolved_exiftool": get_exiftool_executable_path(),
+            "sidecar_xmp": find_xmp_sidecar(str(file)),
+        }
     typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
 
 

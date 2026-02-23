@@ -8,7 +8,7 @@ from typing import Any, Callable
 
 from PIL import Image, ImageColor, ImageDraw, ImageOps
 from PyQt6.QtCore import QPoint, QRect, QRectF, Qt, pyqtSignal
-from PyQt6.QtGui import QColor, QCursor, QFontDatabase, QGuiApplication, QImage, QPainter, QPen, QPixmap
+from PyQt6.QtGui import QColor, QCursor, QFontDatabase, QGuiApplication, QImage, QPainter, QPen, QPixmap, QRawFont
 from PyQt6.QtWidgets import QApplication, QLabel, QWidget
 
 from birdstamp.meta.normalize import format_settings_line, normalize_metadata
@@ -23,6 +23,32 @@ TEMPLATE_BANNER_COLOR_CUSTOM = "custom"
 TEMPLATE_BANNER_TOP_PADDING_PX = 16
 DEFAULT_TEMPLATE_FONT_TYPE = "auto"
 DEFAULT_CROP_EFFECT_ALPHA = 160
+_CHINESE_FONT_NAME_ALIASES: tuple[tuple[str, str], ...] = (
+    ("microsoft yahei", "微软雅黑"),
+    ("msyh", "微软雅黑"),
+    ("simhei", "黑体"),
+    ("simsun", "宋体"),
+    ("nsimsun", "新宋体"),
+    ("fangsong", "仿宋"),
+    ("dengxian", "等线"),
+    ("pingfang", "苹方"),
+    ("hiragino sans", "冬青黑体"),
+    ("hiragino sans gb", "冬青黑体简体中文"),
+    ("hiragino mincho", "冬青明朝"),
+    ("songti sc", "宋体-简"),
+    ("songti", "宋体"),
+    ("heiti sc", "黑体-简"),
+    ("heiti", "黑体"),
+    ("kaiti sc", "楷体-简"),
+    ("stfangsong", "华文仿宋"),
+    ("stkaiti", "华文楷体"),
+    ("stsong", "华文宋体"),
+    ("source han sans", "思源黑体"),
+    ("source han serif", "思源宋体"),
+    ("noto sans cjk", "Noto Sans CJK"),
+    ("noto serif cjk", "Noto Serif CJK"),
+    ("sarasa", "更纱黑体"),
+)
 
 
 def safe_color(value: str, fallback: str) -> str:
@@ -89,31 +115,141 @@ def template_banner_fill_color(value: Any) -> str | None:
     return color
 
 
+def _contains_cjk_char(text: str) -> bool:
+    for ch in str(text or ""):
+        code = ord(ch)
+        if 0x3400 <= code <= 0x9FFF or 0xF900 <= code <= 0xFAFF:
+            return True
+    return False
+
+
+def _guess_chinese_font_name(families: list[str], font_path_text: str) -> str:
+    for family in families:
+        if _contains_cjk_char(family):
+            return family
+    path_name = ""
+    path_stem = ""
+    try:
+        p = Path(font_path_text)
+        path_name = p.name.lower()
+        path_stem = p.stem.lower()
+    except Exception:
+        pass
+    haystacks = [str(f or "").strip().lower() for f in families if str(f or "").strip()]
+    joined = " | ".join(haystacks + [path_name, path_stem])
+    for key, zh_name in _CHINESE_FONT_NAME_ALIASES:
+        if key in joined:
+            return zh_name
+    return ""
+
+
+def _is_unwanted_font_for_template_picker(*, label: str, font_path_text: str) -> bool:
+    haystack = f"{label} {font_path_text}".lower()
+    if "lastresort" in haystack:
+        return True
+    if "aqua kana" in haystack:
+        return True
+    if "fallback" in haystack and "cjk" in haystack:
+        return True
+    return False
+
+
 @lru_cache(maxsize=4096)
-def font_family_label_from_path(font_path_text: str) -> str:
+def _font_metadata_from_path(font_path_text: str) -> dict[str, Any]:
     path_text = str(font_path_text or "").strip()
     if not path_text:
-        return ""
+        return {
+            "family_label": "",
+            "display_label_zh": "",
+            "supports_chinese": False,
+        }
     try:
         font_id = QFontDatabase.addApplicationFont(path_text)
     except Exception:
-        return ""
+        return {
+            "family_label": "",
+            "display_label_zh": "",
+            "supports_chinese": False,
+        }
     if font_id < 0:
-        return ""
+        return {
+            "family_label": "",
+            "display_label_zh": "",
+            "supports_chinese": False,
+        }
     try:
         names: list[str] = []
         for family in QFontDatabase.applicationFontFamilies(font_id):
             text = str(family or "").strip()
             if text and text not in names:
                 names.append(text)
-        return " / ".join(names[:2])
+        family_label = " / ".join(names[:2])
+        supports_chinese = False
+        raw_font_valid = False
+        try:
+            raw_font = QRawFont(path_text, 14)
+            raw_font_valid = raw_font.isValid()
+            if raw_font_valid:
+                supports_chinese = bool(
+                    raw_font.supportsCharacter("汉")
+                    or raw_font.supportsCharacter("鳥")
+                    or raw_font.supportsCharacter("测")
+                )
+        except Exception:
+            raw_font_valid = False
+        if not supports_chinese and not raw_font_valid:
+            for family in names:
+                try:
+                    systems = QFontDatabase.writingSystems(family)
+                except Exception:
+                    systems = []
+                if (
+                    QFontDatabase.WritingSystem.SimplifiedChinese in systems
+                    or QFontDatabase.WritingSystem.TraditionalChinese in systems
+                ):
+                    supports_chinese = True
+                    break
+        zh_name = _guess_chinese_font_name(names, path_text)
+        if zh_name and family_label and zh_name not in family_label:
+            display_label_zh = f"{zh_name} / {family_label}"
+        elif zh_name:
+            display_label_zh = zh_name
+        else:
+            display_label_zh = family_label
+        return {
+            "family_label": family_label,
+            "display_label_zh": display_label_zh,
+            "supports_chinese": supports_chinese,
+        }
     except Exception:
-        return ""
+        return {
+            "family_label": "",
+            "display_label_zh": "",
+            "supports_chinese": False,
+        }
     finally:
         try:
             QFontDatabase.removeApplicationFont(font_id)
         except Exception:
             pass
+
+
+@lru_cache(maxsize=4096)
+def font_family_label_from_path(font_path_text: str) -> str:
+    metadata = _font_metadata_from_path(font_path_text)
+    return str(metadata.get("family_label") or "")
+
+
+@lru_cache(maxsize=4096)
+def font_display_label_from_path(font_path_text: str) -> str:
+    metadata = _font_metadata_from_path(font_path_text)
+    return str(metadata.get("display_label_zh") or metadata.get("family_label") or "")
+
+
+@lru_cache(maxsize=4096)
+def font_supports_chinese_from_path(font_path_text: str) -> bool:
+    metadata = _font_metadata_from_path(font_path_text)
+    return bool(metadata.get("supports_chinese"))
 
 
 def normalize_template_font_type(value: Any) -> str:
@@ -142,8 +278,12 @@ def template_font_path_from_type(value: Any) -> Path | None:
     return None
 
 
-@lru_cache(maxsize=1)
-def template_font_choices() -> list[tuple[str, str]]:
+@lru_cache(maxsize=4)
+def template_font_choices(
+    *,
+    chinese_only: bool = False,
+    prefer_chinese_label: bool = False,
+) -> list[tuple[str, str]]:
     choices: list[tuple[str, str]] = [("自动(系统默认)", DEFAULT_TEMPLATE_FONT_TYPE)]
     font_entries: list[tuple[str, str]] = []
     seen_paths: set[str] = set()
@@ -152,7 +292,11 @@ def template_font_choices() -> list[tuple[str, str]]:
         if not key or key in seen_paths:
             continue
         seen_paths.add(key)
-        family_label = font_family_label_from_path(key)
+        if chinese_only and not font_supports_chinese_from_path(key):
+            continue
+        family_label = font_display_label_from_path(key) if prefer_chinese_label else font_family_label_from_path(key)
+        if chinese_only and _is_unwanted_font_for_template_picker(label=family_label, font_path_text=key):
+            continue
         if family_label:
             label = f"{family_label} ({font_path.name})"
         else:

@@ -37,6 +37,9 @@ _XMP_NS_TO_PREFIX = {
     "http://ns.adobe.com/xap/1.0/": "XMP",
     "http://ns.adobe.com/xmp/1.0/DynamicMedia/": "XMP-xmpDM",
 }
+_XMP_SIDECAR_SUFFIX_CANDIDATES = (".xmp", ".XMP", ".Xmp")
+_XMP_DERIVED_EXPORT_DIR_NAMES = {"dxo", "dxo pureraw", "pureraw", "exports", "export"}
+_XMP_DERIVED_STEM_SPLIT_MARKERS = ("-DxO_", "_DxO_")
 
 
 def clean_text(value: Any) -> str | None:
@@ -79,23 +82,47 @@ def _split_xml_tag(tag: str) -> tuple[str, str]:
 
 
 def find_sidecar_xmp_path(source_path: Path) -> Path | None:
-    candidates = (
-        source_path.with_suffix(".xmp"),
-        source_path.with_suffix(".XMP"),
-    )
-    for candidate in candidates:
-        if candidate.exists() and candidate.is_file():
-            return candidate
-    try:
-        for sibling in source_path.parent.iterdir():
-            if not sibling.is_file():
-                continue
-            if sibling.stem != source_path.stem:
-                continue
-            if sibling.suffix.lower() == ".xmp":
-                return sibling
-    except Exception:
+    stem_text = str(source_path.stem or "").strip()
+    if not stem_text:
         return None
+
+    stem_candidates: list[str] = [stem_text]
+    for marker in _XMP_DERIVED_STEM_SPLIT_MARKERS:
+        pos = stem_text.find(marker)
+        if pos <= 0:
+            continue
+        base = stem_text[:pos].rstrip(" _-")
+        if base and base not in stem_candidates:
+            stem_candidates.append(base)
+
+    dir_candidates: list[Path] = [source_path.parent]
+    stem_changed = any(candidate != stem_text for candidate in stem_candidates)
+    parent_name = str(source_path.parent.name or "").strip().lower()
+    if stem_changed or parent_name in _XMP_DERIVED_EXPORT_DIR_NAMES:
+        upper = source_path.parent.parent
+        if upper != source_path.parent and upper not in dir_candidates:
+            dir_candidates.append(upper)
+
+    for dir_path in dir_candidates:
+        for stem in stem_candidates:
+            for suffix in _XMP_SIDECAR_SUFFIX_CANDIDATES:
+                candidate = dir_path / f"{stem}{suffix}"
+                try:
+                    if candidate.exists() and candidate.is_file():
+                        return candidate
+                except Exception:
+                    continue
+            target_lower = f"{stem.lower()}.xmp"
+            try:
+                for sibling in dir_path.iterdir():
+                    if not sibling.is_file():
+                        continue
+                    if sibling.suffix.lower() != ".xmp":
+                        continue
+                    if sibling.name.lower() == target_lower:
+                        return sibling
+            except Exception:
+                continue
     return None
 
 

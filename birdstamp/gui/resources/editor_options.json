@@ -45,6 +45,7 @@
   "default_field_tag": "EXIF:Model",
   "tag_options": [
     {"label": "鸟名 (XMP)", "value": "XMP-dc:Title"},
+    {"label": "星级 (XMP)", "value": "XMP-xmp:Rating"},
     {"label": "拍摄时间 (EXIF)", "value": "EXIF:DateTimeOriginal"},
     {"label": "创建时间 (EXIF)", "value": "EXIF:CreateDate"},
     {"label": "机身型号 (EXIF)", "value": "EXIF:Model"},
@@ -68,6 +69,7 @@
   ],
   "sample_raw_metadata": {
     "XMP-dc:Title": "黑脸琵鹭",
+    "XMP-xmp:Rating": 4,
     "EXIF:DateTimeOriginal": "2026:02:16 09:14:33",
     "EXIF:Model": "Sony ILCE-1M2",
     "EXIF:LensModel": "FE 600mm F4 GM OSS",

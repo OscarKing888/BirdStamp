@@ -57,6 +57,39 @@ class _BirdStampCropMixin:
             self._bird_detect_error_reported = True
         return bird_box
 
+    def _resolve_crop_targets_for_image_center(
+        self,
+        *,
+        focus_point: tuple[float, float] | None,
+        bird_box: tuple[float, float, float, float] | None,
+    ) -> tuple[tuple[float, float], tuple[float, float, float, float] | None]:
+        _ = focus_point, bird_box
+        return ((0.5, 0.5), None)
+
+    def _resolve_crop_targets_for_focus_center(
+        self,
+        *,
+        focus_point: tuple[float, float] | None,
+        bird_box: tuple[float, float, float, float] | None,
+    ) -> tuple[tuple[float, float], tuple[float, float, float, float] | None]:
+        if focus_point is not None:
+            return (focus_point, None)
+        if bird_box is not None:
+            return (_box_center(bird_box), None)
+        return ((0.5, 0.5), None)
+
+    def _resolve_crop_targets_for_bird_center(
+        self,
+        *,
+        focus_point: tuple[float, float] | None,
+        bird_box: tuple[float, float, float, float] | None,
+    ) -> tuple[tuple[float, float], tuple[float, float, float, float] | None]:
+        if bird_box is not None:
+            return (_box_center(bird_box), bird_box)
+        if focus_point is not None:
+            return (focus_point, None)
+        return ((0.5, 0.5), None)
+
     def _resolve_crop_anchor_and_keep_box(
         self,
         *,
@@ -71,18 +104,13 @@ class _BirdStampCropMixin:
             bird_box = self._bird_box_for_path(path, source_image=image)
 
         mode = _normalize_center_mode(center_mode)
-        anchor = (0.5, 0.5)
-        if mode == _CENTER_MODE_FOCUS:
-            if focus_point is not None:
-                anchor = focus_point
-            elif bird_box is not None:
-                anchor = _box_center(bird_box)
-        elif mode == _CENTER_MODE_BIRD:
-            if bird_box is not None:
-                anchor = _box_center(bird_box)
-            elif focus_point is not None:
-                anchor = focus_point
-        return (anchor, bird_box)
+        resolver_map = {
+            _CENTER_MODE_IMAGE: self._resolve_crop_targets_for_image_center,
+            _CENTER_MODE_FOCUS: self._resolve_crop_targets_for_focus_center,
+            _CENTER_MODE_BIRD: self._resolve_crop_targets_for_bird_center,
+        }
+        resolver = resolver_map.get(mode, self._resolve_crop_targets_for_image_center)
+        return resolver(focus_point=focus_point, bird_box=bird_box)
 
     def _compute_auto_bird_crop_plan(
         self,
