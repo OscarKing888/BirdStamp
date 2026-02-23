@@ -14,8 +14,8 @@
   "max_long_edge": 0,
   "crop_padding_top": 0,
   "crop_padding_bottom": 0,
-  "crop_padding_left": 0,
-  "crop_padding_right": 0,
+  "crop_padding_left": 256,
+  "crop_padding_right": 256,
   "crop_padding_fill": "#000000",
   "fields": [
     {
