@@ -510,10 +510,6 @@ class BirdStampEditorWindow(QMainWindow, _BirdStampCropMixin, _BirdStampRenderer
         preview_toolbar.setContentsMargins(0, 0, 0, 0)
         preview_toolbar.setSpacing(8)
 
-        self.show_original_size_check = QCheckBox("显示原尺寸图")
-        self.show_original_size_check.toggled.connect(self._on_preview_scale_mode_toggled)
-        preview_toolbar.addWidget(self.show_original_size_check)
-
         self.show_crop_effect_check = QCheckBox("显示裁切效果")
         self.show_crop_effect_check.setChecked(True)
         self.show_crop_effect_check.toggled.connect(self._on_preview_toolbar_toggled)

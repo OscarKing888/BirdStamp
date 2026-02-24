@@ -82,6 +82,12 @@ class _BirdStampRendererMixin:
         fill_val = fill.currentData() if fill is not None and fill.currentData() else "#FFFFFF"
         return f"{base}|{template_name}|{draw_overlay}|{r}|{cm}|{auto_crop}|{pt}_{pb}_{pl}_{pr}|{fill_val}"
 
+    def _preview_render_settings(self, settings: dict[str, Any]) -> dict[str, Any]:
+        """预览固定按原图尺寸渲染，避免 Banner 在预览阶段被二次缩放。"""
+        preview_settings = self._clone_render_settings(settings)
+        preview_settings["max_long_edge"] = 0
+        return preview_settings
+
     def _load_original_mode_pixmap(self) -> QPixmap | None:
         if self.current_path is None or self.current_source_image is None:
             return None
@@ -97,8 +103,7 @@ class _BirdStampRendererMixin:
             return self._original_mode_pixmap
 
         settings = self._render_settings_for_path(self.current_path, prefer_current_ui=True)
-        original_settings = self._clone_render_settings(settings)
-        original_settings["max_long_edge"] = 0
+        original_settings = self._preview_render_settings(settings)
         try:
             # 原尺寸模式显示未裁切预览源，仅保持原始分辨率。
             raw_metadata = dict(self.current_raw_metadata)
@@ -117,11 +122,9 @@ class _BirdStampRendererMixin:
             )
             img = self._render_overlay_for_preview_frame(
                 preview_base=img,
-                source_image=self.current_source_image,
                 raw_metadata=raw_metadata,
                 metadata_context=dict(self.current_metadata_context),
                 settings=original_settings,
-                source_path=self.current_path,
                 crop_box=crop_box,
             )
             direct_pixmap = _pil_to_qpixmap(img)
@@ -229,14 +232,7 @@ class _BirdStampRendererMixin:
         preserve_view: bool = False,
         force_fit: bool = False,
     ) -> None:
-        # force_fit=True 时忽略"显示原图"勾选，强制以适应窗口模式显示完整预览图
-        use_original = self.show_original_size_check.isChecked() and not force_fit
-        self.preview_label.set_use_original_size(
-            use_original,
-            reset_view=reset_view if force_fit else False,
-            preserve_view=preserve_view,
-            preserve_scale=preserve_view,
-        )
+
         self.preview_label.set_crop_effect_alpha(self.crop_effect_alpha_slider.value())
         self.preview_label.set_show_crop_effect(self.show_crop_effect_check.isChecked())
         self.preview_label.set_show_focus_box(self.show_focus_box_check.isChecked())
@@ -246,14 +242,7 @@ class _BirdStampRendererMixin:
         crop_effect_box = self.preview_crop_effect_box if self.preview_pixmap else None
         focus_box = self.preview_focus_box if self.preview_pixmap else None
         bird_box = self.preview_bird_box if self.preview_pixmap else None
-        source_mode = "预览图"
-
-        if use_original:
-            original_pixmap = self._load_original_mode_pixmap()
-            if original_pixmap is not None and not original_pixmap.isNull():
-                display_pixmap = original_pixmap
-                focus_box = self.preview_focus_box_original
-                source_mode = "原图"
+        source_mode = "原图"
 
         self.preview_label.set_crop_effect_box(crop_effect_box)
         self.preview_label.set_focus_box(focus_box)
@@ -525,36 +514,24 @@ class _BirdStampRendererMixin:
         self,
         *,
         preview_base: Image.Image,
-        source_image: Image.Image,
         raw_metadata: dict[str, Any],
         metadata_context: dict[str, str],
         settings: dict[str, Any],
-        source_path: Path,
         crop_box: tuple[float, float, float, float] | None,
     ) -> Image.Image:
         if not self._should_draw_template_overlay(settings):
             return preview_base
 
         template_payload = self._resolve_template_payload_for_render(settings)
-        final_cropped = self._build_processed_image(
-            source_image.copy(),
-            raw_metadata,
-            settings=settings,
-            source_path=source_path,
-            apply_ratio_crop=True,
-        )
-        rendered_crop = render_template_overlay(
-            final_cropped,
+        # 直接在当前预览帧的裁切区域绘制模板，避免先按输出尺寸渲染再缩放导致 Banner 预览偏差。
+        return _render_template_overlay_in_crop_region(
+            preview_base,
             raw_metadata=raw_metadata,
             metadata_context=metadata_context,
             template_payload=template_payload,
+            crop_box=crop_box,
             draw_banner=_parse_bool_value(settings.get("draw_banner"), True),
             draw_text=_parse_bool_value(settings.get("draw_text"), True),
-        )
-        return self._compose_preview_with_crop_aligned_overlay(
-            preview_base=preview_base,
-            rendered_crop=rendered_crop,
-            crop_box=crop_box,
         )
 
     def _build_processed_image(
@@ -629,29 +606,28 @@ class _BirdStampRendererMixin:
             if self.current_source_image is None:
                 raise RuntimeError("缺少当前原图数据")
             settings = self._render_settings_for_path(self.current_path, prefer_current_ui=True)
+            preview_settings = self._preview_render_settings(settings)
             source_image = self.current_source_image.copy()
             raw_metadata = dict(self.current_raw_metadata)
             crop_box, outer_pad = self._compute_crop_plan_for_image(
                 path=self.current_path,
                 image=self.current_source_image,
                 raw_metadata=raw_metadata,
-                settings=settings,
+                settings=preview_settings,
             )
             # 预览保持完整画面，仅通过“显示裁切效果”遮罩提示最终裁切范围。
             processed = self._build_processed_image(
                 source_image,
                 raw_metadata,
-                settings=settings,
+                settings=preview_settings,
                 source_path=self.current_path,
                 apply_ratio_crop=False,
             )
             rendered = self._render_overlay_for_preview_frame(
                 preview_base=processed,
-                source_image=source_image,
                 raw_metadata=raw_metadata,
                 metadata_context=dict(self.current_metadata_context),
-                settings=settings,
-                source_path=self.current_path,
+                settings=preview_settings,
                 crop_box=crop_box,
             )
         except Exception as exc:

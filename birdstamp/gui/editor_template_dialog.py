@@ -756,9 +756,6 @@ class TemplateManagerDialog(QDialog):
 
         preview_group = QGroupBox("预览")
         preview_layout = QVBoxLayout(preview_group)
-        self.preview_original_size_check = QCheckBox("显示原尺寸图")
-        self.preview_original_size_check.toggled.connect(self._on_template_preview_scale_toggled)
-        preview_layout.addWidget(self.preview_original_size_check)
         self.preview_label = PreviewWithStatusBar(
             canvas=PreviewCanvas(placeholder_text="暂无预览"),
         )
@@ -1834,7 +1831,6 @@ class TemplateManagerDialog(QDialog):
             auto_crop = _parse_bool_value(
                 self.current_payload.get("auto_crop_by_bird"), _DEFAULT_TEMPLATE_AUTO_CROP_BY_BIRD
             )
-            max_long_edge = max(0, int(self.current_payload.get("max_long_edge") or 0))
             fill_color = str(self.current_payload.get("crop_padding_fill") or "#FFFFFF")
             # 使用与主界面完全一致的裁切管线，含非对称内边距传入鸟体裁切算法
             inner_top = _parse_padding_value(self.current_payload.get("crop_padding_top"), 0)
@@ -1852,7 +1848,8 @@ class TemplateManagerDialog(QDialog):
                 inner_bottom=inner_bottom,
                 inner_left=inner_left,
                 inner_right=inner_right,
-                max_long_edge=max_long_edge,
+                # 模板编辑预览固定按原图尺寸渲染，避免 Banner 设计时因预览缩放产生偏差
+                max_long_edge=0,
                 fill_color=fill_color,
             )
 
@@ -1869,6 +1866,7 @@ class TemplateManagerDialog(QDialog):
     def _refresh_preview_label(self) -> None:
         if not self.preview_pixmap:
             self.preview_label.set_original_size(None, None)
+            self.preview_label.set_source_mode("")
             self.preview_label.set_source_pixmap(None)
             return
         if self._preview_source_image is not None:
@@ -1876,7 +1874,5 @@ class TemplateManagerDialog(QDialog):
             self.preview_label.set_original_size(w, h)
         else:
             self.preview_label.set_original_size(None, None)
+        self.preview_label.set_source_mode("原图")
         self.preview_label.set_source_pixmap(self.preview_pixmap, preserve_view=True)
-
-    def _on_template_preview_scale_toggled(self, checked: bool) -> None:
-        self.preview_label.set_use_original_size(checked, preserve_view=True)
