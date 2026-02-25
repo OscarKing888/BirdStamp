@@ -675,7 +675,7 @@ class BirdStampEditorWindow(QMainWindow, _BirdStampCropMixin, _BirdStampRenderer
     def _on_crop_effect_alpha_changed(self, value: int) -> None:
         alpha = max(0, min(255, int(value)))
         self.crop_effect_alpha_value_label.setText(str(alpha))
-        self.preview_label.set_crop_effect_alpha(alpha)
+        self._apply_preview_overlay_options_from_ui()
 
     def _sync_crop_padding_slider_from_spin(self, slider: QSlider, value: int) -> None:
         self._crop_padding_widget._sync_slider(slider, value)

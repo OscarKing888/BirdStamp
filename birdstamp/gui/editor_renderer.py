@@ -15,6 +15,7 @@ from PyQt6.QtGui import QPixmap
 
 from birdstamp.decoders.image_decoder import decode_image
 from birdstamp.gui import editor_core, editor_options, editor_template, editor_utils
+from birdstamp.gui.editor_preview_canvas import EditorPreviewOverlayOptions, EditorPreviewOverlayState
 
 _pil_to_qpixmap                     = editor_utils.pil_to_qpixmap
 _path_key                           = editor_utils.path_key
@@ -47,6 +48,19 @@ OUTPUT_FORMAT_OPTIONS               = editor_options.OUTPUT_FORMAT_OPTIONS
 
 class _BirdStampRendererMixin:
     """Mixin: preview-cache, render-settings, image processing pipeline, render_preview."""
+
+    def _build_preview_overlay_options(self) -> EditorPreviewOverlayOptions:
+        """Build editor preview overlay options from the current toolbar UI state."""
+        return EditorPreviewOverlayOptions(
+            show_focus_box=bool(self.show_focus_box_check.isChecked()),
+            show_bird_box=bool(self.show_bird_box_check.isChecked()),
+            show_crop_effect=bool(self.show_crop_effect_check.isChecked()),
+            crop_effect_alpha=int(self.crop_effect_alpha_slider.value()),
+        )
+
+    def _apply_preview_overlay_options_from_ui(self) -> None:
+        """Apply preview overlay options to the preview canvas/composite."""
+        self.preview_label.apply_overlay_options(self._build_preview_overlay_options())
 
     def _source_signature(self, path: Path) -> str:
         try:
@@ -232,11 +246,7 @@ class _BirdStampRendererMixin:
         preserve_view: bool = False,
         force_fit: bool = False,
     ) -> None:
-
-        self.preview_label.set_crop_effect_alpha(self.crop_effect_alpha_slider.value())
-        self.preview_label.set_show_crop_effect(self.show_crop_effect_check.isChecked())
-        self.preview_label.set_show_focus_box(self.show_focus_box_check.isChecked())
-        self.preview_label.set_show_bird_box(self.show_bird_box_check.isChecked())
+        self._apply_preview_overlay_options_from_ui()
 
         display_pixmap: QPixmap | None = self.preview_pixmap
         crop_effect_box = self.preview_crop_effect_box if self.preview_pixmap else None
@@ -244,9 +254,13 @@ class _BirdStampRendererMixin:
         bird_box = self.preview_bird_box if self.preview_pixmap else None
         source_mode = "原图"
 
-        self.preview_label.set_crop_effect_box(crop_effect_box)
-        self.preview_label.set_focus_box(focus_box)
-        self.preview_label.set_bird_box(bird_box)
+        self.preview_label.apply_overlay_state(
+            EditorPreviewOverlayState(
+                focus_box=focus_box,
+                bird_box=bird_box,
+                crop_effect_box=crop_effect_box,
+            )
+        )
         if self.current_source_image is not None:
             self.preview_label.set_original_size(self.current_source_image.size[0], self.current_source_image.size[1])
         else:

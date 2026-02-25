@@ -12,12 +12,36 @@ mode) is inherited from the base class.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from PyQt6.QtCore import QRectF, Qt
 from PyQt6.QtGui import QColor, QPainterPath, QPen, QPixmap
 from PyQt6.QtWidgets import QWidget
 
-from app_common.preview_canvas import PreviewCanvas
+from app_common.preview_canvas import PreviewCanvas, PreviewOverlayOptions, PreviewOverlayState
 from birdstamp.gui.editor_utils import DEFAULT_CROP_EFFECT_ALPHA as _DEFAULT_CROP_EFFECT_ALPHA
+
+NormalizedBox = tuple[float, float, float, float]
+
+
+@dataclass(slots=True)
+class EditorPreviewOverlayState(PreviewOverlayState):
+    """Editor-specific overlay payloads.
+
+    Extends the base preview overlay state (focus box) with editor overlays.
+    """
+
+    bird_box: "NormalizedBox | None" = None
+    crop_effect_box: "NormalizedBox | None" = None
+
+
+@dataclass(slots=True)
+class EditorPreviewOverlayOptions(PreviewOverlayOptions):
+    """Editor-specific preview overlay options."""
+
+    show_bird_box: bool = False
+    show_crop_effect: bool = False
+    crop_effect_alpha: int = _DEFAULT_CROP_EFFECT_ALPHA
 
 
 class EditorPreviewCanvas(PreviewCanvas):
@@ -28,11 +52,16 @@ class EditorPreviewCanvas(PreviewCanvas):
     the previous monolithic implementation for drop-in compatibility.
     """
 
-    def __init__(self, parent: "QWidget | None" = None) -> None:
-        super().__init__(parent)
-        self._bird_box: "tuple[float, float, float, float] | None" = None
+    def __init__(
+        self,
+        parent: "QWidget | None" = None,
+        *,
+        placeholder_text: str = "暂无预览",
+    ) -> None:
+        super().__init__(parent, placeholder_text=placeholder_text)
+        self._bird_box: "NormalizedBox | None" = None
         self._show_bird_box: bool = False
-        self._crop_effect_box: "tuple[float, float, float, float] | None" = None
+        self._crop_effect_box: "NormalizedBox | None" = None
         self._show_crop_effect: bool = False
         self._crop_effect_alpha: int = _DEFAULT_CROP_EFFECT_ALPHA
 
@@ -40,36 +69,55 @@ class EditorPreviewCanvas(PreviewCanvas):
     # Public API – bird box
     # ------------------------------------------------------------------
 
-    def set_bird_box(self, bird_box: "tuple[float, float, float, float] | None") -> None:
-        self._bird_box = bird_box
-        self.update()
+    def set_bird_box(self, bird_box: "NormalizedBox | None") -> None:
+        if self._set_bird_box_no_update(bird_box):
+            self.update()
 
     def set_show_bird_box(self, enabled: bool) -> None:
-        self._show_bird_box = bool(enabled)
-        self.update()
+        if self._set_show_bird_box_no_update(enabled):
+            self.update()
 
     # ------------------------------------------------------------------
     # Public API – crop-effect shade
     # ------------------------------------------------------------------
 
-    def set_crop_effect_box(self, crop_effect_box: "tuple[float, float, float, float] | None") -> None:
-        self._crop_effect_box = crop_effect_box
-        self.update()
+    def set_crop_effect_box(self, crop_effect_box: "NormalizedBox | None") -> None:
+        if self._set_crop_effect_box_no_update(crop_effect_box):
+            self.update()
 
     def set_show_crop_effect(self, enabled: bool) -> None:
-        self._show_crop_effect = bool(enabled)
-        self.update()
+        if self._set_show_crop_effect_no_update(enabled):
+            self.update()
 
     def set_crop_effect_alpha(self, alpha: int) -> None:
-        parsed = max(0, min(255, int(alpha)))
-        if parsed == self._crop_effect_alpha:
-            return
-        self._crop_effect_alpha = parsed
-        self.update()
+        if self._set_crop_effect_alpha_no_update(alpha):
+            self.update()
 
     # ------------------------------------------------------------------
     # Extension hooks
     # ------------------------------------------------------------------
+
+    def _apply_overlay_state_data(self, state: "PreviewOverlayState") -> bool:
+        changed = super()._apply_overlay_state_data(state)
+        if not isinstance(state, EditorPreviewOverlayState):
+            return changed
+        if self._set_bird_box_no_update(state.bird_box):
+            changed = True
+        if self._set_crop_effect_box_no_update(state.crop_effect_box):
+            changed = True
+        return changed
+
+    def _apply_overlay_options_data(self, options: "PreviewOverlayOptions") -> bool:
+        changed = super()._apply_overlay_options_data(options)
+        if not isinstance(options, EditorPreviewOverlayOptions):
+            return changed
+        if self._set_show_bird_box_no_update(options.show_bird_box):
+            changed = True
+        if self._set_show_crop_effect_no_update(options.show_crop_effect):
+            changed = True
+        if self._set_crop_effect_alpha_no_update(options.crop_effect_alpha):
+            changed = True
+        return changed
 
     def _on_source_cleared(self) -> None:
         self._bird_box = None
@@ -84,6 +132,39 @@ class EditorPreviewCanvas(PreviewCanvas):
     # ------------------------------------------------------------------
     # Private overlay painters
     # ------------------------------------------------------------------
+
+    def _set_bird_box_no_update(self, bird_box: "NormalizedBox | None") -> bool:
+        if self._bird_box == bird_box:
+            return False
+        self._bird_box = bird_box
+        return True
+
+    def _set_show_bird_box_no_update(self, enabled: bool) -> bool:
+        parsed = bool(enabled)
+        if self._show_bird_box == parsed:
+            return False
+        self._show_bird_box = parsed
+        return True
+
+    def _set_crop_effect_box_no_update(self, crop_effect_box: "NormalizedBox | None") -> bool:
+        if self._crop_effect_box == crop_effect_box:
+            return False
+        self._crop_effect_box = crop_effect_box
+        return True
+
+    def _set_show_crop_effect_no_update(self, enabled: bool) -> bool:
+        parsed = bool(enabled)
+        if self._show_crop_effect == parsed:
+            return False
+        self._show_crop_effect = parsed
+        return True
+
+    def _set_crop_effect_alpha_no_update(self, alpha: int) -> bool:
+        parsed = max(0, min(255, int(alpha)))
+        if parsed == self._crop_effect_alpha:
+            return False
+        self._crop_effect_alpha = parsed
+        return True
 
     def _paint_bird_overlay(self, painter, draw_rect: "QRectF", content_rect) -> None:
         bb = self._bird_box

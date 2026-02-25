@@ -42,8 +42,13 @@ from PyQt6.QtWidgets import (
     QColorDialog,
 )
 
-from app_common.preview_canvas import PreviewCanvas, PreviewWithStatusBar
+from app_common.preview_canvas import PreviewWithStatusBar
 from birdstamp.gui import editor_core, editor_options, editor_template, editor_utils
+from birdstamp.gui.editor_preview_canvas import (
+    EditorPreviewCanvas,
+    EditorPreviewOverlayOptions,
+    EditorPreviewOverlayState,
+)
 
 # ---------------------------------------------------------------------------
 # Local aliases (mirrors the pattern used in editor.py)
@@ -81,10 +86,15 @@ _normalize_center_mode = editor_core.normalize_center_mode
 _parse_bool_value = editor_core.parse_bool_value
 _parse_ratio_value = editor_core.parse_ratio_value
 _parse_padding_value = editor_core.parse_padding_value
-_apply_full_crop = editor_core.apply_full_crop
+_compute_crop_plan = editor_core.compute_crop_plan
+_extract_focus_box = editor_core.extract_focus_box
+_transform_source_box_after_crop_padding = editor_core.transform_source_box_after_crop_padding
+_detect_primary_bird_box = editor_core.detect_primary_bird_box
+_pad_image = editor_core.pad_image
 _resize_fit = editor_core.resize_fit
 _build_metadata_context = editor_utils.build_metadata_context
 _default_placeholder_path = editor_utils._default_placeholder_path
+_DEFAULT_CROP_EFFECT_ALPHA = editor_utils.DEFAULT_CROP_EFFECT_ALPHA
 
 _BANNER_BACKGROUND_STYLE_SOLID = editor_template.BANNER_BACKGROUND_STYLE_SOLID
 _BANNER_BACKGROUND_STYLE_GRADIENT_BOTTOM = editor_template.BANNER_BACKGROUND_STYLE_GRADIENT_BOTTOM
@@ -107,6 +117,7 @@ _load_template_payload = editor_template.load_template_payload
 _save_template_payload = editor_template.save_template_payload
 _default_template_payload = editor_template.default_template_payload
 render_template_overlay = editor_template.render_template_overlay
+render_template_overlay_in_crop_region = editor_template.render_template_overlay_in_crop_region
 
 
 def _pil_to_qpixmap(image: Image.Image) -> QPixmap:
@@ -610,6 +621,9 @@ class TemplateManagerDialog(QDialog):
         with stat_span("tmpl_placeholder"):
             self.placeholder = placeholder.copy() if placeholder else _build_placeholder_image()
         self.preview_pixmap: QPixmap | None = None
+        self.preview_focus_box: tuple[float, float, float, float] | None = None
+        self.preview_bird_box: tuple[float, float, float, float] | None = None
+        self.preview_crop_effect_box: tuple[float, float, float, float] | None = None
 
         self.template_paths: dict[str, Path] = {}
         self.current_template_name: str | None = None
@@ -623,6 +637,8 @@ class TemplateManagerDialog(QDialog):
         self._preview_source_image: "Image.Image | None" = None
         self._preview_raw_metadata: dict[str, Any] = {}
         self._preview_metadata_context: dict[str, str] = {}
+        self._preview_bird_box_cache: tuple[float, float, float, float] | None = None
+        self._preview_bird_box_cache_ready: bool = False
         with stat_span("tmpl_load_preview_source"):
             self._load_preview_source()
 
@@ -754,10 +770,48 @@ class TemplateManagerDialog(QDialog):
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(8)
 
+        preview_toolbar = QHBoxLayout()
+        preview_toolbar.setContentsMargins(0, 0, 0, 0)
+        preview_toolbar.setSpacing(8)
+
+        self.show_crop_effect_check = QCheckBox("显示裁切效果")
+        self.show_crop_effect_check.setChecked(True)
+        self.show_crop_effect_check.toggled.connect(self._on_preview_overlay_toggled)
+        preview_toolbar.addWidget(self.show_crop_effect_check)
+
+        self.crop_effect_alpha_label = QLabel("Alpha")
+        preview_toolbar.addWidget(self.crop_effect_alpha_label)
+
+        self.crop_effect_alpha_slider = QSlider(Qt.Orientation.Horizontal)
+        self.crop_effect_alpha_slider.setRange(0, 255)
+        self.crop_effect_alpha_slider.setSingleStep(1)
+        self.crop_effect_alpha_slider.setPageStep(16)
+        self.crop_effect_alpha_slider.setValue(_DEFAULT_CROP_EFFECT_ALPHA)
+        self.crop_effect_alpha_slider.setFixedWidth(120)
+        self.crop_effect_alpha_slider.valueChanged.connect(self._on_preview_crop_effect_alpha_changed)
+        preview_toolbar.addWidget(self.crop_effect_alpha_slider)
+
+        self.crop_effect_alpha_value_label = QLabel(str(_DEFAULT_CROP_EFFECT_ALPHA))
+        self.crop_effect_alpha_value_label.setMinimumWidth(28)
+        preview_toolbar.addWidget(self.crop_effect_alpha_value_label)
+
+        self.show_focus_box_check = QCheckBox("显示对焦点")
+        self.show_focus_box_check.setChecked(True)
+        self.show_focus_box_check.toggled.connect(self._on_preview_overlay_toggled)
+        preview_toolbar.addWidget(self.show_focus_box_check)
+
+        self.show_bird_box_check = QCheckBox("显示鸟体框")
+        self.show_bird_box_check.setChecked(True)
+        self.show_bird_box_check.toggled.connect(self._on_preview_overlay_toggled)
+        preview_toolbar.addWidget(self.show_bird_box_check)
+
+        preview_toolbar.addStretch(1)
+        layout.addLayout(preview_toolbar)
+
         preview_group = QGroupBox("预览")
         preview_layout = QVBoxLayout(preview_group)
         self.preview_label = PreviewWithStatusBar(
-            canvas=PreviewCanvas(placeholder_text="暂无预览"),
+            canvas=EditorPreviewCanvas(placeholder_text="暂无预览"),
         )
         preview_layout.addWidget(self.preview_label, stretch=1)
         layout.addWidget(preview_group, stretch=1)
@@ -1815,15 +1869,49 @@ class TemplateManagerDialog(QDialog):
         self.current_payload = payload
         _save_template_payload(path, payload)
 
+    def _build_preview_overlay_options(self) -> EditorPreviewOverlayOptions:
+        return EditorPreviewOverlayOptions(
+            show_focus_box=bool(self.show_focus_box_check.isChecked()),
+            show_bird_box=bool(self.show_bird_box_check.isChecked()),
+            show_crop_effect=bool(self.show_crop_effect_check.isChecked()),
+            crop_effect_alpha=int(self.crop_effect_alpha_slider.value()),
+        )
+
+    def _apply_preview_overlay_options(self) -> None:
+        self.preview_label.apply_overlay_options(self._build_preview_overlay_options())
+
+    def _on_preview_overlay_toggled(self, _checked: bool) -> None:
+        self._apply_preview_overlay_options()
+
+    def _on_preview_crop_effect_alpha_changed(self, value: int) -> None:
+        alpha = max(0, min(255, int(value)))
+        self.crop_effect_alpha_value_label.setText(str(alpha))
+        self._apply_preview_overlay_options()
+
+    def _preview_source_bird_box(self) -> tuple[float, float, float, float] | None:
+        if self._preview_bird_box_cache_ready:
+            return self._preview_bird_box_cache
+        self._preview_bird_box_cache_ready = True
+        if self._preview_source_image is None:
+            self._preview_bird_box_cache = None
+            return None
+        try:
+            self._preview_bird_box_cache = _detect_primary_bird_box(self._preview_source_image)
+        except Exception:
+            self._preview_bird_box_cache = None
+        return self._preview_bird_box_cache
+
     # ------------------------------------------------------------------
     # Preview
     # ------------------------------------------------------------------
 
     def _refresh_preview(self) -> None:
         source = (self._preview_source_image or self.placeholder).copy()
-        if not self.current_payload:
-            image = source
-        else:
+        image = source
+        crop_box: tuple[float, float, float, float] | None = None
+        outer_pad: tuple[int, int, int, int] = (0, 0, 0, 0)
+
+        if self.current_payload:
             ratio = _parse_ratio_value(self.current_payload.get("ratio"))
             center_mode = _normalize_center_mode(
                 str(self.current_payload.get("center_mode") or _DEFAULT_TEMPLATE_CENTER_MODE)
@@ -1838,7 +1926,7 @@ class TemplateManagerDialog(QDialog):
             inner_left = _parse_padding_value(self.current_payload.get("crop_padding_left"), 0)
             inner_right = _parse_padding_value(self.current_payload.get("crop_padding_right"), 0)
 
-            source = _apply_full_crop(
+            crop_box, outer_pad = _compute_crop_plan(
                 source,
                 self._preview_raw_metadata,
                 ratio=ratio,
@@ -1848,27 +1936,70 @@ class TemplateManagerDialog(QDialog):
                 inner_bottom=inner_bottom,
                 inner_left=inner_left,
                 inner_right=inner_right,
-                # 模板编辑预览固定按原图尺寸渲染，避免 Banner 设计时因预览缩放产生偏差
-                max_long_edge=0,
-                fill_color=fill_color,
             )
+            pad_top, pad_bottom, pad_left, pad_right = outer_pad
+            if pad_top or pad_bottom or pad_left or pad_right:
+                source = _pad_image(
+                    source,
+                    top=pad_top,
+                    bottom=pad_bottom,
+                    left=pad_left,
+                    right=pad_right,
+                    fill=fill_color,
+                )
 
-            image = render_template_overlay(
+            # 与主编辑器预览一致：保留完整画面，仅在裁切区域渲染模板效果；
+            # 裁切范围通过 EditorPreviewCanvas 的 crop-effect overlay 显示。
+            image = render_template_overlay_in_crop_region(
                 source,
                 raw_metadata=self._preview_raw_metadata,
                 metadata_context=self._preview_metadata_context,
                 template_payload=self.current_payload,
+                crop_box=crop_box,
             )
 
+        source_width, source_height = (self._preview_source_image or self.placeholder).size
+        pad_top, pad_bottom, pad_left, pad_right = outer_pad
+        self.preview_focus_box = _transform_source_box_after_crop_padding(
+            _extract_focus_box(self._preview_raw_metadata, source_width, source_height),
+            crop_box=None,
+            source_width=source_width,
+            source_height=source_height,
+            pt=pad_top,
+            pb=pad_bottom,
+            pl=pad_left,
+            pr=pad_right,
+        )
+        self.preview_bird_box = _transform_source_box_after_crop_padding(
+            self._preview_source_bird_box(),
+            crop_box=None,
+            source_width=source_width,
+            source_height=source_height,
+            pt=pad_top,
+            pb=pad_bottom,
+            pl=pad_left,
+            pr=pad_right,
+        )
+        self.preview_crop_effect_box = crop_box
         self.preview_pixmap = _pil_to_qpixmap(image)
         self._refresh_preview_label()
 
     def _refresh_preview_label(self) -> None:
-        if not self.preview_pixmap:
+        self._apply_preview_overlay_options()
+
+        if self.preview_pixmap is None or self.preview_pixmap.isNull():
+            self.preview_label.apply_overlay_state(EditorPreviewOverlayState())
             self.preview_label.set_original_size(None, None)
             self.preview_label.set_source_mode("")
             self.preview_label.set_source_pixmap(None)
             return
+        self.preview_label.apply_overlay_state(
+            EditorPreviewOverlayState(
+                focus_box=self.preview_focus_box,
+                bird_box=self.preview_bird_box,
+                crop_effect_box=self.preview_crop_effect_box,
+            )
+        )
         if self._preview_source_image is not None:
             w, h = self._preview_source_image.size
             self.preview_label.set_original_size(w, h)
