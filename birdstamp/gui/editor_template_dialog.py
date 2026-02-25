@@ -88,6 +88,7 @@ _parse_ratio_value = editor_core.parse_ratio_value
 _parse_padding_value = editor_core.parse_padding_value
 _compute_crop_plan = editor_core.compute_crop_plan
 _extract_focus_box = editor_core.extract_focus_box
+_resolve_focus_camera_type_from_metadata = editor_core.resolve_focus_camera_type_from_metadata
 _transform_source_box_after_crop_padding = editor_core.transform_source_box_after_crop_padding
 _detect_primary_bird_box = editor_core.detect_primary_bird_box
 _pad_image = editor_core.pad_image
@@ -116,7 +117,6 @@ _list_template_names = editor_template.list_template_names
 _load_template_payload = editor_template.load_template_payload
 _save_template_payload = editor_template.save_template_payload
 _default_template_payload = editor_template.default_template_payload
-render_template_overlay = editor_template.render_template_overlay
 render_template_overlay_in_crop_region = editor_template.render_template_overlay_in_crop_region
 
 
@@ -621,9 +621,7 @@ class TemplateManagerDialog(QDialog):
         with stat_span("tmpl_placeholder"):
             self.placeholder = placeholder.copy() if placeholder else _build_placeholder_image()
         self.preview_pixmap: QPixmap | None = None
-        self.preview_focus_box: tuple[float, float, float, float] | None = None
-        self.preview_bird_box: tuple[float, float, float, float] | None = None
-        self.preview_crop_effect_box: tuple[float, float, float, float] | None = None
+        self.preview_overlay_state = EditorPreviewOverlayState()
 
         self.template_paths: dict[str, Path] = {}
         self.current_template_name: str | None = None
@@ -1910,6 +1908,7 @@ class TemplateManagerDialog(QDialog):
         image = source
         crop_box: tuple[float, float, float, float] | None = None
         outer_pad: tuple[int, int, int, int] = (0, 0, 0, 0)
+        focus_camera_type = _resolve_focus_camera_type_from_metadata(self._preview_raw_metadata)
 
         if self.current_payload:
             ratio = _parse_ratio_value(self.current_payload.get("ratio"))
@@ -1931,6 +1930,7 @@ class TemplateManagerDialog(QDialog):
                 self._preview_raw_metadata,
                 ratio=ratio,
                 center_mode=center_mode,
+                camera_type=focus_camera_type,
                 auto_crop_by_bird=auto_crop,
                 inner_top=inner_top,
                 inner_bottom=inner_bottom,
@@ -1960,8 +1960,13 @@ class TemplateManagerDialog(QDialog):
 
         source_width, source_height = (self._preview_source_image or self.placeholder).size
         pad_top, pad_bottom, pad_left, pad_right = outer_pad
-        self.preview_focus_box = _transform_source_box_after_crop_padding(
-            _extract_focus_box(self._preview_raw_metadata, source_width, source_height),
+        preview_focus_box = _transform_source_box_after_crop_padding(
+            _extract_focus_box(
+                self._preview_raw_metadata,
+                source_width,
+                source_height,
+                camera_type=focus_camera_type,
+            ),
             crop_box=None,
             source_width=source_width,
             source_height=source_height,
@@ -1970,7 +1975,7 @@ class TemplateManagerDialog(QDialog):
             pl=pad_left,
             pr=pad_right,
         )
-        self.preview_bird_box = _transform_source_box_after_crop_padding(
+        preview_bird_box = _transform_source_box_after_crop_padding(
             self._preview_source_bird_box(),
             crop_box=None,
             source_width=source_width,
@@ -1980,7 +1985,11 @@ class TemplateManagerDialog(QDialog):
             pl=pad_left,
             pr=pad_right,
         )
-        self.preview_crop_effect_box = crop_box
+        self.preview_overlay_state = EditorPreviewOverlayState(
+            focus_box=preview_focus_box,
+            bird_box=preview_bird_box,
+            crop_effect_box=crop_box,
+        )
         self.preview_pixmap = _pil_to_qpixmap(image)
         self._refresh_preview_label()
 
@@ -1993,13 +2002,7 @@ class TemplateManagerDialog(QDialog):
             self.preview_label.set_source_mode("")
             self.preview_label.set_source_pixmap(None)
             return
-        self.preview_label.apply_overlay_state(
-            EditorPreviewOverlayState(
-                focus_box=self.preview_focus_box,
-                bird_box=self.preview_bird_box,
-                crop_effect_box=self.preview_crop_effect_box,
-            )
-        )
+        self.preview_label.apply_overlay_state(self.preview_overlay_state)
         if self._preview_source_image is not None:
             w, h = self._preview_source_image.size
             self.preview_label.set_original_size(w, h)

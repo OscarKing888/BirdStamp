@@ -23,6 +23,7 @@ _safe_color                         = editor_utils.safe_color
 _build_metadata_context             = editor_utils.build_metadata_context
 _default_placeholder_path           = editor_utils._default_placeholder_path
 _extract_focus_box                  = editor_core.extract_focus_box
+_resolve_focus_camera_type_from_metadata = editor_core.resolve_focus_camera_type_from_metadata
 _transform_source_box_after_crop_padding = editor_core.transform_source_box_after_crop_padding
 _normalize_center_mode              = editor_core.normalize_center_mode
 _parse_bool_value                   = editor_core.parse_bool_value
@@ -165,7 +166,13 @@ class _BirdStampRendererMixin:
             return None
 
         source_width, source_height = self.current_source_image.size
-        focus_box_source = _extract_focus_box(self.current_raw_metadata, source_width, source_height)
+        focus_camera_type = _resolve_focus_camera_type_from_metadata(self.current_raw_metadata)
+        focus_box_source = _extract_focus_box(
+            self.current_raw_metadata,
+            source_width,
+            source_height,
+            camera_type=focus_camera_type,
+        )
         if focus_box_source is None:
             return None
 
@@ -232,10 +239,7 @@ class _BirdStampRendererMixin:
         self.current_raw_metadata = {}
         self.current_metadata_context = {}
         self.preview_pixmap = _pil_to_qpixmap(self.placeholder)
-        self.preview_focus_box = None
-        self.preview_focus_box_original = None
-        self.preview_bird_box = None
-        self.preview_crop_effect_box = None
+        self.preview_overlay_state = EditorPreviewOverlayState()
         self._invalidate_original_mode_cache()
         self._refresh_preview_label(reset_view=True)
 
@@ -249,17 +253,10 @@ class _BirdStampRendererMixin:
         self._apply_preview_overlay_options_from_ui()
 
         display_pixmap: QPixmap | None = self.preview_pixmap
-        crop_effect_box = self.preview_crop_effect_box if self.preview_pixmap else None
-        focus_box = self.preview_focus_box if self.preview_pixmap else None
-        bird_box = self.preview_bird_box if self.preview_pixmap else None
         source_mode = "原图"
 
         self.preview_label.apply_overlay_state(
-            EditorPreviewOverlayState(
-                focus_box=focus_box,
-                bird_box=bird_box,
-                crop_effect_box=crop_effect_box,
-            )
+            self.preview_overlay_state if self.preview_pixmap else EditorPreviewOverlayState()
         )
         if self.current_source_image is not None:
             self.preview_label.set_original_size(self.current_source_image.size[0], self.current_source_image.size[1])
@@ -645,18 +642,21 @@ class _BirdStampRendererMixin:
                 crop_box=crop_box,
             )
         except Exception as exc:
-            self.preview_focus_box = None
-            self.preview_focus_box_original = None
-            self.preview_bird_box = None
-            self.preview_crop_effect_box = None
+            self.preview_overlay_state = EditorPreviewOverlayState()
             self._show_error("预览失败", str(exc))
             self._set_status(f"预览失败: {exc}")
             return
 
         self.last_rendered = rendered
         pad_top, pad_bottom, pad_left, pad_right = outer_pad
-        self.preview_focus_box = _transform_source_box_after_crop_padding(
-            _extract_focus_box(raw_metadata, self.current_source_image.width, self.current_source_image.height),
+        focus_camera_type = _resolve_focus_camera_type_from_metadata(raw_metadata)
+        preview_focus_box = _transform_source_box_after_crop_padding(
+            _extract_focus_box(
+                raw_metadata,
+                self.current_source_image.width,
+                self.current_source_image.height,
+                camera_type=focus_camera_type,
+            ),
             crop_box=None,
             source_width=self.current_source_image.width,
             source_height=self.current_source_image.height,
@@ -665,8 +665,7 @@ class _BirdStampRendererMixin:
             pl=pad_left,
             pr=pad_right,
         )
-        self.preview_focus_box_original = self.preview_focus_box
-        self.preview_bird_box = _transform_source_box_after_crop_padding(
+        preview_bird_box = _transform_source_box_after_crop_padding(
             self._bird_box_for_path(self.current_path, source_image=self.current_source_image),
             crop_box=None,
             source_width=self.current_source_image.width,
@@ -676,8 +675,11 @@ class _BirdStampRendererMixin:
             pl=pad_left,
             pr=pad_right,
         )
-
-        self.preview_crop_effect_box = crop_box
+        self.preview_overlay_state = EditorPreviewOverlayState(
+            focus_box=preview_focus_box,
+            bird_box=preview_bird_box,
+            crop_effect_box=crop_box,
+        )
 
         self.preview_pixmap = _pil_to_qpixmap(rendered)
         fit_reset = self._pending_preview_fit_reset

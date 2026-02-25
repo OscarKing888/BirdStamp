@@ -93,7 +93,7 @@ from birdstamp.gui.editor_template_dialog import (
     TemplateManagerDialog,
 )
 from app_common.preview_canvas import PreviewWithStatusBar
-from birdstamp.gui.editor_preview_canvas import EditorPreviewCanvas
+from birdstamp.gui.editor_preview_canvas import EditorPreviewCanvas, EditorPreviewOverlayState
 from birdstamp.gui.editor_photo_list import PhotoListWidget
 from birdstamp.gui.editor_crop_calculator import _BirdStampCropMixin
 from birdstamp.gui.editor_renderer import _BirdStampRendererMixin
@@ -231,10 +231,7 @@ class BirdStampEditorWindow(QMainWindow, _BirdStampCropMixin, _BirdStampRenderer
         self.current_template_payload: dict[str, Any] = _default_template_payload(name="default")
 
         self.preview_pixmap: QPixmap | None = None
-        self.preview_focus_box: tuple[float, float, float, float] | None = None
-        self.preview_focus_box_original: tuple[float, float, float, float] | None = None
-        self.preview_bird_box: tuple[float, float, float, float] | None = None
-        self.preview_crop_effect_box: tuple[float, float, float, float] | None = None
+        self.preview_overlay_state = EditorPreviewOverlayState()
         self._original_mode_pixmap: QPixmap | None = None
         self._original_mode_signature: str | None = None
         self._bird_box_cache: dict[str, tuple[float, float, float, float] | None] = {}

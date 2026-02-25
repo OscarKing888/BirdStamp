@@ -28,6 +28,7 @@ _transform_source_box_after_crop_padding = editor_core.transform_source_box_afte
 _detect_primary_bird_box            = editor_core.detect_primary_bird_box
 _get_bird_detector_error_message    = editor_core.get_bird_detector_error_message
 _extract_focus_point                = editor_core.get_focus_point
+_resolve_focus_camera_type_from_metadata = editor_core.resolve_focus_camera_type_from_metadata
 _CENTER_MODE_BIRD                   = editor_core.CENTER_MODE_BIRD
 _CENTER_MODE_FOCUS                  = editor_core.CENTER_MODE_FOCUS
 _CENTER_MODE_IMAGE                  = editor_core.CENTER_MODE_IMAGE
@@ -98,7 +99,13 @@ class _BirdStampCropMixin:
         raw_metadata: dict[str, Any],
         center_mode: str,
     ) -> tuple[tuple[float, float], tuple[float, float, float, float] | None]:
-        focus_point = _extract_focus_point(raw_metadata, image.width, image.height)
+        focus_camera_type = _resolve_focus_camera_type_from_metadata(raw_metadata)
+        focus_point = _extract_focus_point(
+            raw_metadata,
+            image.width,
+            image.height,
+            camera_type=focus_camera_type,
+        )
         bird_box: tuple[float, float, float, float] | None = None
         if path is not None:
             bird_box = self._bird_box_for_path(path, source_image=image)

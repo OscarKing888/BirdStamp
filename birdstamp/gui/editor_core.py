@@ -10,6 +10,13 @@ from pathlib import Path
 from typing import Any
 
 from PIL import Image, ImageColor, ImageOps
+from app_common.focus_calc import (
+    CameraFocusType,
+    extract_focus_box as _extract_focus_box_by_camera_type,
+    get_focus_point as _get_focus_point_by_camera_type,
+    resolve_focus_camera_type as _resolve_focus_camera_type,
+    resolve_focus_camera_type_from_metadata as _resolve_focus_camera_type_from_metadata,
+)
 
 # Center mode constants (used by CLI and GUI)
 CENTER_MODE_IMAGE = "image"
@@ -270,9 +277,14 @@ def _extract_focus_frame_size(value: Any) -> tuple[float, float] | None:
     return (float(width), float(height))
 
 
-def get_focus_point(raw: dict[str, Any], width: int, height: int) -> tuple[float, float] | None:
+def get_focus_point(
+    raw: dict[str, Any],
+    width: int,
+    height: int,
+    camera_type: CameraFocusType | str | None = None,
+) -> tuple[float, float] | None:
     """Return normalized (x,y) focus point from metadata, or None."""
-    return _extract_focus_point_impl(raw, width, height)
+    return _get_focus_point_by_camera_type(raw, width, height, camera_type=camera_type)
 
 
 def _extract_focus_point_impl(raw: dict[str, Any], width: int, height: int) -> tuple[float, float] | None:
@@ -306,9 +318,24 @@ def _extract_focus_point_impl(raw: dict[str, Any], width: int, height: int) -> t
     return None
 
 
-def _extract_focus_point(raw: dict[str, Any], width: int, height: int) -> tuple[float, float] | None:
+def _extract_focus_point(
+    raw: dict[str, Any],
+    width: int,
+    height: int,
+    camera_type: CameraFocusType | str | None = None,
+) -> tuple[float, float] | None:
     """Alias for backward compatibility in editor_core internals."""
-    return _extract_focus_point_impl(raw, width, height)
+    return _get_focus_point_by_camera_type(raw, width, height, camera_type=camera_type)
+
+
+def resolve_focus_camera_type(camera_model: Any, *, camera_make: Any = None) -> CameraFocusType:
+    """Public alias for app_common focus camera-type resolver."""
+    return _resolve_focus_camera_type(camera_model, camera_make=camera_make)
+
+
+def resolve_focus_camera_type_from_metadata(raw: dict[str, Any]) -> CameraFocusType:
+    """Public alias for app_common metadata -> focus camera-type resolver."""
+    return _resolve_focus_camera_type_from_metadata(raw)
 
 
 def _normalize_focus_span(value: float | None, full_size: int, fallback: float) -> float:
@@ -373,65 +400,13 @@ def _focus_box_from_numbers(
     return _focus_box_from_center(center_x, center_y, span_x, span_y)
 
 
-def extract_focus_box(raw: dict[str, Any], width: int, height: int) -> tuple[float, float, float, float] | None:
-    if width <= 0 or height <= 0:
-        return None
-    lookup = normalize_lookup(raw)
-    focus_frame_span_px: tuple[float, float] | None = None
-    for key in ("focusframesize", "focusframesize2"):
-        if key not in lookup:
-            continue
-        parsed = _extract_focus_frame_size(lookup[key])
-        if parsed is not None:
-            focus_frame_span_px = parsed
-            break
-    subject_area = lookup.get("subjectarea")
-    if subject_area is not None:
-        box = _focus_box_from_numbers(_extract_numbers(subject_area), width, height, fallback_span_px=focus_frame_span_px)
-        if box is not None:
-            return box
-    box_key_groups = [
-        ("composite:focusx", "composite:focusy", "composite:focusw", "composite:focush"),
-        ("focusx", "focusy", "focusw", "focush"),
-        (
-            "regioninfo:regionsregionlistregionareax",
-            "regioninfo:regionsregionlistregionareay",
-            "regioninfo:regionsregionlistregionareaw",
-            "regioninfo:regionsregionlistregionareah",
-        ),
-        ("regionareax", "regionareay", "regionareaw", "regionareah"),
-    ]
-    for x_key, y_key, w_key, h_key in box_key_groups:
-        if x_key not in lookup or y_key not in lookup:
-            continue
-        xs = _extract_numbers(lookup[x_key])
-        ys = _extract_numbers(lookup[y_key])
-        if not xs or not ys:
-            continue
-        nums = [xs[0], ys[0]]
-        ws = _extract_numbers(lookup.get(w_key))
-        hs = _extract_numbers(lookup.get(h_key))
-        if ws and hs:
-            nums.extend([ws[0], hs[0]])
-        box = _focus_box_from_numbers(nums, width, height, fallback_span_px=focus_frame_span_px)
-        if box is not None:
-            return box
-    for key in ("subjectlocation", "focuslocation", "focuslocation2", "afpoint"):
-        if key not in lookup:
-            continue
-        box = _focus_box_from_numbers(_extract_numbers(lookup[key]), width, height, fallback_span_px=focus_frame_span_px)
-        if box is not None:
-            return box
-    focus_point = _extract_focus_point(raw, width, height)
-    if focus_point is None:
-        return None
-    default_side_px = max(24.0, min(width, height) * DEFAULT_FOCUS_BOX_SHORT_EDGE_RATIO)
-    return _focus_box_from_center(
-        focus_point[0],
-        focus_point[1],
-        default_side_px / float(width),
-        default_side_px / float(height),
-    )
+def extract_focus_box(
+    raw: dict[str, Any],
+    width: int,
+    height: int,
+    camera_type: CameraFocusType | str | None = None,
+) -> tuple[float, float, float, float] | None:
+    return _extract_focus_box_by_camera_type(raw, width, height, camera_type=camera_type)
 
 
 def transform_focus_box_after_crop(
@@ -1026,6 +1001,7 @@ def compute_crop_plan(
     *,
     ratio: float | None,
     center_mode: str,
+    camera_type: CameraFocusType | str | None = None,
     auto_crop_by_bird: bool = True,
     inner_top: int = 0,
     inner_bottom: int = 0,
@@ -1046,7 +1022,7 @@ def compute_crop_plan(
     keep_box: tuple[float, float, float, float] | None = None
 
     # Resolve anchor and keep_box
-    focus_point = get_focus_point(raw_metadata, w, h)
+    focus_point = get_focus_point(raw_metadata, w, h, camera_type=camera_type)
     bird_box: tuple[float, float, float, float] | None = None
     try:
         bird_box = detect_primary_bird_box(image)
@@ -1118,6 +1094,7 @@ def apply_full_crop(
     *,
     ratio: float | None,
     center_mode: str,
+    camera_type: CameraFocusType | str | None = None,
     auto_crop_by_bird: bool = True,
     inner_top: int = 0,
     inner_bottom: int = 0,
@@ -1136,6 +1113,7 @@ def apply_full_crop(
         image, raw_metadata,
         ratio=ratio,
         center_mode=center_mode,
+        camera_type=camera_type,
         auto_crop_by_bird=auto_crop_by_bird,
         inner_top=inner_top,
         inner_bottom=inner_bottom,
@@ -1159,6 +1137,7 @@ def apply_editor_crop(
     raw_metadata: dict[str, Any],
     ratio: float | None,
     center_mode: str,
+    camera_type: CameraFocusType | str | None = None,
     crop_padding_px: int = DEFAULT_CROP_PADDING_PX,
     max_long_edge: int = 0,
     fill_color: str = "#FFFFFF",
@@ -1173,7 +1152,7 @@ def apply_editor_crop(
     keep_box: tuple[float, float, float, float] | None = None
 
     if center_mode == CENTER_MODE_FOCUS:
-        focus_box = extract_focus_box(raw_metadata, w, h)
+        focus_box = extract_focus_box(raw_metadata, w, h, camera_type=camera_type)
         if focus_box is not None:
             if ratio is not None and ratio > 0:
                 focus_box = transform_focus_box_after_crop(
