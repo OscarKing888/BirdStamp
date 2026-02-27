@@ -400,6 +400,62 @@ def get_fallback_context_vars() -> list[tuple[str, str]]:
     return _fallback_context_vars_from_cfg(data)
 
 
+# ReportDB 中用于模板「数据源/字段」下拉的非路径列及展示标签（与 app_common.report_db.PHOTO_COLUMNS 对齐）
+_REPORT_DB_PATH_COLUMNS = frozenset({
+    "original_path", "current_path", "temp_jpeg_path", "debug_crop_path", "yolo_debug_path",
+})
+_REPORT_DB_FIELD_OPTIONS: list[tuple[str, str]] = [
+    ("filename", "文件名"),
+    ("bird_species_cn", "鸟种中文名"),
+    ("bird_species_en", "鸟种英文名"),
+    ("birdid_confidence", "鸟种识别置信度"),
+    ("date_time_original", "拍摄时间"),
+    ("title", "标题"),
+    ("caption", "说明"),
+    ("city", "城市"),
+    ("state_province", "省/州"),
+    ("country", "国家"),
+    ("exposure_status", "曝光状态"),
+    ("iso", "ISO"),
+    ("shutter_speed", "快门速度"),
+    ("aperture", "光圈"),
+    ("focal_length", "焦距"),
+    ("focal_length_35mm", "35mm 等效焦距"),
+    ("camera_model", "相机型号"),
+    ("lens_model", "镜头型号"),
+    ("gps_latitude", "GPS 纬度"),
+    ("gps_longitude", "GPS 经度"),
+    ("gps_altitude", "GPS 海拔"),
+    ("has_bird", "有鸟"),
+    ("confidence", "置信度"),
+    ("rating", "评分"),
+    ("focus_status", "对焦状态"),
+    ("created_at", "创建时间"),
+    ("updated_at", "更新时间"),
+]
+# 仅保留非路径列（供 get_template_context_field_options 与 template_context 使用）
+REPORT_DB_NON_PATH_FIELD_OPTIONS: list[tuple[str, str]] = [
+    (col, label) for col, label in _REPORT_DB_FIELD_OPTIONS
+    if col not in _REPORT_DB_PATH_COLUMNS
+]
+
+
+def get_template_context_field_options() -> list[tuple[str, str, str]]:
+    """返回统一「数据源/字段」选项列表，供模板编辑下拉使用。
+
+    每项为 (data_source, key, display_label)。
+    - data_source: "metadata" | "report_db"
+    - metadata 时 key 为占位符表达式如 "{bird}"
+    - report_db 时 key 为列名如 "bird_species_en"
+    """
+    result: list[tuple[str, str, str]] = []
+    for expr, label in get_fallback_context_vars():
+        result.append(("metadata", expr, label))
+    for col, label in REPORT_DB_NON_PATH_FIELD_OPTIONS:
+        result.append(("report_db", col, label))
+    return result
+
+
 def pil_to_qpixmap(image: Image.Image) -> QPixmap:
     """Convert a PIL Image to a QPixmap (RGBA round-trip)."""
     rgba = image.convert("RGBA")

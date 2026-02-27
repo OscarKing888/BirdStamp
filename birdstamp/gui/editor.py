@@ -86,6 +86,7 @@ from birdstamp.gui import editor_core
 from birdstamp.gui import editor_options
 from birdstamp.gui import editor_template
 from birdstamp.gui import editor_utils
+from birdstamp.gui import template_context as _template_context
 from birdstamp.gui.editor_template_dialog import (
     _CropPaddingEditorWidget,
     _GradientBarWidget,  # noqa: F401  (re-exported for compat)
@@ -98,6 +99,7 @@ from birdstamp.gui.editor_photo_list import PhotoListWidget
 from birdstamp.gui.editor_crop_calculator import _BirdStampCropMixin
 from birdstamp.gui.editor_renderer import _BirdStampRendererMixin
 from birdstamp.gui.editor_exporter import _BirdStampExporterMixin
+from app_common.report_db import ReportDB
 
 # Re-export / aliases for refactored symbols (used below)
 ALIGN_OPTIONS_VERTICAL = editor_utils.ALIGN_OPTIONS_VERTICAL
@@ -188,6 +190,46 @@ _normalize_template_field = editor_template.normalize_template_field
 _deep_copy_payload = editor_template.deep_copy_payload
 
 
+class _ReportDBListWidget(QListWidget):
+    """支持拖放 report.db 文件的列表控件。"""
+
+    def __init__(self, owner, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._owner = owner
+        self.setAcceptDrops(True)
+
+    def dragEnterEvent(self, event) -> None:  # type: ignore[override]
+        if event.mimeData() and event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event) -> None:  # type: ignore[override]
+        if event.mimeData() and event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event) -> None:  # type: ignore[override]
+        mime = event.mimeData()
+        if not mime or not mime.hasUrls():
+            event.ignore()
+            return
+        paths: list[Path] = []
+        for url in mime.urls():
+            try:
+                if url.isLocalFile():
+                    paths.append(Path(url.toLocalFile()))
+            except Exception:
+                continue
+        if paths and hasattr(self._owner, "_add_report_db_paths"):
+            try:
+                self._owner._add_report_db_paths(paths)
+            except Exception:
+                pass
+        event.acceptProposedAction()
+
+
 def _app_icon_paths() -> tuple[Path, Path]:
     """返回 (窗口用图标路径, AppInfoBar 用 PNG 路径)。窗口优先 .ico/.icns，否则 .png。"""
     try:
@@ -229,6 +271,10 @@ class BirdStampEditorWindow(QMainWindow, _BirdStampCropMixin, _BirdStampRenderer
         self.template_paths: dict[str, Path] = {}
         self.current_template_payload: dict[str, Any] = _default_template_payload(name="default")
 
+        # ReportDB 相关：多库列表 + 行缓存（stem → row）
+        self._report_db_entries: list[Path] = []
+        self._report_db_cache: dict[str, dict[str, Any]] = {}
+
         self.preview_pixmap: QPixmap | None = None
         self.preview_overlay_state = EditorPreviewOverlayState()
         self._original_mode_pixmap: QPixmap | None = None
@@ -265,6 +311,126 @@ class BirdStampEditorWindow(QMainWindow, _BirdStampCropMixin, _BirdStampRenderer
 
         if startup_file:
             self._add_photo_paths([startup_file])
+
+        # 初始化 report.db 行解析器（无缓存时返回 None）
+        self._update_report_db_row_resolver()
+
+    # ------------------------------------------------------------------
+    # ReportDB 列表与缓存
+    # ------------------------------------------------------------------
+
+    def _update_report_db_row_resolver(self) -> None:
+        """根据当前缓存更新模板上下文中的 report.db 行解析函数。"""
+
+        cache = self._report_db_cache
+
+        if not cache:
+            _template_context.set_report_db_row_resolver(None)
+            return
+
+        def _resolver(path: Path) -> dict[str, Any] | None:
+            try:
+                stem = path.stem
+            except Exception:
+                return None
+            return cache.get(stem)
+
+        _template_context.set_report_db_row_resolver(_resolver)
+
+    def _rebuild_report_db_cache(self) -> None:
+        """根据当前 report.db 列表重建行缓存，并更新 provider 解析器。"""
+        cache: dict[str, dict[str, Any]] = {}
+        for db_path in self._report_db_entries:
+            try:
+                p = db_path
+                if p.name.lower() == "report.db" and p.parent.name == ".superpicky":
+                    directory = p.parent.parent
+                else:
+                    directory = p.parent
+            except Exception:
+                continue
+            try:
+                db = ReportDB.open_if_exists(str(directory))
+            except Exception:
+                continue
+            if not db:
+                continue
+            try:
+                for row in db.get_all_photos():
+                    try:
+                        stem = str(row.get("filename") or "").strip()
+                    except Exception:
+                        continue
+                    if not stem:
+                        continue
+                    if stem in cache:
+                        continue
+                    cache[stem] = dict(row)
+            finally:
+                try:
+                    db.close()
+                except Exception:
+                    pass
+        self._report_db_cache = cache
+        self._update_report_db_row_resolver()
+
+    def _add_report_db_paths(self, paths: Iterable[Path]) -> None:
+        """将一个或多个 report.db 文件路径加入列表并重建缓存。"""
+        added = 0
+        existing: set[Path] = set(self._report_db_entries)
+        for incoming in paths:
+            try:
+                p = incoming if isinstance(incoming, Path) else Path(str(incoming))
+            except Exception:
+                continue
+            try:
+                p = p.resolve(strict=False)
+            except Exception:
+                pass
+            if not p.is_file():
+                continue
+            name_lower = p.name.lower()
+            if not (name_lower.endswith(".db") or name_lower == "report.db"):
+                continue
+            if p in existing:
+                continue
+            existing.add(p)
+            self._report_db_entries.append(p)
+            label = f"{p.parent.name} ({p.name})"
+            item = QListWidgetItem(label)
+            item.setData(Qt.ItemDataRole.UserRole, str(p))
+            self.report_db_list.addItem(item)
+            added += 1
+        if added:
+            self._rebuild_report_db_cache()
+
+    def _remove_selected_report_dbs(self) -> None:
+        """从列表中移除选中的 report.db，并更新缓存。"""
+        items = self.report_db_list.selectedItems()
+        if not items:
+            return
+        paths_to_remove: set[Path] = set()
+        for item in items:
+            raw = item.data(Qt.ItemDataRole.UserRole)
+            if isinstance(raw, str):
+                try:
+                    paths_to_remove.add(Path(raw))
+                except Exception:
+                    pass
+            row = self.report_db_list.row(item)
+            if row >= 0:
+                self.report_db_list.takeItem(row)
+        if not paths_to_remove:
+            return
+        self._report_db_entries = [p for p in self._report_db_entries if p not in paths_to_remove]
+        self._rebuild_report_db_cache()
+
+    def _clear_report_dbs(self) -> None:
+        """清空所有 report.db 记录与缓存。"""
+        self.report_db_list.clear()
+        self._report_db_entries.clear()
+        self._report_db_cache.clear()
+        self._update_report_db_row_resolver()
 
     def _setup_ui(self) -> None:
         root = QWidget()
@@ -308,7 +474,34 @@ class BirdStampEditorWindow(QMainWindow, _BirdStampCropMixin, _BirdStampRenderer
         self.setStatusBar(self.statusBar())
 
     def _setup_ui_photos_list(self, left_layout: QVBoxLayout) -> None:
-        """构建左侧「照片列表」分组 UI。"""
+        """构建左侧「Report 数据库」+「照片列表」分组 UI。"""
+        # ── Report 数据库列表 ────────────────────────────────────────────────
+        db_group = QGroupBox("Report 数据库")
+        db_layout = QVBoxLayout(db_group)
+        db_layout.setSpacing(6)
+
+        self.report_db_list = _ReportDBListWidget(self)
+        self.report_db_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        db_layout.addWidget(self.report_db_list, stretch=1)
+
+        db_btn_row = QHBoxLayout()
+        db_remove_btn = QPushButton("删除所选")
+        db_remove_btn.clicked.connect(self._remove_selected_report_dbs)
+        db_btn_row.addWidget(db_remove_btn)
+
+        db_clear_btn = QPushButton("清空")
+        db_clear_btn.clicked.connect(self._clear_report_dbs)
+        db_btn_row.addWidget(db_clear_btn)
+        db_btn_row.addStretch(1)
+        db_layout.addLayout(db_btn_row)
+
+        db_hint = QLabel("支持拖入 report.db 文件")
+        db_hint.setStyleSheet("color: #7A7A7A; font-size: 11px;")
+        db_layout.addWidget(db_hint)
+
+        left_layout.addWidget(db_group)
+
+        # ── 照片列表 ────────────────────────────────────────────────────────
         photos_group = QGroupBox("照片列表")
         photos_layout = QVBoxLayout(photos_group)
         photos_layout.setSpacing(6)
@@ -342,6 +535,28 @@ class BirdStampEditorWindow(QMainWindow, _BirdStampCropMixin, _BirdStampRenderer
         photos_layout.addWidget(hint)
 
         left_layout.addWidget(photos_group, stretch=2)
+
+    # ------------------------------------------------------------------
+    # ReportDB 列表与缓存
+    # ------------------------------------------------------------------
+
+    def _update_report_db_row_resolver(self) -> None:
+        """根据当前缓存更新模板上下文中的 report.db 行解析函数。"""
+
+        cache = self._report_db_cache
+
+        if not cache:
+            _template_context.set_report_db_row_resolver(None)
+            return
+
+        def _resolver(path: Path) -> dict[str, Any] | None:
+            try:
+                stem = path.stem
+            except Exception:
+                return None
+            return cache.get(stem)
+
+        _template_context.set_report_db_row_resolver(_resolver)
 
     def _setup_ui_template_output_actions(self, left_layout: QVBoxLayout) -> None:
         """构建左侧「模板」「模板选项重载」「操作」分组 UI。"""

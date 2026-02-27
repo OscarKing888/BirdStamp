@@ -151,10 +151,16 @@ def _normalize_template_field(data: dict[str, Any], index: int) -> dict[str, Any
     font_type = str(data.get("font_type") or "").strip()
     if not font_type or font_type.lower() in {"auto", "default", "system", "none"}:
         font_type = "auto"
+    data_source = str(data.get("data_source") or "").strip().lower()
+    if data_source not in ("metadata", "report_db"):
+        data_source = "metadata"
+    report_field = str(data.get("report_field") or "").strip() if data_source == "report_db" else ""
     return {
         "name": str(data.get("name") or f"字段{index + 1}"),
         "tag": str(data.get("tag") or DEFAULT_FIELD_TAG),
         "fallback": str(data.get("fallback") or ""),
+        "data_source": data_source,
+        "report_field": report_field,
         "align_horizontal": align_h,
         "align_vertical": align_v,
         "x_offset_pct": round(_clamp_float(data.get("x_offset_pct"), -100.0, 100.0, 0.0), 2),
@@ -619,11 +625,17 @@ def render_template_overlay(
         if not isinstance(raw_field, dict):
             continue
         field = _normalize_template_field(raw_field, field_index)
-        tag = str(field.get("tag") or "")
-        text = _lookup_tag_value(tag, lookup, metadata_context)
-        if not text:
-            fallback = _format_with_context(str(field.get("fallback") or ""), metadata_context)
-            text = clean_text(fallback)
+        data_source = str(field.get("data_source") or "metadata")
+        report_field = str(field.get("report_field") or "").strip()
+        if data_source == "report_db" and report_field:
+            text = clean_text(metadata_context.get("report." + report_field, "") or "")
+        else:
+            expr = str(field.get("fallback") or "")
+            text = clean_text(_format_with_context(expr, metadata_context))
+            if not text and field.get("tag"):
+                text = _lookup_tag_value(str(field["tag"]), lookup, metadata_context)
+                if text:
+                    text = clean_text(text)
         if not text:
             continue
         font_size_base = max(8, int(field.get("font_size") or 24))

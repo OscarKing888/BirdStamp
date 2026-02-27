@@ -2,9 +2,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Protocol, runtime_checkable
+from typing import Any, Callable, Dict, List, Optional, Protocol, runtime_checkable
 
+from app_common.report_db import PHOTO_COLUMNS
 from birdstamp.meta.normalize import format_settings_line, normalize_metadata
+
+# 与 editor_utils 中一致：不写入 context 的路径列
+_REPORT_DB_PATH_COLUMNS = frozenset({
+    "original_path", "current_path", "temp_jpeg_path", "debug_crop_path", "yolo_debug_path",
+})
 
 
 TemplateContext = Dict[str, str]
@@ -30,6 +36,8 @@ class _Registry:
 
 _REGISTRY = _Registry(providers=[])
 
+_REPORT_DB_ROW_RESOLVER: Optional[Callable[[Path], Optional[Dict[str, Any]]]] = None
+
 
 def register_template_context_provider(provider: TemplateContextProvider) -> None:
     """注册一个 TemplateContextProvider，供后续构建上下文时使用。"""
@@ -40,6 +48,29 @@ def register_template_context_provider(provider: TemplateContextProvider) -> Non
 def list_template_context_providers() -> List[TemplateContextProvider]:
     """返回当前已注册的所有 TemplateContextProvider 列表（只读副本）。"""
     return list(_REGISTRY.providers)
+
+
+def set_report_db_row_resolver(
+    resolver: Optional[Callable[[Path], Optional[Dict[str, Any]]]]
+) -> None:
+    """设置全局 report.db 行解析函数（由 GUI 层注入）。
+
+    - resolver(path) 返回与给定图片路径对应的 report 行（dict），或 None。
+    - 传入 None 将禁用 report.db provider 的行解析。
+    """
+    global _REPORT_DB_ROW_RESOLVER
+    _REPORT_DB_ROW_RESOLVER = resolver
+
+
+def get_report_db_row_for_path(path: Path) -> Optional[Dict[str, Any]]:
+    """根据图片路径查询 report.db 中对应的行（若配置了 resolver）。"""
+    resolver = _REPORT_DB_ROW_RESOLVER
+    if resolver is None:
+        return None
+    try:
+        return resolver(path)
+    except Exception:
+        return None
 
 
 class ExifMetadataContextProvider:
@@ -97,10 +128,44 @@ class ExifMetadataContextProvider:
             context["settings_text"] = settings
 
 
+class ReportDBTemplateContextProvider:
+    """从 report.db 中读取鸟种等字段并填充模板上下文的提供器。"""
+
+    def __init__(self) -> None:
+        self._id = "report_db"
+
+    @property
+    def id(self) -> str:
+        return self._id
+
+    def provide(self, path: Path, raw_metadata: Dict[str, Any], context: TemplateContext) -> None:  # noqa: ARG002
+        row = get_report_db_row_for_path(path)
+        if not isinstance(row, dict):
+            return
+
+        species_cn = str(row.get("bird_species_cn") or "").strip()
+        species_en = str(row.get("bird_species_en") or "").strip()
+
+        if species_cn:
+            context["bird"] = species_cn
+            context["bird_common"] = species_cn
+        if species_en:
+            context.setdefault("bird_latin", species_en)
+            context.setdefault("bird_scientific", species_en)
+
+        # 非路径列统一以 report.<列名> 写入，供模板 data_source=report_db 时使用
+        for (col_name, _type_def, _default) in PHOTO_COLUMNS:
+            if col_name in _REPORT_DB_PATH_COLUMNS:
+                continue
+            val = row.get(col_name)
+            context["report." + col_name] = "" if val is None else str(val).strip()
+
+
 def _ensure_default_providers_registered() -> None:
-    if any(p.id == "exif_metadata" for p in _REGISTRY.providers):
-        return
-    register_template_context_provider(ExifMetadataContextProvider())
+    if not any(p.id == "exif_metadata" for p in _REGISTRY.providers):
+        register_template_context_provider(ExifMetadataContextProvider())
+    if not any(p.id == "report_db" for p in _REGISTRY.providers):
+        register_template_context_provider(ReportDBTemplateContextProvider())
 
 
 def build_template_context(path: Path, raw_metadata: Dict[str, Any]) -> TemplateContext:

@@ -64,6 +64,7 @@ STYLE_OPTIONS = editor_options.STYLE_OPTIONS
 ALIGN_OPTIONS_HORIZONTAL = editor_utils.ALIGN_OPTIONS_HORIZONTAL
 ALIGN_OPTIONS_VERTICAL = editor_utils.ALIGN_OPTIONS_VERTICAL
 _get_fallback_context_vars = editor_utils.get_fallback_context_vars
+_get_template_context_field_options = editor_utils.get_template_context_field_options
 _DEFAULT_TEMPLATE_FONT_TYPE = editor_utils.DEFAULT_TEMPLATE_FONT_TYPE
 _normalize_template_font_type = editor_utils.normalize_template_font_type
 _template_font_choices = editor_utils.template_font_choices
@@ -961,25 +962,23 @@ class TemplateManagerDialog(QDialog):
         self.field_name_edit.textChanged.connect(self._apply_field_changes)
         form.addRow("名称", self.field_name_edit)
 
-        self.field_tag_combo = QComboBox()
-        for label, value in TAG_OPTIONS:
-            self.field_tag_combo.addItem(label, value)
-        self.field_tag_combo.currentIndexChanged.connect(self._apply_field_changes)
-        form.addRow("Exif标签", self.field_tag_combo)
-
         self._field_fallback_combo = QComboBox()
         self._field_fallback_combo.setEditable(True)
         self._field_fallback_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
-        self._field_fallback_combo.addItem("（空）", "")
-        for expr, label in _get_fallback_context_vars():
-            self._field_fallback_combo.addItem(f"{expr}  —  {label}", expr)
+        self._field_fallback_combo.addItem("（空）", ("", ""))
+        for data_source, key, display_label in _get_template_context_field_options():
+            if data_source == "metadata":
+                display_text = f"元数据 — {key}  —  {display_label}"
+            else:
+                display_text = f"ReportDB — {key}  —  {display_label}"
+            self._field_fallback_combo.addItem(display_text, (data_source, key))
         self._field_fallback_combo.setCurrentIndex(0)
         if self._field_fallback_combo.lineEdit():
-            self._field_fallback_combo.lineEdit().setPlaceholderText("留空则不使用 Fallback")
+            self._field_fallback_combo.lineEdit().setPlaceholderText("选数据源与字段，可输入自定义占位符")
         self.field_fallback_edit = self._field_fallback_combo.lineEdit()
         self._field_fallback_combo.currentIndexChanged.connect(self._on_fallback_var_selected)
         self.field_fallback_edit.textChanged.connect(self._apply_field_changes)
-        form.addRow("Fallback", self._field_fallback_combo)
+        form.addRow("数据源/字段", self._field_fallback_combo)
 
         self.field_align_h_combo = QComboBox()
         self.field_align_h_combo.addItems(list(ALIGN_OPTIONS_HORIZONTAL))
@@ -1613,20 +1612,11 @@ class TemplateManagerDialog(QDialog):
             return
         self._apply_field_to_editor(self._selected_field())
 
-    def _set_tag_combo_value(self, tag: str) -> None:
-        target = (tag or DEFAULT_FIELD_TAG).strip()
-        idx = self.field_tag_combo.findData(target)
-        if idx < 0:
-            self.field_tag_combo.addItem(f"保留旧标签: {target}", target)
-            idx = self.field_tag_combo.count() - 1
-        self.field_tag_combo.setCurrentIndex(idx)
-
     def _apply_field_to_editor(self, field: dict[str, Any] | None) -> None:
         self._updating = True
         try:
             if not field:
                 self.field_name_edit.clear()
-                self._set_tag_combo_value(DEFAULT_FIELD_TAG)
                 self._set_fallback_combo_value("")
                 self.field_align_h_combo.setCurrentText("left")
                 self.field_align_v_combo.setCurrentText("top")
@@ -1641,8 +1631,11 @@ class TemplateManagerDialog(QDialog):
 
             normalized = _normalize_template_field(field, 0)
             self.field_name_edit.setText(normalized["name"])
-            self._set_tag_combo_value(normalized["tag"])
-            self._set_fallback_combo_value(normalized["fallback"])
+            self._set_fallback_combo_value(
+                normalized.get("fallback", ""),
+                data_source=normalized.get("data_source"),
+                report_field=normalized.get("report_field"),
+            )
             self.field_align_h_combo.setCurrentText(normalized["align_horizontal"])
             self.field_align_v_combo.setCurrentText(normalized["align_vertical"])
             self.field_x_spin.setValue(float(normalized["x_offset_pct"]))
@@ -1691,22 +1684,48 @@ class TemplateManagerDialog(QDialog):
 
         _start_screen_color_picker(parent=self, on_picked=_apply)
 
-    def _set_fallback_combo_value(self, value: str) -> None:
+    def _set_fallback_combo_value(
+        self,
+        fallback: str = "",
+        *,
+        data_source: str | None = None,
+        report_field: str | None = None,
+    ) -> None:
         old = self._updating
         self._updating = True
         try:
             combo = self._field_fallback_combo
             matched = -1
-            for i in range(combo.count()):
-                if combo.itemData(i) == value:
-                    matched = i
-                    break
+            ds = (data_source or "").strip().lower() if data_source else "metadata"
+            rf = (report_field or "").strip()
+            if ds == "report_db" and rf:
+                for i in range(combo.count()):
+                    item_data = combo.itemData(i)
+                    if isinstance(item_data, (list, tuple)) and len(item_data) >= 2:
+                        if item_data[0] == "report_db" and item_data[1] == rf:
+                            matched = i
+                            break
+            else:
+                fb = (fallback or "").strip()
+                if not fb:
+                    matched = 0
+                else:
+                    for i in range(combo.count()):
+                        item_data = combo.itemData(i)
+                        if isinstance(item_data, (list, tuple)) and len(item_data) >= 2:
+                            if item_data[0] == "metadata" and item_data[1] == fb:
+                                matched = i
+                                break
             if matched >= 0:
                 combo.setCurrentIndex(matched)
-            else:
+                if combo.lineEdit():
+                    combo.lineEdit().setText(
+                        (fallback or "").strip() if (matched > 0 and ds == "metadata") else ""
+                    )
+            if matched < 0:
                 combo.setCurrentIndex(0)
                 if combo.lineEdit():
-                    combo.lineEdit().setText(value)
+                    combo.lineEdit().setText(fallback.strip())
         finally:
             self._updating = old
 
@@ -1717,7 +1736,11 @@ class TemplateManagerDialog(QDialog):
         if data is not None and self.field_fallback_edit:
             old = self._updating
             self._updating = True
-            self.field_fallback_edit.setText(str(data))
+            if isinstance(data, (list, tuple)) and len(data) >= 2:
+                _ds, key = data[0], data[1]
+                self.field_fallback_edit.setText(str(key) if _ds == "metadata" else "")
+            else:
+                self.field_fallback_edit.setText(str(data) if data else "")
             self._updating = old
             self._apply_field_changes()
 
@@ -1729,8 +1752,16 @@ class TemplateManagerDialog(QDialog):
             return
 
         field["name"] = self.field_name_edit.text().strip() or "字段"
-        field["tag"] = str(self.field_tag_combo.currentData() or DEFAULT_FIELD_TAG)
-        field["fallback"] = self.field_fallback_edit.text().strip()
+        item_data = self._field_fallback_combo.currentData()
+        if isinstance(item_data, (list, tuple)) and len(item_data) >= 2:
+            ds, key = str(item_data[0] or ""), str(item_data[1] or "")
+            field["data_source"] = "report_db" if ds == "report_db" else "metadata"
+            field["report_field"] = key if ds == "report_db" else ""
+            field["fallback"] = self.field_fallback_edit.text().strip() if ds == "metadata" else ""
+        else:
+            field["data_source"] = "metadata"
+            field["report_field"] = ""
+            field["fallback"] = self.field_fallback_edit.text().strip()
         align_h = self.field_align_h_combo.currentText().strip().lower()
         align_v = self.field_align_v_combo.currentText().strip().lower()
         field["align_horizontal"] = align_h if align_h in ALIGN_OPTIONS_HORIZONTAL else "left"
