@@ -13,3 +13,4 @@ torchvision>=0.17
 rawpy>=0.20
 pillow-heif>=0.16
 # pytest>=8.0
+piexif>=1.1.0

@@ -63,7 +63,7 @@ STYLE_OPTIONS = editor_options.STYLE_OPTIONS
 
 ALIGN_OPTIONS_HORIZONTAL = editor_utils.ALIGN_OPTIONS_HORIZONTAL
 ALIGN_OPTIONS_VERTICAL = editor_utils.ALIGN_OPTIONS_VERTICAL
-_FALLBACK_CONTEXT_VARS = editor_utils.FALLBACK_CONTEXT_VARS
+_get_fallback_context_vars = editor_utils.get_fallback_context_vars
 _DEFAULT_TEMPLATE_FONT_TYPE = editor_utils.DEFAULT_TEMPLATE_FONT_TYPE
 _normalize_template_font_type = editor_utils.normalize_template_font_type
 _template_font_choices = editor_utils.template_font_choices
@@ -971,7 +971,7 @@ class TemplateManagerDialog(QDialog):
         self._field_fallback_combo.setEditable(True)
         self._field_fallback_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
         self._field_fallback_combo.addItem("（空）", "")
-        for expr, label in _FALLBACK_CONTEXT_VARS:
+        for expr, label in _get_fallback_context_vars():
             self._field_fallback_combo.addItem(f"{expr}  —  {label}", expr)
         self._field_fallback_combo.setCurrentIndex(0)
         if self._field_fallback_combo.lineEdit():

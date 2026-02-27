@@ -1,6 +1,7 @@
 # Editor UI utilities: color, font, screen picker, placeholder, metadata context.
 from __future__ import annotations
 
+import json
 import re
 from functools import lru_cache
 from pathlib import Path
@@ -11,7 +12,8 @@ from PyQt6.QtCore import QPoint, QRect, QRectF, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QCursor, QFontDatabase, QGuiApplication, QImage, QPainter, QPen, QPixmap, QRawFont
 from PyQt6.QtWidgets import QApplication, QLabel, QWidget
 
-from birdstamp.meta.normalize import format_settings_line, normalize_metadata
+from birdstamp.config import get_app_dir
+from birdstamp.gui.template_context import build_template_context
 from birdstamp.render.typography import list_available_font_paths, load_font
 
 ALIGN_OPTIONS_VERTICAL = ("top", "center", "bottom")
@@ -321,43 +323,23 @@ def sanitize_template_name(text: str) -> str:
 
 
 def build_metadata_context(path: Path, raw_metadata: dict[str, Any]) -> dict[str, str]:
-    context: dict[str, str] = {
-        "bird": "",
-        "capture_text": "",
-        "location": "",
-        "gps_text": "",
-        "camera": "",
-        "lens": "",
-        "settings_text": "",
-        "stem": path.stem,
-        "filename": path.name,
-    }
-    try:
-        normalized = normalize_metadata(
-            path,
-            raw_metadata,
-            bird_arg=None,
-            bird_priority=["meta", "filename"],
-            bird_regex=r"(?P<bird>[^_]+)_",
-            time_format="%Y-%m-%d %H:%M",
-        )
-    except Exception:
-        return context
-    context["bird"] = normalized.bird or ""
-    context["capture_text"] = normalized.capture_text or ""
-    context["location"] = normalized.location or ""
-    context["gps_text"] = normalized.gps_text or ""
-    context["camera"] = normalized.camera or ""
-    context["lens"] = normalized.lens or ""
-    settings = normalized.settings_text or format_settings_line(normalized, show_eq_focal=True) or ""
-    context["settings_text"] = settings
-    return context
+    """构建用于模板和 UI 的元数据上下文字典。
+
+    当前实现委托给 TemplateContextProvider 注册表，以便后续扩展如 {bird_latin} 等新字段。
+    """
+    return build_template_context(path, raw_metadata)
 
 
-# 模板 fallback 可用的上下文变量列表，顺序即下拉菜单顺序
-# 每项 (template_expr, label)
-FALLBACK_CONTEXT_VARS: list[tuple[str, str]] = [
+_DEFAULT_FALLBACK_CONTEXT_VARS: list[tuple[str, str]] = [
     ("{bird}", "鸟种名称"),
+    ("{bird_latin}", "鸟种拉丁文名称"),
+    ("{bird_scientific}", "鸟种学名"),
+    ("{bird_common}", "鸟种通用名"),
+    ("{bird_family}", "鸟种科名"),
+    ("{bird_order}", "鸟种目名"),
+    ("{bird_class}", "鸟种纲名"),
+    ("{bird_phylum}", "鸟种门名"),
+    ("{bird_kingdom}", "鸟种界名"),
     ("{capture_text}", "拍摄日期时间"),
     ("{location}", "拍摄地点"),
     ("{gps_text}", "GPS 坐标文字"),
@@ -367,6 +349,55 @@ FALLBACK_CONTEXT_VARS: list[tuple[str, str]] = [
     ("{stem}", "文件名（不含扩展名）"),
     ("{filename}", "完整文件名"),
 ]
+
+
+def get_birdstamp_cfg_path() -> Path:
+    """返回 birdstamp.cfg 的路径（project_root/config/birdstamp.cfg）。"""
+    return get_app_dir() / "config" / "birdstamp.cfg"
+
+
+def _load_birdstamp_cfg_raw() -> dict[str, Any]:
+    path = get_birdstamp_cfg_path()
+    try:
+        if not path.exists():
+            return {}
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    text = (text or "").strip()
+    if not text:
+        return {}
+    try:
+        data = json.loads(text)
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _fallback_context_vars_from_cfg(data: dict[str, Any]) -> list[tuple[str, str]]:
+    items = data.get("template_fallback_context_vars")
+    if not isinstance(items, list):
+        return list(_DEFAULT_FALLBACK_CONTEXT_VARS)
+    result: list[tuple[str, str]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        expr = str(item.get("expr") or "").strip()
+        label = str(item.get("label") or "").strip()
+        if not expr or not label:
+            continue
+        result.append((expr, label))
+    return result or list(_DEFAULT_FALLBACK_CONTEXT_VARS)
+
+
+@lru_cache(maxsize=1)
+def get_fallback_context_vars() -> list[tuple[str, str]]:
+    """返回用于 Fallback 下拉列表的上下文变量配置。
+
+    优先从 config/birdstamp.cfg 读取；否则回退到内置默认列表。
+    """
+    data = _load_birdstamp_cfg_raw()
+    return _fallback_context_vars_from_cfg(data)
 
 
 def pil_to_qpixmap(image: Image.Image) -> QPixmap:
