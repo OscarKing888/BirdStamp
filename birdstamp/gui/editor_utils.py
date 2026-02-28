@@ -10,7 +10,7 @@ from typing import Any, Callable
 from PIL import Image, ImageColor, ImageDraw, ImageOps
 from PyQt6.QtCore import QPoint, QRect, QRectF, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QCursor, QFontDatabase, QGuiApplication, QImage, QPainter, QPen, QPixmap, QRawFont
-from PyQt6.QtWidgets import QApplication, QLabel, QWidget
+from PyQt6.QtWidgets import QApplication, QAbstractSpinBox, QFormLayout, QLabel, QSizePolicy, QWidget
 
 from birdstamp.config import get_app_dir
 from birdstamp.gui.template_context import build_template_context
@@ -71,6 +71,54 @@ def build_color_preview_swatch() -> QLabel:
     swatch.setStyleSheet("border: 1px solid #2A2A2A; border-radius: 2px;")
     swatch.setToolTip("")
     return swatch
+
+
+def configure_form_layout(form: QFormLayout) -> None:
+    """Normalize QFormLayout growth so fields behave consistently on macOS and Windows."""
+    form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+    form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+    form.setFormAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+    form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+    if form.horizontalSpacing() < 12:
+        form.setHorizontalSpacing(12)
+    if form.verticalSpacing() < 8:
+        form.setVerticalSpacing(8)
+
+
+def set_widget_minimum_width_from_text(
+    widget: QWidget,
+    text: str,
+    *,
+    extra_padding: int = 24,
+    floor: int = 0,
+) -> int:
+    """Set a width floor from content text while preserving the native size hint."""
+    width = max(int(floor), int(widget.sizeHint().width()))
+    sample = str(text or "").strip()
+    if sample:
+        width = max(width, int(widget.fontMetrics().horizontalAdvance(sample) + extra_padding))
+    widget.setMinimumWidth(width)
+    return width
+
+
+def configure_spinbox_minimum_width(
+    spin: QAbstractSpinBox,
+    *,
+    sample_text: str,
+    extra_padding: int = 40,
+    expanding: bool = False,
+) -> int:
+    """Give spin boxes enough horizontal room for text plus native step buttons."""
+    width = set_widget_minimum_width_from_text(
+        spin,
+        sample_text,
+        extra_padding=extra_padding,
+    )
+    if expanding:
+        policy = spin.sizePolicy()
+        policy.setHorizontalPolicy(QSizePolicy.Policy.MinimumExpanding)
+        spin.setSizePolicy(policy)
+    return width
 
 
 def set_color_preview_swatch(

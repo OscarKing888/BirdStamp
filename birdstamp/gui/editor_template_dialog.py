@@ -35,6 +35,7 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSlider,
+    QSizePolicy,
     QSpinBox,
     QSplitter,
     QVBoxLayout,
@@ -68,6 +69,8 @@ _get_template_context_field_options = editor_utils.get_template_context_field_op
 _DEFAULT_TEMPLATE_FONT_TYPE = editor_utils.DEFAULT_TEMPLATE_FONT_TYPE
 _normalize_template_font_type = editor_utils.normalize_template_font_type
 _template_font_choices = editor_utils.template_font_choices
+_configure_form_layout = editor_utils.configure_form_layout
+_configure_spinbox_minimum_width = editor_utils.configure_spinbox_minimum_width
 _normalize_template_banner_color = editor_utils.normalize_template_banner_color
 _build_color_preview_swatch = editor_utils.build_color_preview_swatch
 _set_color_preview_swatch = editor_utils.set_color_preview_swatch
@@ -207,16 +210,13 @@ class _GradientEditorWidget(QWidget):
         top_row = QHBoxLayout()
         top_row.setSpacing(4)
         top_lbl = QLabel("顶端")
-        top_lbl.setFixedWidth(36)
         top_row.addWidget(top_lbl)
         self._top_swatch = _build_color_preview_swatch()
         top_row.addWidget(self._top_swatch)
         top_pick = QPushButton("选色")
-        top_pick.setFixedWidth(42)
         top_pick.clicked.connect(self._pick_top_color)
         top_row.addWidget(top_pick)
         top_screen = QPushButton("吸管")
-        top_screen.setFixedWidth(42)
         top_screen.clicked.connect(self._pick_top_screen)
         top_row.addWidget(top_screen)
         top_row.addWidget(QLabel("不透明度"))
@@ -227,7 +227,7 @@ class _GradientEditorWidget(QWidget):
         self._top_opacity_spin = QSpinBox()
         self._top_opacity_spin.setRange(0, 100)
         self._top_opacity_spin.setSuffix(" %")
-        self._top_opacity_spin.setFixedWidth(60)
+        _configure_spinbox_minimum_width(self._top_opacity_spin, sample_text="100 %")
         self._top_opacity_spin.valueChanged.connect(self._on_top_spin)
         top_row.addWidget(self._top_opacity_spin)
         layout.addLayout(top_row)
@@ -235,16 +235,13 @@ class _GradientEditorWidget(QWidget):
         bot_row = QHBoxLayout()
         bot_row.setSpacing(4)
         bot_lbl = QLabel("底端")
-        bot_lbl.setFixedWidth(36)
         bot_row.addWidget(bot_lbl)
         self._bot_swatch = _build_color_preview_swatch()
         bot_row.addWidget(self._bot_swatch)
         bot_pick = QPushButton("选色")
-        bot_pick.setFixedWidth(42)
         bot_pick.clicked.connect(self._pick_bot_color)
         bot_row.addWidget(bot_pick)
         bot_screen = QPushButton("吸管")
-        bot_screen.setFixedWidth(42)
         bot_screen.clicked.connect(self._pick_bot_screen)
         bot_row.addWidget(bot_screen)
         bot_row.addWidget(QLabel("不透明度"))
@@ -255,7 +252,7 @@ class _GradientEditorWidget(QWidget):
         self._bot_opacity_spin = QSpinBox()
         self._bot_opacity_spin.setRange(0, 100)
         self._bot_opacity_spin.setSuffix(" %")
-        self._bot_opacity_spin.setFixedWidth(60)
+        _configure_spinbox_minimum_width(self._bot_opacity_spin, sample_text="100 %")
         self._bot_opacity_spin.valueChanged.connect(self._on_bot_spin)
         bot_row.addWidget(self._bot_opacity_spin)
         layout.addLayout(bot_row)
@@ -270,7 +267,7 @@ class _GradientEditorWidget(QWidget):
         self._height_spin = QSpinBox()
         self._height_spin.setRange(int(_BANNER_GRADIENT_HEIGHT_PCT_MIN), int(_BANNER_GRADIENT_HEIGHT_PCT_MAX))
         self._height_spin.setSuffix(" %")
-        self._height_spin.setFixedWidth(60)
+        _configure_spinbox_minimum_width(self._height_spin, sample_text="100 %")
         self._height_spin.valueChanged.connect(self._on_height_spin)
         h_row.addWidget(self._height_spin)
         layout.addLayout(h_row)
@@ -450,9 +447,13 @@ class _CropPaddingEditorWidget(QWidget):
         grid = QGridLayout(grid_widget)
         grid.setContentsMargins(0, 2, 0, 2)
         grid.setSpacing(4)
+        grid.setColumnStretch(0, 1)
+        grid.setColumnStretch(1, 1)
+        grid.setColumnStretch(2, 1)
 
         def _make_spin_slider(label: str) -> tuple[QWidget, QSpinBox, QSlider]:
             w = QWidget()
+            w.setSizePolicy(QSizePolicy.Policy.MinimumExpanding, QSizePolicy.Policy.Fixed)
             wl = QVBoxLayout(w)
             wl.setContentsMargins(0, 0, 0, 0)
             wl.setSpacing(2)
@@ -461,14 +462,15 @@ class _CropPaddingEditorWidget(QWidget):
             spin.setValue(_DEFAULT_CROP_PADDING_PX)
             spin.setSuffix(" px")
             spin.setAccessibleName(label)
-            spin.setFixedWidth(72)
+            _configure_spinbox_minimum_width(spin, sample_text="-9999 px")
             wl.addWidget(spin)
             slider = QSlider(Qt.Orientation.Horizontal)
             slider.setRange(-2048, 2048)
             slider.setSingleStep(1)
             slider.setPageStep(16)
             slider.setValue(max(slider.minimum(), min(slider.maximum(), _DEFAULT_CROP_PADDING_PX)))
-            slider.setFixedWidth(72)
+            slider.setMinimumWidth(max(96, spin.minimumWidth()))
+            slider.setSizePolicy(QSizePolicy.Policy.MinimumExpanding, QSizePolicy.Policy.Fixed)
             wl.addWidget(slider)
             spin.valueChanged.connect(lambda v, s=slider: self._sync_slider(s, v))
             slider.valueChanged.connect(lambda v, sp=spin: self._sync_spin(sp, v))
@@ -820,6 +822,7 @@ class TemplateManagerDialog(QDialog):
         """当前模板 GroupBox：裁切参数 + Banner 颜色/样式/渐变。"""
         group = QGroupBox("当前模板")
         form = QFormLayout(group)
+        _configure_form_layout(form)
 
         self.template_name_edit = QLineEdit()
         self.template_name_edit.setReadOnly(True)
@@ -927,6 +930,7 @@ class TemplateManagerDialog(QDialog):
         """裁切填充 GroupBox：边界填充 + 外圈颜色。"""
         group = QGroupBox("裁切填充")
         form = QFormLayout(group)
+        _configure_form_layout(form)
         self._tmpl_crop_padding_widget = _CropPaddingEditorWidget()
         self._tmpl_crop_padding_widget.changed.connect(self._on_tmpl_crop_padding_changed)
         form.addRow("边界填充 / 外圈颜色", self._tmpl_crop_padding_widget)
@@ -957,6 +961,7 @@ class TemplateManagerDialog(QDialog):
         """文本项编辑 GroupBox：所有文本项属性控件。"""
         group = QGroupBox("文本项编辑")
         form = QFormLayout(group)
+        _configure_form_layout(form)
 
         self.field_name_edit = QLineEdit()
         self.field_name_edit.textChanged.connect(self._apply_field_changes)
@@ -994,6 +999,7 @@ class TemplateManagerDialog(QDialog):
         self.field_x_spin.setRange(-100.0, 100.0)
         self.field_x_spin.setDecimals(2)
         self.field_x_spin.setSingleStep(0.5)
+        _configure_spinbox_minimum_width(self.field_x_spin, sample_text="-100.00", expanding=True)
         self.field_x_spin.valueChanged.connect(self._apply_field_changes)
         form.addRow("X偏移(%)", self.field_x_spin)
 
@@ -1001,6 +1007,7 @@ class TemplateManagerDialog(QDialog):
         self.field_y_spin.setRange(-100.0, 100.0)
         self.field_y_spin.setDecimals(2)
         self.field_y_spin.setSingleStep(0.5)
+        _configure_spinbox_minimum_width(self.field_y_spin, sample_text="-100.00", expanding=True)
         self.field_y_spin.valueChanged.connect(self._apply_field_changes)
         form.addRow("Y偏移(%)", self.field_y_spin)
 
@@ -1026,6 +1033,7 @@ class TemplateManagerDialog(QDialog):
 
         self.field_font_size_spin = QSpinBox()
         self.field_font_size_spin.setRange(8, 300)
+        _configure_spinbox_minimum_width(self.field_font_size_spin, sample_text="300", expanding=True)
         self.field_font_size_spin.valueChanged.connect(self._apply_field_changes)
         form.addRow("字体大小", self.field_font_size_spin)
 

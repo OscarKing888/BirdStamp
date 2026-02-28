@@ -124,6 +124,7 @@ _TEMPLATE_BANNER_COLOR_CUSTOM = editor_utils.TEMPLATE_BANNER_COLOR_CUSTOM
 _TEMPLATE_BANNER_TOP_PADDING_PX = editor_utils.TEMPLATE_BANNER_TOP_PADDING_PX
 _build_color_preview_swatch = editor_utils.build_color_preview_swatch
 _set_color_preview_swatch = editor_utils.set_color_preview_swatch
+_configure_form_layout = editor_utils.configure_form_layout
 _normalize_template_banner_color = editor_utils.normalize_template_banner_color
 _template_banner_fill_color = editor_utils.template_banner_fill_color
 _template_font_choices = editor_utils.template_font_choices
@@ -576,6 +577,7 @@ class BirdStampEditorWindow(QMainWindow, _BirdStampCropMixin, _BirdStampRenderer
         # ── 模板选项重载（可滚动） ─────────────────────────────────────────
         override_group = QGroupBox("模板选项重载")
         override_form = QFormLayout(override_group)
+        _configure_form_layout(override_form)
 
         self.ratio_combo = QComboBox()
         for label, ratio in RATIO_OPTIONS:
@@ -650,6 +652,7 @@ class BirdStampEditorWindow(QMainWindow, _BirdStampCropMixin, _BirdStampRenderer
 
         global_form = QFormLayout()
         global_form.setContentsMargins(0, 0, 0, 0)
+        _configure_form_layout(global_form)
 
         self.output_format_combo = QComboBox()
         for suffix, label in OUTPUT_FORMAT_OPTIONS:
@@ -811,10 +814,22 @@ class BirdStampEditorWindow(QMainWindow, _BirdStampCropMixin, _BirdStampRenderer
                 padding: 0 4px;
                 font-weight: 600;
             }}
-            QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QListWidget, QTreeWidget {{
+            QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {{
                 border: 1px solid {border_color.name()};
                 border-radius: 7px;
+                background: {base_color.name()};
+                color: {text_color.name()};
+                min-height: 24px;
+            }}
+            QLineEdit {{
                 padding: 4px 6px;
+            }}
+            QComboBox, QSpinBox, QDoubleSpinBox {{
+                padding: 4px 26px 4px 6px;
+            }}
+            QListWidget, QTreeWidget {{
+                border: 1px solid {border_color.name()};
+                border-radius: 7px;
                 background: {base_color.name()};
                 color: {text_color.name()};
             }}
