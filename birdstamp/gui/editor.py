@@ -8,6 +8,7 @@ import sys
 import threading
 import xml.etree.ElementTree as ET
 from collections import defaultdict
+from datetime import datetime
 from functools import lru_cache
 from importlib import resources
 from pathlib import Path
@@ -95,7 +96,19 @@ from birdstamp.gui.editor_template_dialog import (
 )
 from app_common.preview_canvas import PreviewWithStatusBar
 from birdstamp.gui.editor_preview_canvas import EditorPreviewCanvas, EditorPreviewOverlayState
-from birdstamp.gui.editor_photo_list import PhotoListWidget
+from birdstamp.gui.editor_photo_list import (
+    PHOTO_COL_CAPTURE_TIME,
+    PHOTO_COL_NAME,
+    PHOTO_COL_RATING,
+    PHOTO_COL_RATIO,
+    PHOTO_COL_ROW,
+    PHOTO_COL_TITLE,
+    PHOTO_LIST_PATH_ROLE,
+    PHOTO_LIST_SEQUENCE_ROLE,
+    PHOTO_LIST_SORT_ROLE,
+    PhotoListItem,
+    PhotoListWidget,
+)
 from birdstamp.gui.editor_crop_calculator import _BirdStampCropMixin
 from birdstamp.gui.editor_renderer import _BirdStampRendererMixin
 from birdstamp.gui.editor_exporter import _BirdStampExporterMixin
@@ -1132,6 +1145,78 @@ class BirdStampEditorWindow(QMainWindow, _BirdStampCropMixin, _BirdStampRenderer
         text = f"{parsed:.4f}".rstrip("0").rstrip(".")
         return text or "原比例"
 
+    def _parse_display_capture_datetime(self, value: Any) -> datetime | None:
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            return value
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                parsed = self._parse_display_capture_datetime(item)
+                if parsed is not None:
+                    return parsed
+            return None
+        if isinstance(value, dict):
+            for item in value.values():
+                parsed = self._parse_display_capture_datetime(item)
+                if parsed is not None:
+                    return parsed
+            return None
+
+        text = _clean_text(value) or str(value).strip()
+        if not text:
+            return None
+        normalized = text.replace("T", " ").strip()
+        if "." in normalized:
+            normalized = normalized.split(".", 1)[0]
+        for pattern in (
+            "%Y:%m:%d %H:%M:%S%z",
+            "%Y:%m:%d %H:%M:%S",
+            "%Y-%m-%d %H:%M:%S%z",
+            "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%d %H:%M",
+        ):
+            try:
+                return datetime.strptime(normalized, pattern)
+            except ValueError:
+                continue
+        try:
+            return datetime.fromisoformat(text)
+        except Exception:
+            return None
+
+    def _extract_display_capture_time_from_metadata(
+        self, raw_metadata: dict[str, Any]
+    ) -> tuple[str, tuple[int, float]]:
+        if not isinstance(raw_metadata, dict):
+            return "-", (1, 0.0)
+
+        lookup = _normalize_lookup(raw_metadata)
+        key_candidates = (
+            "EXIF:DateTimeOriginal",
+            "ExifIFD:DateTimeOriginal",
+            "XMP-exif:DateTimeOriginal",
+            "DateTimeOriginal",
+            "EXIF:CreateDate",
+            "XMP-xmp:CreateDate",
+            "CreateDate",
+            "DateTimeCreated",
+            "DateCreated",
+            "MediaCreateDate",
+        )
+        for key in key_candidates:
+            value = lookup.get(key.lower())
+            if value is None:
+                value = raw_metadata.get(key)
+            capture_dt = self._parse_display_capture_datetime(value)
+            if capture_dt is not None:
+                try:
+                    sort_value = float(capture_dt.timestamp())
+                except Exception:
+                    sort_value = 0.0
+                return capture_dt.strftime("%Y-%m-%d %H:%M:%S"), (0, sort_value)
+        return "-", (1, 0.0)
+
     def _extract_display_title_from_metadata(self, raw_metadata: dict[str, Any]) -> str:
         if not isinstance(raw_metadata, dict):
             return ""
@@ -1249,13 +1334,27 @@ class BirdStampEditorWindow(QMainWindow, _BirdStampCropMixin, _BirdStampRenderer
             return "-"
         return "★" * stars
 
+    def _next_photo_sequence_value(self) -> int:
+        next_value = 1
+        for idx in range(self.photo_list.topLevelItemCount()):
+            item = self.photo_list.topLevelItem(idx)
+            if item is None:
+                continue
+            raw_value = item.data(PHOTO_COL_ROW, PHOTO_LIST_SEQUENCE_ROLE)
+            try:
+                candidate = int(raw_value)
+            except Exception:
+                continue
+            next_value = max(next_value, candidate + 1)
+        return next_value
+
     def _find_photo_item_by_path(self, path: Path) -> QTreeWidgetItem | None:
         key = _path_key(path)
         for idx in range(self.photo_list.topLevelItemCount()):
             item = self.photo_list.topLevelItem(idx)
             if item is None:
                 continue
-            raw = item.data(0, Qt.ItemDataRole.UserRole)
+            raw = item.data(PHOTO_COL_ROW, PHOTO_LIST_PATH_ROLE)
             if isinstance(raw, str) and _path_key(Path(raw)) == key:
                 return item
         return None
@@ -1272,21 +1371,45 @@ class BirdStampEditorWindow(QMainWindow, _BirdStampCropMixin, _BirdStampRenderer
             return
 
         metadata = raw_metadata if isinstance(raw_metadata, dict) else self._load_raw_metadata(path)
+        capture_time_text, capture_time_sort = self._extract_display_capture_time_from_metadata(metadata)
         title = self._extract_display_title_from_metadata(metadata)
-        rating_text = self._format_rating_display(self._extract_display_rating_from_metadata(metadata))
-        active_settings = settings if isinstance(settings, dict) else self._render_settings_for_path(path, prefer_current_ui=False)
-        ratio_text = self._format_ratio_display(_parse_ratio_value(active_settings.get("ratio")))
+        rating_value = self._extract_display_rating_from_metadata(metadata)
+        rating_text = self._format_rating_display(rating_value)
+        active_settings = (
+            settings
+            if isinstance(settings, dict)
+            else self._render_settings_for_path(path, prefer_current_ui=False)
+        )
+        ratio_value = _parse_ratio_value(active_settings.get("ratio"))
+        ratio_text = self._format_ratio_display(ratio_value)
 
-        item.setText(0, path.name)
-        item.setText(1, title or "-")
-        item.setText(2, ratio_text)
-        item.setText(3, rating_text)
-        item.setToolTip(0, str(path))
-        item.setToolTip(1, title or "")
-        item.setToolTip(2, ratio_text)
-        item.setToolTip(3, rating_text)
-        item.setTextAlignment(2, int(Qt.AlignmentFlag.AlignCenter))
-        item.setTextAlignment(3, int(Qt.AlignmentFlag.AlignCenter))
+        item.setText(PHOTO_COL_NAME, path.name)
+        item.setText(PHOTO_COL_CAPTURE_TIME, capture_time_text)
+        item.setText(PHOTO_COL_TITLE, title or "-")
+        item.setText(PHOTO_COL_RATIO, ratio_text)
+        item.setText(PHOTO_COL_RATING, rating_text)
+        item.setToolTip(PHOTO_COL_NAME, str(path))
+        item.setToolTip(PHOTO_COL_CAPTURE_TIME, capture_time_text if capture_time_text != "-" else "")
+        item.setToolTip(PHOTO_COL_TITLE, title or "")
+        item.setToolTip(PHOTO_COL_RATIO, ratio_text)
+        item.setToolTip(PHOTO_COL_RATING, rating_text)
+        item.setTextAlignment(PHOTO_COL_CAPTURE_TIME, int(Qt.AlignmentFlag.AlignCenter))
+        item.setTextAlignment(PHOTO_COL_RATIO, int(Qt.AlignmentFlag.AlignCenter))
+        item.setTextAlignment(PHOTO_COL_RATING, int(Qt.AlignmentFlag.AlignCenter))
+        item.setData(PHOTO_COL_NAME, PHOTO_LIST_SORT_ROLE, (0, path.name.casefold()))
+        item.setData(PHOTO_COL_CAPTURE_TIME, PHOTO_LIST_SORT_ROLE, capture_time_sort)
+        item.setData(PHOTO_COL_TITLE, PHOTO_LIST_SORT_ROLE, (0, title.casefold()) if title else (1, ""))
+        item.setData(
+            PHOTO_COL_RATIO,
+            PHOTO_LIST_SORT_ROLE,
+            (0, float(ratio_value)) if ratio_value is not None else (1, 0.0),
+        )
+        item.setData(
+            PHOTO_COL_RATING,
+            PHOTO_LIST_SORT_ROLE,
+            (0, int(rating_value)) if rating_value is not None else (1, 0),
+        )
+        self.photo_list.resort()
 
     def _list_photo_paths(self) -> list[Path]:
         paths: list[Path] = []
@@ -1294,7 +1417,7 @@ class BirdStampEditorWindow(QMainWindow, _BirdStampCropMixin, _BirdStampRenderer
             item = self.photo_list.topLevelItem(idx)
             if not item:
                 continue
-            raw = item.data(0, Qt.ItemDataRole.UserRole)
+            raw = item.data(PHOTO_COL_ROW, PHOTO_LIST_PATH_ROLE)
             if isinstance(raw, str):
                 paths.append(Path(raw))
         return paths
@@ -1316,19 +1439,15 @@ class BirdStampEditorWindow(QMainWindow, _BirdStampCropMixin, _BirdStampRenderer
             current_settings = self._clone_render_settings(default_settings)
             self.photo_render_overrides[key] = current_settings
             raw_metadata = self._load_raw_metadata(path)
-            title = self._extract_display_title_from_metadata(raw_metadata)
-            rating_text = self._format_rating_display(self._extract_display_rating_from_metadata(raw_metadata))
-            ratio_text = self._format_ratio_display(_parse_ratio_value(current_settings.get("ratio")))
-
-            item = QTreeWidgetItem([path.name, title or "-", ratio_text, rating_text])
-            item.setData(0, Qt.ItemDataRole.UserRole, str(path))
-            item.setToolTip(0, str(path))
-            item.setToolTip(1, title or "")
-            item.setToolTip(2, ratio_text)
-            item.setToolTip(3, rating_text)
-            item.setTextAlignment(2, int(Qt.AlignmentFlag.AlignCenter))
-            item.setTextAlignment(3, int(Qt.AlignmentFlag.AlignCenter))
+            item = PhotoListItem(["", "", "", "", "", ""])
+            sequence_value = self._next_photo_sequence_value()
+            item.setData(PHOTO_COL_ROW, PHOTO_LIST_PATH_ROLE, str(path))
+            item.setData(PHOTO_COL_ROW, PHOTO_LIST_SEQUENCE_ROLE, sequence_value)
+            item.setData(PHOTO_COL_ROW, PHOTO_LIST_SORT_ROLE, (0, sequence_value))
+            item.setToolTip(PHOTO_COL_ROW, "")
+            item.setTextAlignment(PHOTO_COL_ROW, int(Qt.AlignmentFlag.AlignCenter))
             self.photo_list.addTopLevelItem(item)
+            self._update_photo_list_item_display(path, raw_metadata=raw_metadata, settings=current_settings)
             add_count += 1
 
         if add_count == 0:
@@ -1340,6 +1459,8 @@ class BirdStampEditorWindow(QMainWindow, _BirdStampCropMixin, _BirdStampRenderer
             if first_item is not None:
                 self.photo_list.setCurrentItem(first_item)
 
+        self.photo_list.refresh_row_numbers()
+
         self._set_status(f"已添加 {add_count} 张照片。")
 
     def _remove_selected_photos(self) -> None:
@@ -1349,7 +1470,7 @@ class BirdStampEditorWindow(QMainWindow, _BirdStampCropMixin, _BirdStampRenderer
 
         removed_keys: list[str] = []
         for item in selected_items:
-            raw = item.data(0, Qt.ItemDataRole.UserRole)
+            raw = item.data(PHOTO_COL_ROW, PHOTO_LIST_PATH_ROLE)
             if isinstance(raw, str):
                 removed_keys.append(_path_key(Path(raw)))
             row = self.photo_list.indexOfTopLevelItem(item)
@@ -1361,6 +1482,7 @@ class BirdStampEditorWindow(QMainWindow, _BirdStampCropMixin, _BirdStampRenderer
             self.photo_render_overrides.pop(key, None)
         if removed_keys:
             self._bird_box_cache.clear()
+            self.photo_list.refresh_row_numbers()
 
         if self.photo_list.topLevelItemCount() == 0:
             self.placeholder_path = None
@@ -1392,7 +1514,7 @@ class BirdStampEditorWindow(QMainWindow, _BirdStampCropMixin, _BirdStampRenderer
     def _on_photo_selected(self, current: QTreeWidgetItem | None, _previous: QTreeWidgetItem | None) -> None:
         if not current:
             return
-        raw = current.data(0, Qt.ItemDataRole.UserRole)
+        raw = current.data(PHOTO_COL_ROW, PHOTO_LIST_PATH_ROLE)
         if not isinstance(raw, str):
             return
         path = Path(raw)
@@ -1469,7 +1591,7 @@ class BirdStampEditorWindow(QMainWindow, _BirdStampCropMixin, _BirdStampRenderer
         paths: list[Path] = []
         if selected_items:
             for item in selected_items:
-                raw = item.data(0, Qt.ItemDataRole.UserRole)
+                raw = item.data(PHOTO_COL_ROW, PHOTO_LIST_PATH_ROLE)
                 if isinstance(raw, str):
                     paths.append(Path(raw))
         elif self.current_path is not None and not self._is_placeholder_active():

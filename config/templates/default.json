@@ -19,12 +19,12 @@
   "crop_padding_fill": "#111111",
   "fields": [
     {
-      "name": "鸟种",
+      "name": "ReportDB — bird_species_cn  —  鸟种中文名",
       "tag": "bird",
       "fallback": "",
       "data_source": "report_db",
       "report_field": "bird_species_cn",
-      "align_horizontal": "right",
+      "align_horizontal": "left",
       "align_vertical": "bottom",
       "x_offset_pct": 0.5,
       "y_offset_pct": -6.0,
@@ -34,12 +34,12 @@
       "style": "normal"
     },
     {
-      "name": "机身",
+      "name": "ReportDB — bird_species_en  —  鸟种英文名",
       "tag": "EXIF:Model",
       "fallback": "",
       "data_source": "report_db",
       "report_field": "bird_species_en",
-      "align_horizontal": "right",
+      "align_horizontal": "left",
       "align_vertical": "bottom",
       "x_offset_pct": -1.0,
       "y_offset_pct": -4.0,
@@ -49,12 +49,12 @@
       "style": "bold"
     },
     {
-      "name": "镜头",
+      "name": "元数据 — {capture_text}  —  拍摄日期时间",
       "tag": "EXIF:LensModel",
-      "fallback": "{lens}",
+      "fallback": "{capture_text}",
       "data_source": "metadata",
       "report_field": "",
-      "align_horizontal": "right",
+      "align_horizontal": "left",
       "align_vertical": "bottom",
       "x_offset_pct": -1.0,
       "y_offset_pct": -1.0,
@@ -64,17 +64,17 @@
       "style": "normal"
     },
     {
-      "name": "参数",
-      "tag": "settings_text",
-      "fallback": "{settings_text}  —  拍摄参数",
-      "data_source": "metadata",
-      "report_field": "",
+      "name": "ReportDB — state_province  —  省/州",
+      "tag": "EXIF:Model",
+      "fallback": "",
+      "data_source": "report_db",
+      "report_field": "state_province",
       "align_horizontal": "left",
-      "align_vertical": "bottom",
-      "x_offset_pct": 1.0,
-      "y_offset_pct": -1.0,
-      "color": "#E53935",
-      "font_size": 20,
+      "align_vertical": "top",
+      "x_offset_pct": 0.0,
+      "y_offset_pct": 5.0,
+      "color": "#FFFFFF",
+      "font_size": 24,
       "font_type": "auto",
       "style": "normal"
     }

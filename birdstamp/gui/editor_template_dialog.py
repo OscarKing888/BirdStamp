@@ -963,10 +963,6 @@ class TemplateManagerDialog(QDialog):
         form = QFormLayout(group)
         _configure_form_layout(form)
 
-        self.field_name_edit = QLineEdit()
-        self.field_name_edit.textChanged.connect(self._apply_field_changes)
-        form.addRow("名称", self.field_name_edit)
-
         self._field_fallback_combo = QComboBox()
         self._field_fallback_combo.setEditable(True)
         self._field_fallback_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
@@ -1584,11 +1580,51 @@ class TemplateManagerDialog(QDialog):
     # Field list / editor
     # ------------------------------------------------------------------
 
+    def _fallback_combo_index_for_value(self, data_source: str, key: str) -> int:
+        combo = self._field_fallback_combo
+        target_source = str(data_source or "").strip().lower()
+        target_key = str(key or "").strip()
+        for idx in range(combo.count()):
+            item_data = combo.itemData(idx)
+            if not isinstance(item_data, (list, tuple)) or len(item_data) < 2:
+                continue
+            if str(item_data[0] or "").strip().lower() == target_source and str(item_data[1] or "").strip() == target_key:
+                return idx
+        return -1
+
+    def _field_source_display_text(self, field: dict[str, Any] | None, index: int = 0) -> str:
+        normalized = _normalize_template_field(field or {}, index)
+        data_source = str(normalized.get("data_source") or "metadata").strip().lower()
+        if data_source == "report_db":
+            report_field = str(normalized.get("report_field") or "").strip()
+            if report_field:
+                combo_idx = self._fallback_combo_index_for_value("report_db", report_field)
+                if combo_idx >= 0:
+                    return str(self._field_fallback_combo.itemText(combo_idx) or "").strip()
+                return f"ReportDB - {report_field}"
+        fallback = str(normalized.get("fallback") or "").strip()
+        if fallback:
+            combo_idx = self._fallback_combo_index_for_value("metadata", fallback)
+            if combo_idx >= 0:
+                return str(self._field_fallback_combo.itemText(combo_idx) or "").strip()
+            return fallback
+        return "（空）"
+
+    def _current_field_source_display_text(self) -> str:
+        text = str(self._field_fallback_combo.currentText() or "").strip()
+        return text or "（空）"
+
+    def _fallback_combo_uses_selected_item(self) -> bool:
+        idx = self._field_fallback_combo.currentIndex()
+        if idx < 0:
+            return False
+        return self._current_field_source_display_text() == str(self._field_fallback_combo.itemText(idx) or "").strip()
+
     def _populate_field_list(self, fields: list[dict[str, Any]]) -> None:
         self.field_list.blockSignals(True)
         self.field_list.clear()
         for idx, field in enumerate(fields):
-            display = str(field.get("name") or f"字段{idx + 1}")
+            display = self._field_source_display_text(field, idx)
             self.field_list.addItem(display)
         self.field_list.blockSignals(False)
 
@@ -1624,7 +1660,6 @@ class TemplateManagerDialog(QDialog):
         self._updating = True
         try:
             if not field:
-                self.field_name_edit.clear()
                 self._set_fallback_combo_value("")
                 self.field_align_h_combo.setCurrentText("left")
                 self.field_align_v_combo.setCurrentText("top")
@@ -1638,7 +1673,6 @@ class TemplateManagerDialog(QDialog):
                 return
 
             normalized = _normalize_template_field(field, 0)
-            self.field_name_edit.setText(normalized["name"])
             self._set_fallback_combo_value(
                 normalized.get("fallback", ""),
                 data_source=normalized.get("data_source"),
@@ -1727,9 +1761,7 @@ class TemplateManagerDialog(QDialog):
             if matched >= 0:
                 combo.setCurrentIndex(matched)
                 if combo.lineEdit():
-                    combo.lineEdit().setText(
-                        (fallback or "").strip() if (matched > 0 and ds == "metadata") else ""
-                    )
+                    combo.lineEdit().setText(str(combo.itemText(matched) or "").strip())
             if matched < 0:
                 combo.setCurrentIndex(0)
                 if combo.lineEdit():
@@ -1744,12 +1776,12 @@ class TemplateManagerDialog(QDialog):
         if data is not None and self.field_fallback_edit:
             old = self._updating
             self._updating = True
-            if isinstance(data, (list, tuple)) and len(data) >= 2:
-                _ds, key = data[0], data[1]
-                self.field_fallback_edit.setText(str(key) if _ds == "metadata" else "")
-            else:
-                self.field_fallback_edit.setText(str(data) if data else "")
-            self._updating = old
+            try:
+                self.field_fallback_edit.setText(
+                    str(self._field_fallback_combo.itemText(index) or "").strip()
+                )
+            finally:
+                self._updating = old
             self._apply_field_changes()
 
     def _apply_field_changes(self, *_args: Any) -> None:
@@ -1759,17 +1791,17 @@ class TemplateManagerDialog(QDialog):
         if not field or not self.current_payload:
             return
 
-        field["name"] = self.field_name_edit.text().strip() or "字段"
         item_data = self._field_fallback_combo.currentData()
-        if isinstance(item_data, (list, tuple)) and len(item_data) >= 2:
+        uses_selected_item = self._fallback_combo_uses_selected_item()
+        if uses_selected_item and isinstance(item_data, (list, tuple)) and len(item_data) >= 2:
             ds, key = str(item_data[0] or ""), str(item_data[1] or "")
             field["data_source"] = "report_db" if ds == "report_db" else "metadata"
             field["report_field"] = key if ds == "report_db" else ""
-            field["fallback"] = self.field_fallback_edit.text().strip() if ds == "metadata" else ""
+            field["fallback"] = key if ds == "metadata" else ""
         else:
             field["data_source"] = "metadata"
             field["report_field"] = ""
-            field["fallback"] = self.field_fallback_edit.text().strip()
+            field["fallback"] = str(self.field_fallback_edit.text() or "").strip()
         align_h = self.field_align_h_combo.currentText().strip().lower()
         align_v = self.field_align_v_combo.currentText().strip().lower()
         field["align_horizontal"] = align_h if align_h in ALIGN_OPTIONS_HORIZONTAL else "left"
@@ -1781,12 +1813,13 @@ class TemplateManagerDialog(QDialog):
         field["font_size"] = int(self.field_font_size_spin.value())
         style = self.field_style_combo.currentText().strip().lower()
         field["style"] = style if style in STYLE_OPTIONS else STYLE_OPTIONS[0]
+        field["name"] = self._current_field_source_display_text()
 
         idx = self._selected_field_index()
         if idx >= 0:
             item = self.field_list.item(idx)
             if item:
-                item.setText(field["name"])
+                item.setText(self._field_source_display_text(field, idx))
 
         self._save_current_template()
         self._refresh_preview()

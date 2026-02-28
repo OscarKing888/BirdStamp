@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
+import re
 from typing import Any, Callable, Dict, List, Optional, Protocol, runtime_checkable
 
 from app_common.report_db import PHOTO_COLUMNS
@@ -11,6 +13,17 @@ from birdstamp.meta.normalize import format_settings_line, normalize_metadata
 _REPORT_DB_PATH_COLUMNS = frozenset({
     "original_path", "current_path", "temp_jpeg_path", "debug_crop_path", "yolo_debug_path",
 })
+
+_PHOTO_AUTHOR_KEY_CANDIDATES: tuple[str, ...] = (
+    "XMP-dc:Creator",
+    "XMP:Creator",
+    "Creator",
+    "EXIF:Artist",
+    "Artist",
+    "IPTC:By-line",
+    "By-line",
+    "Author",
+)
 
 
 TemplateContext = Dict[str, str]
@@ -37,6 +50,97 @@ class _Registry:
 _REGISTRY = _Registry(providers=[])
 
 _REPORT_DB_ROW_RESOLVER: Optional[Callable[[Path], Optional[Dict[str, Any]]]] = None
+
+
+def _normalize_lookup(raw: Dict[str, Any]) -> Dict[str, Any]:
+    lookup: Dict[str, Any] = {}
+    for key, value in raw.items():
+        key_text = str(key or "").strip().lower()
+        if not key_text:
+            continue
+        lookup.setdefault(key_text, value)
+        if ":" in key_text:
+            lookup.setdefault(key_text.split(":")[-1], value)
+    return lookup
+
+
+def _clean_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        for codec in ("utf-8", "utf-16le", "latin1"):
+            try:
+                value = value.decode(codec, errors="ignore")
+                break
+            except Exception:
+                continue
+    if isinstance(value, (list, tuple)):
+        text_items = [_clean_text(item) for item in value]
+        return " ".join(item for item in text_items if item).strip()
+    if isinstance(value, dict):
+        text_items = [_clean_text(item) for item in value.values()]
+        return " ".join(item for item in text_items if item).strip()
+    text = str(value).replace("\x00", " ").strip()
+    return re.sub(r"\s+", " ", text)
+
+
+def _parse_datetime_value(value: Any) -> datetime | None:
+    text = _clean_text(value)
+    if not text:
+        return None
+    normalized = text.replace("T", " ").strip()
+    if "." in normalized:
+        normalized = normalized.split(".", 1)[0]
+    for pattern in (
+        "%Y:%m:%d %H:%M:%S%z",
+        "%Y:%m:%d %H:%M:%S",
+        "%Y-%m-%d %H:%M:%S%z",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+    ):
+        try:
+            return datetime.strptime(normalized, pattern)
+        except ValueError:
+            continue
+    try:
+        return datetime.fromisoformat(text)
+    except Exception:
+        return None
+
+
+def _extract_capture_date_text(path: Path, raw_metadata: Dict[str, Any]) -> str:
+    lookup = _normalize_lookup(raw_metadata)
+    for key in (
+        "DateTimeOriginal",
+        "CreateDate",
+        "DateTimeCreated",
+        "DateCreated",
+        "MediaCreateDate",
+    ):
+        value = lookup.get(key.lower())
+        dt = _parse_datetime_value(value)
+        if dt is not None:
+            return dt.strftime("%Y-%m-%d")
+    try:
+        return datetime.fromtimestamp(path.stat().st_ctime).strftime("%Y-%m-%d")
+    except Exception:
+        return ""
+
+
+def _extract_author_text(raw_metadata: Dict[str, Any]) -> str:
+    lookup = _normalize_lookup(raw_metadata)
+    for key in _PHOTO_AUTHOR_KEY_CANDIDATES:
+        value = lookup.get(key.lower())
+        text = _clean_text(value)
+        if text:
+            return text
+    for key, value in raw_metadata.items():
+        key_text = str(key or "").strip().lower()
+        if any(token in key_text for token in ("creator", "artist", "author", "by-line")):
+            text = _clean_text(value)
+            if text:
+                return text
+    return ""
 
 
 def register_template_context_provider(provider: TemplateContextProvider) -> None:
@@ -128,6 +232,26 @@ class ExifMetadataContextProvider:
             context["settings_text"] = settings
 
 
+class PhotoFileTemplateContextProvider:
+    """从照片文件元数据中提供模板字段，如拍摄日期与作者。"""
+
+    def __init__(self) -> None:
+        self._id = "photo_file"
+
+    @property
+    def id(self) -> str:
+        return self._id
+
+    def provide(self, path: Path, raw_metadata: Dict[str, Any], context: TemplateContext) -> None:
+        capture_date = _extract_capture_date_text(path, raw_metadata)
+        if capture_date:
+            context["capture_date"] = capture_date
+
+        author = _extract_author_text(raw_metadata)
+        if author:
+            context["author"] = author
+
+
 class ReportDBTemplateContextProvider:
     """从 report.db 中读取鸟种等字段并填充模板上下文的提供器。"""
 
@@ -164,6 +288,8 @@ class ReportDBTemplateContextProvider:
 def _ensure_default_providers_registered() -> None:
     if not any(p.id == "exif_metadata" for p in _REGISTRY.providers):
         register_template_context_provider(ExifMetadataContextProvider())
+    if not any(p.id == "photo_file" for p in _REGISTRY.providers):
+        register_template_context_provider(PhotoFileTemplateContextProvider())
     if not any(p.id == "report_db" for p in _REGISTRY.providers):
         register_template_context_provider(ReportDBTemplateContextProvider())
 
@@ -179,7 +305,9 @@ def build_template_context(path: Path, raw_metadata: Dict[str, Any]) -> Template
 
     context: TemplateContext = {
         "bird": "",
+        "capture_date": "",
         "capture_text": "",
+        "author": "",
         "location": "",
         "gps_text": "",
         "camera": "",
