@@ -5,6 +5,7 @@ from app_common.report_db import (
     ReportDB,
     existing_report_db_paths,
     find_report_root,
+    report_row_to_exiftool_style,
     resolve_existing_report_db_path,
 )
 
@@ -46,3 +47,29 @@ def test_open_if_exists_supports_root_report_db_and_find_report_root(tmp_path: P
         db.close()
 
     assert find_report_root(str(nested), max_levels=4) == str(tmp_path)
+
+
+def test_report_db_schema_contains_pick_column(tmp_path: Path) -> None:
+    db = ReportDB(str(tmp_path), create_if_missing=True)
+    try:
+        cols = [row[1] for row in db._conn.execute("PRAGMA table_info(photos)").fetchall()]
+    finally:
+        db.close()
+
+    assert "pick" in cols
+
+
+def test_report_row_to_exiftool_style_maps_pick_flag() -> None:
+    rec = report_row_to_exiftool_style(
+        {
+            "filename": "sample",
+            "rating": 4,
+            "pick": 1,
+            "bird_species_cn": "黑脸琵鹭",
+        },
+        "/tmp/sample.jpg",
+    )
+
+    assert rec["XMP-dc:Title"] == "黑脸琵鹭"
+    assert rec["XMP-xmp:Rating"] == 4
+    assert rec["XMP-xmpDM:pick"] == 1
