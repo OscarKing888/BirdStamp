@@ -23,6 +23,7 @@ _safe_color                         = editor_utils.safe_color
 _build_metadata_context             = editor_utils.build_metadata_context
 _default_placeholder_path           = editor_utils._default_placeholder_path
 _extract_focus_box                  = editor_core.extract_focus_box
+_extract_focus_box_for_display      = editor_core.extract_focus_box_for_display
 _resolve_focus_camera_type_from_metadata = editor_core.resolve_focus_camera_type_from_metadata
 _transform_source_box_after_crop_padding = editor_core.transform_source_box_after_crop_padding
 _normalize_center_mode              = editor_core.normalize_center_mode
@@ -166,7 +167,7 @@ class _BirdStampRendererMixin:
 
         source_width, source_height = self.current_source_image.size
         focus_camera_type = _resolve_focus_camera_type_from_metadata(self.current_raw_metadata)
-        focus_box_source = _extract_focus_box(
+        focus_box_source = _extract_focus_box_for_display(
             self.current_raw_metadata,
             source_width,
             source_height,
@@ -652,8 +653,10 @@ class _BirdStampRendererMixin:
         self.last_rendered = rendered
         pad_top, pad_bottom, pad_left, pad_right = outer_pad
         focus_camera_type = _resolve_focus_camera_type_from_metadata(raw_metadata)
+        # 注意：预览图是经过 EXIF Orientation 纠正后的显示坐标，不能直接用当前图像尺寸调用
+        # extract_focus_box()。这里必须走 extract_focus_box_for_display()，否则“显示对焦点”会再次错位。
         preview_focus_box = _transform_source_box_after_crop_padding(
-            _extract_focus_box(
+            _extract_focus_box_for_display(
                 raw_metadata,
                 self.current_source_image.width,
                 self.current_source_image.height,

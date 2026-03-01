@@ -13,6 +13,7 @@ from PIL import Image, ImageColor, ImageOps
 from app_common.focus_calc import (
     CameraFocusType,
     extract_focus_box as _extract_focus_box_by_camera_type,
+    extract_focus_box_for_display as _extract_focus_box_for_display_by_camera_type,
     get_focus_point as _get_focus_point_by_camera_type,
     resolve_focus_camera_type as _resolve_focus_camera_type,
     resolve_focus_camera_type_from_metadata as _resolve_focus_camera_type_from_metadata,
@@ -407,6 +408,16 @@ def extract_focus_box(
     camera_type: CameraFocusType | str | None = None,
 ) -> tuple[float, float, float, float] | None:
     return _extract_focus_box_by_camera_type(raw, width, height, camera_type=camera_type)
+
+
+def extract_focus_box_for_display(
+    raw: dict[str, Any],
+    width: int,
+    height: int,
+    camera_type: CameraFocusType | str | None = None,
+) -> tuple[float, float, float, float] | None:
+    """Resolve a preview-ready focus box using metadata size + Orientation mapping."""
+    return _extract_focus_box_for_display_by_camera_type(raw, width, height, camera_type=camera_type)
 
 
 def transform_focus_box_after_crop(

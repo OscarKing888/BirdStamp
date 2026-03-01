@@ -91,7 +91,7 @@ _parse_bool_value = editor_core.parse_bool_value
 _parse_ratio_value = editor_core.parse_ratio_value
 _parse_padding_value = editor_core.parse_padding_value
 _compute_crop_plan = editor_core.compute_crop_plan
-_extract_focus_box = editor_core.extract_focus_box
+_extract_focus_box_for_display = editor_core.extract_focus_box_for_display
 _resolve_focus_camera_type_from_metadata = editor_core.resolve_focus_camera_type_from_metadata
 _transform_source_box_after_crop_padding = editor_core.transform_source_box_after_crop_padding
 _detect_primary_bird_box = editor_core.detect_primary_bird_box
@@ -2042,8 +2042,10 @@ class TemplateManagerDialog(QDialog):
 
         source_width, source_height = (self._preview_source_image or self.placeholder).size
         pad_top, pad_bottom, pad_left, pad_right = outer_pad
+        # 模板管理器预览也必须沿用主编辑器同一套“元数据尺寸 + Orientation 映射”逻辑，
+        # 否则后续 AI 改动很容易把对焦框重新改回错位状态。
         preview_focus_box = _transform_source_box_after_crop_padding(
-            _extract_focus_box(
+            _extract_focus_box_for_display(
                 self._preview_raw_metadata,
                 source_width,
                 source_height,
