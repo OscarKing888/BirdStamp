@@ -34,7 +34,6 @@ from PyQt6.QtGui import (
 )
 from PyQt6.QtWidgets import (
     QAbstractItemView,
-    QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -69,7 +68,12 @@ from PyQt6.QtWidgets import (
 from app_common.about_dialog import load_about_info, load_about_images, show_about_dialog
 from app_common.app_info_bar import AppInfoBar
 from app_common.log import get_logger
-from app_common.send_to_app import SingleInstanceReceiver
+from app_common.send_to_app import (
+    SingleInstanceReceiver,
+    ensure_file_open_aware_application,
+    install_file_open_handler,
+    normalize_file_paths,
+)
 
 import birdstamp
 from birdstamp.config import get_config_path
@@ -1528,16 +1532,21 @@ class BirdStampEditorWindow(QMainWindow, _BirdStampCropMixin, _BirdStampRenderer
             return
         self._set_status(f"没有新增照片，已自动添加 {auto_added_report_db_count} 个 report.db。")
 
-    def add_received_file_paths(self, paths: list[str]) -> None:
+    def add_received_file_paths(self, paths: Iterable[str | Path]) -> None:
         """
-        由「发送到本应用」热接收回调调用，将接收到的文件路径加入照片列表。
+        统一处理 argv / socket / FileOpen 三种入口收到的文件路径，并加入照片列表。
         可在任意线程调用；内部通过 QTimer.singleShot 投递到主线程执行。
         """
-        if not paths:
+        normalized_paths = normalize_file_paths(paths)
+        if not normalized_paths:
             return
-        _log.info("send_to_app: received %d file(s), scheduling add to photo list: %s", len(paths), paths)
-        path_objs = [Path(p) for p in paths]
-        QTimer.singleShot(0, lambda: self._add_photo_paths(path_objs))
+        _log.info(
+            "received file list count=%s, scheduling add to photo list: %s",
+            len(normalized_paths),
+            normalized_paths,
+        )
+        path_objs = [Path(path_text) for path_text in normalized_paths]
+        QTimer.singleShot(0, lambda pending_paths=path_objs: self._add_photo_paths(pending_paths))
 
     def _remove_selected_photos(self) -> None:
         selected_items = self.photo_list.selectedItems()
@@ -1736,17 +1745,17 @@ def launch_gui(
         str(startup_file) if startup_file else "",
         [str(path) for path in (startup_files or [])],
     )
-    app = QApplication.instance() or QApplication(sys.argv)
-    window = BirdStampEditorWindow(startup_file=startup_file, startup_files=startup_files)
+    app = ensure_file_open_aware_application(sys.argv)
+    window = BirdStampEditorWindow()
     _log.info("editor window created")
-    window.showMaximized()
-    _log.info("editor window shown")
 
-    # 热接收：单例 IPC，其它进程通过 send_file_list_to_running_app 发来文件列表时加入本窗口照片列表
-    def on_files_received(paths: list[str]) -> None:
-        _log.info("received files from running instance count=%s", len(paths))
+    def on_files_received(paths: Iterable[str | Path]) -> None:
         window.add_received_file_paths(paths)
 
+    install_file_open_handler(app, on_files_received)
+    _log.info("FileOpen handler installed")
+
+    # 热接收：单例 IPC，其它进程通过 send_file_list_to_running_app 发来文件列表时加入本窗口照片列表
     receiver = SingleInstanceReceiver(SEND_TO_APP_ID, on_files_received)
     if receiver.start():
         window._send_to_app_receiver = receiver  # 保持引用，避免被回收；退出时可选 stop()
@@ -1764,6 +1773,16 @@ def launch_gui(
             except Exception as exc:
                 _log.warning("receiver stop failed: %s", exc)
 
+    startup_inputs: list[Path] = []
+    if startup_files:
+        startup_inputs = list(startup_files)
+    elif startup_file:
+        startup_inputs = [startup_file]
+
     app.aboutToQuit.connect(_on_about_to_quit)
+    window.showMaximized()
+    _log.info("editor window shown")
+    if startup_inputs:
+        QTimer.singleShot(0, lambda pending_paths=startup_inputs: on_files_received(pending_paths))
     exit_code = app.exec()
     _log.info("qt event loop exited code=%s window_visible=%s", exit_code, window.isVisible())
