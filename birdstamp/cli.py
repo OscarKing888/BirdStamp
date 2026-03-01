@@ -20,6 +20,12 @@ from app_common.exif_io import (
 )
 from birdstamp.meta.normalize import normalize_metadata
 from birdstamp.naming import build_output_name
+from birdstamp.gui.template_context import (
+    AutoProxyTemplateContextProvider,
+    PhotoInfo,
+    TEMPLATE_SOURCE_AUTO,
+    build_template_context_provider,
+)
 
 app = typer.Typer(add_completion=False, no_args_is_help=True, help="极速鸟框 photo banner CLI.")
 LOGGER = logging.getLogger("birdstamp")
@@ -292,6 +298,48 @@ def inspect_file(
             "resolved_exiftool": get_exiftool_executable_path(),
             "sidecar_xmp": find_xmp_sidecar(str(file)),
         }
+    typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+@app.command("inspect-auto-proxy")
+def inspect_auto_proxy(
+    file: Path = typer.Argument(..., exists=True, resolve_path=True, dir_okay=False),
+    field: str = typer.Argument("bird_species_cn", help="Logical field key resolved by AutoProxy."),
+    use_exiftool: str = typer.Option("auto", "--use-exiftool", help="auto|on|off"),
+) -> None:
+    """Inspect how AutoProxy resolves a logical template field for one file."""
+    resolved = file.resolve(strict=False)
+    mode = use_exiftool.lower()
+    try:
+        raw_metadata = extract_metadata_with_xmp_priority(file, mode=mode)
+    except Exception as exc:
+        typer.secho(f"Metadata extraction failed: {exc}", err=True, fg=typer.colors.RED)
+        raise typer.Exit(1)
+
+    photo_info = PhotoInfo.from_path(
+        resolved,
+        sidecar_path=find_xmp_sidecar(str(file)),
+        raw_metadata=raw_metadata,
+    )
+    provider = build_template_context_provider(TEMPLATE_SOURCE_AUTO, field)
+    payload = {
+        "file": str(resolved),
+        "sidecar_path": str(photo_info.sidecar_path) if photo_info.sidecar_path else None,
+        "field": field,
+        "display_caption": provider.get_display_caption(photo_info),
+        "text_content": provider.get_text_content(photo_info),
+    }
+    if isinstance(provider, AutoProxyTemplateContextProvider):
+        payload["candidates"] = [
+            {
+                "provider_id": candidate.provider_id,
+                "provider_name": candidate.provider_name,
+                "source_key": candidate.source_key,
+                "display_caption": candidate.display_caption,
+                "text_content": candidate.text_content,
+            }
+            for candidate in provider.inspect_candidates(photo_info)
+        ]
     typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
 
 

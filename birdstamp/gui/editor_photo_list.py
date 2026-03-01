@@ -4,7 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from PyQt6.QtCore import QEvent, QObject, pyqtSignal
+from PyQt6.QtCore import QEvent, QObject, Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QHeaderView,
@@ -20,6 +20,29 @@ from birdstamp.constants import SUPPORTED_EXTENSIONS
 from birdstamp.discover import discover_inputs
 from birdstamp.gui.editor_utils import path_key as _path_key
 
+# Column indices for editor photo list (must match header and editor.py usage)
+PHOTO_COL_SEQ = 0
+PHOTO_COL_NAME = 1
+PHOTO_COL_CAPTURE_TIME = 2
+PHOTO_COL_TITLE = 3
+PHOTO_COL_RATIO = 4
+PHOTO_COL_RATING = 5
+PHOTO_COL_ROW = 6
+
+# Custom item data roles (for path, sequence, sort key)
+_UserRole = int(Qt.ItemDataRole.UserRole)
+PHOTO_LIST_PATH_ROLE = _UserRole + 1
+PHOTO_LIST_SEQUENCE_ROLE = _UserRole + 2
+PHOTO_LIST_SORT_ROLE = _UserRole + 3
+PHOTO_LIST_PHOTO_INFO_ROLE = _UserRole + 4
+
+
+class PhotoListItem(QTreeWidgetItem):
+    """Tree item for editor photo list; constructor accepts list of column texts (e.g. 7 empty strings)."""
+
+    def __init__(self, texts: list[str]) -> None:
+        super().__init__(texts)
+
 
 class PhotoListWidget(FileListPanel):
     """
@@ -30,6 +53,8 @@ class PhotoListWidget(FileListPanel):
     - 底层实际使用 `FileListPanel` 的列表视图与样式实现
     - 隐藏 `FileListPanel` 的目录浏览专用增强 UI（缩略图切换、过滤栏、进度条）
     """
+
+    create_filter_bar = False
 
     pathsDropped = pyqtSignal(list)
     currentItemChanged = pyqtSignal(object, object)  # (QTreeWidgetItem | None, QTreeWidgetItem | None)
@@ -51,23 +76,29 @@ class PhotoListWidget(FileListPanel):
         # 隐藏 FileListPanel 扩展 UI（仍保留底层树控件）。
         self._hide_non_tree_ui()
 
-        # 将 FileListPanel 的 7 列配置收敛为主编辑器当前使用的 4 列。
-        self._tree_widget.setColumnCount(4)
-        self._tree_widget.setHeaderLabels(["照片", "Title", "裁切比例", "标星"])
+        # 主编辑器沿用通用文件列表的编号列，并收敛为 7 列（含隐藏 ROW 数据列）。
+        self._tree_widget.setColumnCount(7)
+        self._tree_widget.setHeaderLabels(["#", "文件名", "拍摄时间", "鸟名", "裁切比例", "标星", ""])
         self._tree_widget.setSortingEnabled(False)
         self._tree_widget.setAcceptDrops(True)
         self._tree_widget.setDragDropMode(QAbstractItemView.DragDropMode.DropOnly)
 
         header = self._tree_widget.header()
         header.setStretchLastSection(False)
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        header.resizeSection(0, 260)
-        header.resizeSection(1, 160)
-        header.resizeSection(2, 96)
-        header.resizeSection(3, 88)
+        header.setSectionResizeMode(PHOTO_COL_SEQ, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(PHOTO_COL_NAME, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(PHOTO_COL_CAPTURE_TIME, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(PHOTO_COL_TITLE, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(PHOTO_COL_RATIO, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(PHOTO_COL_RATING, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(PHOTO_COL_ROW, QHeaderView.ResizeMode.Fixed)
+        header.resizeSection(PHOTO_COL_SEQ, 44)
+        header.resizeSection(PHOTO_COL_NAME, 260)
+        header.resizeSection(PHOTO_COL_CAPTURE_TIME, 96)
+        header.resizeSection(PHOTO_COL_TITLE, 160)
+        header.resizeSection(PHOTO_COL_RATIO, 96)
+        header.resizeSection(PHOTO_COL_RATING, 88)
+        header.resizeSection(PHOTO_COL_ROW, 0)  # ROW 数据列隐藏
 
         # 兼容旧控件的默认行为
         self._tree_widget.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -241,3 +272,11 @@ class PhotoListWidget(FileListPanel):
 
     def selectedItems(self) -> list[QTreeWidgetItem]:
         return list(self._tree_widget.selectedItems())
+
+    def resort(self) -> None:
+        """主编辑器列表固定按编号列保持添加顺序。"""
+        self._tree_widget.sortByColumn(PHOTO_COL_SEQ, Qt.SortOrder.AscendingOrder)
+
+    def refresh_row_numbers(self) -> None:
+        """刷新行号显示；统一复用 FileListPanel 的通用实现。"""
+        super().refresh_row_numbers()

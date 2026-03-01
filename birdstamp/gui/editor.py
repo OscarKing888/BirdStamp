@@ -103,6 +103,7 @@ from birdstamp.gui.editor_photo_list import (
     PHOTO_COL_RATIO,
     PHOTO_COL_ROW,
     PHOTO_COL_TITLE,
+    PHOTO_LIST_PHOTO_INFO_ROLE,
     PHOTO_LIST_PATH_ROLE,
     PHOTO_LIST_SEQUENCE_ROLE,
     PHOTO_LIST_SORT_ROLE,
@@ -112,7 +113,7 @@ from birdstamp.gui.editor_photo_list import (
 from birdstamp.gui.editor_crop_calculator import _BirdStampCropMixin
 from birdstamp.gui.editor_renderer import _BirdStampRendererMixin
 from birdstamp.gui.editor_exporter import _BirdStampExporterMixin
-from app_common.report_db import ReportDB
+from app_common.report_db import ReportDB, resolve_existing_report_db_path
 
 # Re-export / aliases for refactored symbols (used below)
 ALIGN_OPTIONS_VERTICAL = editor_utils.ALIGN_OPTIONS_VERTICAL
@@ -300,6 +301,7 @@ class BirdStampEditorWindow(QMainWindow, _BirdStampCropMixin, _BirdStampRenderer
         self._bird_detector_preload_thread: threading.Thread | None = None
         self.last_rendered: Image.Image | None = None
         self.current_path: Path | None = None
+        self.current_photo_info: _template_context.PhotoInfo | None = None
         self.current_source_image: Image.Image | None = None
         self.current_raw_metadata: dict[str, Any] = {}
         self.current_metadata_context: dict[str, str] = {}
@@ -343,11 +345,11 @@ class BirdStampEditorWindow(QMainWindow, _BirdStampCropMixin, _BirdStampRenderer
             return
 
         def _resolver(path: Path) -> dict[str, Any] | None:
-            try:
-                stem = path.stem
-            except Exception:
-                return None
-            return cache.get(stem)
+            for key in _template_context.report_db_lookup_keys_for_path(path):
+                row = cache.get(key)
+                if isinstance(row, dict):
+                    return row
+            return None
 
         _template_context.set_report_db_row_resolver(_resolver)
 
@@ -357,29 +359,27 @@ class BirdStampEditorWindow(QMainWindow, _BirdStampCropMixin, _BirdStampRenderer
         for db_path in self._report_db_entries:
             try:
                 p = db_path
-                if p.name.lower() == "report.db" and p.parent.name == ".superpicky":
-                    directory = p.parent.parent
-                else:
-                    directory = p.parent
             except Exception:
                 continue
             try:
-                db = ReportDB.open_if_exists(str(directory))
+                db = ReportDB.open_db_path_if_exists(str(p))
             except Exception:
                 continue
             if not db:
                 continue
             try:
                 for row in db.get_all_photos():
+                    row_data = dict(row)
                     try:
-                        stem = str(row.get("filename") or "").strip()
+                        lookup_keys = _template_context.report_db_lookup_keys_for_value(row_data.get("filename"))
                     except Exception:
                         continue
-                    if not stem:
+                    if not lookup_keys:
                         continue
-                    if stem in cache:
-                        continue
-                    cache[stem] = dict(row)
+                    for key in lookup_keys:
+                        if key in cache:
+                            continue
+                        cache[key] = row_data
             finally:
                 try:
                     db.close()
@@ -417,6 +417,32 @@ class BirdStampEditorWindow(QMainWindow, _BirdStampCropMixin, _BirdStampRenderer
             added += 1
         if added:
             self._rebuild_report_db_cache()
+
+    def _auto_add_report_db_paths_for_photos(self, paths: Iterable[Path]) -> int:
+        """根据照片所在目录自动发现 report.db，并加入当前列表。"""
+        existing_count = len(self._report_db_entries)
+        candidates: list[Path] = []
+        seen_dirs: set[Path] = set()
+        for incoming in paths:
+            try:
+                photo_path = incoming if isinstance(incoming, Path) else Path(str(incoming))
+                photo_path = photo_path.resolve(strict=False)
+                parent = photo_path.parent
+            except Exception:
+                continue
+            if parent in seen_dirs:
+                continue
+            seen_dirs.add(parent)
+            db_path = resolve_existing_report_db_path(str(parent))
+            if not db_path:
+                continue
+            try:
+                candidates.append(Path(db_path))
+            except Exception:
+                continue
+        if candidates:
+            self._add_report_db_paths(candidates)
+        return max(0, len(self._report_db_entries) - existing_count)
 
     def _remove_selected_report_dbs(self) -> None:
         """从列表中移除选中的 report.db，并更新缓存。"""
@@ -482,7 +508,7 @@ class BirdStampEditorWindow(QMainWindow, _BirdStampCropMixin, _BirdStampRenderer
         splitter.addWidget(right_panel)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
-        splitter.setSizes([500, 920])
+        splitter.setSizes([600, 920])
         splitter.setChildrenCollapsible(False)
 
         self.setStatusBar(self.statusBar())
@@ -496,6 +522,8 @@ class BirdStampEditorWindow(QMainWindow, _BirdStampCropMixin, _BirdStampRenderer
 
         self.report_db_list = _ReportDBListWidget(self)
         self.report_db_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        row_h = self.report_db_list.fontMetrics().height() + 4
+        self.report_db_list.setMaximumHeight(2 * row_h + 6)
         db_layout.addWidget(self.report_db_list, stretch=1)
 
         db_btn_row = QHBoxLayout()
@@ -564,11 +592,11 @@ class BirdStampEditorWindow(QMainWindow, _BirdStampCropMixin, _BirdStampRenderer
             return
 
         def _resolver(path: Path) -> dict[str, Any] | None:
-            try:
-                stem = path.stem
-            except Exception:
-                return None
-            return cache.get(stem)
+            for key in _template_context.report_db_lookup_keys_for_path(path):
+                row = cache.get(key)
+                if isinstance(row, dict):
+                    return row
+            return None
 
         _template_context.set_report_db_row_resolver(_resolver)
 
@@ -827,18 +855,23 @@ class BirdStampEditorWindow(QMainWindow, _BirdStampCropMixin, _BirdStampRenderer
                 padding: 0 4px;
                 font-weight: 600;
             }}
-            QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {{
+            QLineEdit {{
                 border: 1px solid {border_color.name()};
                 border-radius: 7px;
                 background: {base_color.name()};
                 color: {text_color.name()};
-                min-height: 24px;
+                min-height: 28px;
             }}
             QLineEdit {{
-                padding: 4px 6px;
+                padding: 5px 8px;
             }}
-            QComboBox, QSpinBox, QDoubleSpinBox {{
-                padding: 4px 26px 4px 6px;
+            QComboBox QAbstractItemView {{
+                background: {base_color.name()};
+                color: {text_color.name()};
+                border: 1px solid {border_color.name()};
+                selection-background-color: {hover_color.name()};
+                selection-color: {text_color.name()};
+                outline: none;
             }}
             QListWidget, QTreeWidget {{
                 border: 1px solid {border_color.name()};
@@ -1185,84 +1218,97 @@ class BirdStampEditorWindow(QMainWindow, _BirdStampCropMixin, _BirdStampRenderer
         except Exception:
             return None
 
-    def _extract_display_capture_time_from_metadata(
-        self, raw_metadata: dict[str, Any]
-    ) -> tuple[str, tuple[int, float]]:
-        if not isinstance(raw_metadata, dict):
-            return "-", (1, 0.0)
-
-        lookup = _normalize_lookup(raw_metadata)
-        key_candidates = (
-            "EXIF:DateTimeOriginal",
-            "ExifIFD:DateTimeOriginal",
-            "XMP-exif:DateTimeOriginal",
-            "DateTimeOriginal",
-            "EXIF:CreateDate",
-            "XMP-xmp:CreateDate",
-            "CreateDate",
-            "DateTimeCreated",
-            "DateCreated",
-            "MediaCreateDate",
+    def _photo_info_for_display(
+        self,
+        path: Path,
+        *,
+        raw_metadata: dict[str, Any] | None = None,
+    ) -> _template_context.PhotoInfo:
+        item = self._find_photo_item_by_path(path)
+        existing = item.data(PHOTO_COL_ROW, PHOTO_LIST_PHOTO_INFO_ROLE) if item is not None else None
+        metadata = raw_metadata if isinstance(raw_metadata, dict) else self._load_raw_metadata(path)
+        photo_info = _template_context.ensure_photo_info(
+            existing if isinstance(existing, _template_context.PhotoInfo) else path,
+            raw_metadata=metadata,
         )
-        for key in key_candidates:
-            value = lookup.get(key.lower())
-            if value is None:
-                value = raw_metadata.get(key)
-            capture_dt = self._parse_display_capture_datetime(value)
-            if capture_dt is not None:
-                try:
-                    sort_value = float(capture_dt.timestamp())
-                except Exception:
-                    sort_value = 0.0
-                return capture_dt.strftime("%Y-%m-%d %H:%M:%S"), (0, sort_value)
-        return "-", (1, 0.0)
+        if item is not None:
+            item.setData(PHOTO_COL_ROW, PHOTO_LIST_PHOTO_INFO_ROLE, photo_info)
+        return photo_info
 
-    def _extract_display_title_from_metadata(self, raw_metadata: dict[str, Any]) -> str:
-        if not isinstance(raw_metadata, dict):
-            return ""
-
-        def _value_to_text(value: Any) -> str:
-            if isinstance(value, dict):
-                for nested in value.values():
-                    text = _clean_text(nested)
-                    if text:
-                        return text
-                return ""
-            text = _clean_text(value)
-            return text or ""
-
-        lookup = _normalize_lookup(raw_metadata)
-        key_candidates = (
-            "XMP:Title",
-            "XMP-dc:Title",
-            "IPTC:ObjectName",
-            "IPTC:Headline",
-            "EXIF:ImageDescription",
-            "EXIF:XPTitle",
-            "Image:Title",
-            "Title",
-            "ImageDescription",
-        )
-        for key in key_candidates:
-            value = lookup.get(key.lower())
-            if value is None:
-                value = raw_metadata.get(key)
-            text = _value_to_text(value)
+    def _provider_text_candidates(
+        self,
+        photo_info: _template_context.PhotoInfo,
+        candidates: Iterable[str],
+    ) -> str:
+        for source_key in candidates:
+            provider = _template_context.build_template_context_provider(
+                _template_context.TEMPLATE_SOURCE_AUTO,
+                source_key,
+            )
+            text = str(provider.get_text_content(photo_info) or "").strip()
             if text:
                 return text
-
-        for key, value in raw_metadata.items():
-            key_text = str(key or "").strip().lower()
-            if ("title" in key_text) or key_text.endswith("imagedescription") or key_text.endswith("headline"):
-                text = _value_to_text(value)
-                if text:
-                    return text
         return ""
 
-    def _extract_display_rating_from_metadata(self, raw_metadata: dict[str, Any]) -> int | None:
-        if not isinstance(raw_metadata, dict):
-            return None
+    def _display_filename_from_photo_info(self, photo_info: _template_context.PhotoInfo) -> str:
+        return self._provider_text_candidates(
+            photo_info,
+            ["{filename}"],
+        )
 
+    def _extract_display_capture_time_from_metadata(
+        self,
+        photo_info: _template_context.PhotoInfo,
+    ) -> tuple[str, tuple[int, float]]:
+        capture_text = self._provider_text_candidates(
+            photo_info,
+            [
+                "capture_text",
+                "{capture_text}",
+                "capture_date",
+                "{capture_date}",
+                "EXIF:DateTimeOriginal",
+                "ExifIFD:DateTimeOriginal",
+                "XMP-exif:DateTimeOriginal",
+                "DateTimeOriginal",
+                "EXIF:CreateDate",
+                "XMP-xmp:CreateDate",
+                "CreateDate",
+                "DateTimeCreated",
+                "DateCreated",
+                "MediaCreateDate",
+            ],
+        )
+        capture_dt = self._parse_display_capture_datetime(capture_text)
+        if capture_dt is not None:
+            try:
+                sort_value = float(capture_dt.timestamp())
+            except Exception:
+                sort_value = 0.0
+            return capture_dt.strftime("%Y-%m-%d %H:%M:%S"), (0, sort_value)
+        return "-", (1, 0.0)
+
+    def _extract_display_title_from_metadata(self, photo_info: _template_context.PhotoInfo) -> str:
+        return self._provider_text_candidates(
+            photo_info,
+            [
+                "bird_species_cn",
+                "{bird_common}",
+                "{bird}",
+                "bird",
+                "XMP:Title",
+                "XMP-dc:Title",
+                "IPTC:ObjectName",
+                "IPTC:Headline",
+                "EXIF:ImageDescription",
+                "EXIF:XPTitle",
+                "Image:Title",
+                "Title",
+                "ImageDescription",
+            ],
+        )
+
+    def _extract_display_rating_from_metadata(self, photo_info: _template_context.PhotoInfo) -> int | None:
         def _value_to_rating(value: Any) -> int | None:
             if value is None:
                 return None
@@ -1301,23 +1347,22 @@ class BirdStampEditorWindow(QMainWindow, _BirdStampCropMixin, _BirdStampRenderer
             score = int(round(raw_score))
             return max(0, min(5, score))
 
-        lookup = _normalize_lookup(raw_metadata)
-        key_candidates = (
-            "XMP:Rating",
-            "XMP-xmp:Rating",
-            "EXIF:Rating",
-            "Composite:Rating",
-            "Rating",
+        rating_text = self._provider_text_candidates(
+            photo_info,
+            [
+                "rating",
+                "XMP:Rating",
+                "XMP-xmp:Rating",
+                "EXIF:Rating",
+                "Composite:Rating",
+                "Rating",
+            ],
         )
-        for key in key_candidates:
-            value = lookup.get(key.lower())
-            if value is None:
-                value = raw_metadata.get(key)
-            parsed = _value_to_rating(value)
-            if parsed is not None:
-                return parsed
+        parsed = _value_to_rating(rating_text)
+        if parsed is not None:
+            return parsed
 
-        for key, value in raw_metadata.items():
+        for key, value in (_template_context.ensure_photo_info(photo_info).raw_metadata or {}).items():
             key_text = str(key or "").strip().lower()
             if "rating" not in key_text:
                 continue
@@ -1371,9 +1416,11 @@ class BirdStampEditorWindow(QMainWindow, _BirdStampCropMixin, _BirdStampRenderer
             return
 
         metadata = raw_metadata if isinstance(raw_metadata, dict) else self._load_raw_metadata(path)
-        capture_time_text, capture_time_sort = self._extract_display_capture_time_from_metadata(metadata)
-        title = self._extract_display_title_from_metadata(metadata)
-        rating_value = self._extract_display_rating_from_metadata(metadata)
+        photo_info = self._photo_info_for_display(path, raw_metadata=metadata)
+        filename_text = self._display_filename_from_photo_info(photo_info) or path.name
+        capture_time_text, capture_time_sort = self._extract_display_capture_time_from_metadata(photo_info)
+        title = self._extract_display_title_from_metadata(photo_info)
+        rating_value = self._extract_display_rating_from_metadata(photo_info)
         rating_text = self._format_rating_display(rating_value)
         active_settings = (
             settings
@@ -1383,7 +1430,7 @@ class BirdStampEditorWindow(QMainWindow, _BirdStampCropMixin, _BirdStampRenderer
         ratio_value = _parse_ratio_value(active_settings.get("ratio"))
         ratio_text = self._format_ratio_display(ratio_value)
 
-        item.setText(PHOTO_COL_NAME, path.name)
+        item.setText(PHOTO_COL_NAME, filename_text)
         item.setText(PHOTO_COL_CAPTURE_TIME, capture_time_text)
         item.setText(PHOTO_COL_TITLE, title or "-")
         item.setText(PHOTO_COL_RATIO, ratio_text)
@@ -1396,7 +1443,7 @@ class BirdStampEditorWindow(QMainWindow, _BirdStampCropMixin, _BirdStampRenderer
         item.setTextAlignment(PHOTO_COL_CAPTURE_TIME, int(Qt.AlignmentFlag.AlignCenter))
         item.setTextAlignment(PHOTO_COL_RATIO, int(Qt.AlignmentFlag.AlignCenter))
         item.setTextAlignment(PHOTO_COL_RATING, int(Qt.AlignmentFlag.AlignCenter))
-        item.setData(PHOTO_COL_NAME, PHOTO_LIST_SORT_ROLE, (0, path.name.casefold()))
+        item.setData(PHOTO_COL_NAME, PHOTO_LIST_SORT_ROLE, (0, filename_text.casefold()))
         item.setData(PHOTO_COL_CAPTURE_TIME, PHOTO_LIST_SORT_ROLE, capture_time_sort)
         item.setData(PHOTO_COL_TITLE, PHOTO_LIST_SORT_ROLE, (0, title.casefold()) if title else (1, ""))
         item.setData(
@@ -1423,14 +1470,24 @@ class BirdStampEditorWindow(QMainWindow, _BirdStampCropMixin, _BirdStampRenderer
         return paths
 
     def _add_photo_paths(self, paths: Iterable[Path]) -> None:
+        valid_paths: list[Path] = []
+        for incoming in paths:
+            try:
+                path = incoming if isinstance(incoming, Path) else Path(str(incoming))
+                path = path.resolve(strict=False)
+            except Exception:
+                continue
+            if not path.is_file() or path.suffix.lower() not in SUPPORTED_EXTENSIONS:
+                continue
+            valid_paths.append(path)
+
+        auto_added_report_db_count = self._auto_add_report_db_paths_for_photos(valid_paths)
+
         existing_keys = {_path_key(path) for path in self._list_photo_paths()}
         default_settings = self._build_current_render_settings()
         add_count = 0
 
-        for incoming in paths:
-            path = incoming.resolve(strict=False)
-            if not path.is_file() or path.suffix.lower() not in SUPPORTED_EXTENSIONS:
-                continue
+        for path in valid_paths:
             key = _path_key(path)
             if key in existing_keys:
                 continue
@@ -1439,9 +1496,11 @@ class BirdStampEditorWindow(QMainWindow, _BirdStampCropMixin, _BirdStampRenderer
             current_settings = self._clone_render_settings(default_settings)
             self.photo_render_overrides[key] = current_settings
             raw_metadata = self._load_raw_metadata(path)
-            item = PhotoListItem(["", "", "", "", "", ""])
+            photo_info = _template_context.ensure_photo_info(path, raw_metadata=raw_metadata)
+            item = PhotoListItem(["", "", "", "", "", "", ""])
             sequence_value = self._next_photo_sequence_value()
             item.setData(PHOTO_COL_ROW, PHOTO_LIST_PATH_ROLE, str(path))
+            item.setData(PHOTO_COL_ROW, PHOTO_LIST_PHOTO_INFO_ROLE, photo_info)
             item.setData(PHOTO_COL_ROW, PHOTO_LIST_SEQUENCE_ROLE, sequence_value)
             item.setData(PHOTO_COL_ROW, PHOTO_LIST_SORT_ROLE, (0, sequence_value))
             item.setToolTip(PHOTO_COL_ROW, "")
@@ -1450,7 +1509,7 @@ class BirdStampEditorWindow(QMainWindow, _BirdStampCropMixin, _BirdStampRenderer
             self._update_photo_list_item_display(path, raw_metadata=raw_metadata, settings=current_settings)
             add_count += 1
 
-        if add_count == 0:
+        if add_count == 0 and auto_added_report_db_count == 0:
             self._set_status("没有新增照片。")
             return
 
@@ -1461,7 +1520,13 @@ class BirdStampEditorWindow(QMainWindow, _BirdStampCropMixin, _BirdStampRenderer
 
         self.photo_list.refresh_row_numbers()
 
-        self._set_status(f"已添加 {add_count} 张照片。")
+        if add_count > 0 and auto_added_report_db_count > 0:
+            self._set_status(f"已添加 {add_count} 张照片，并自动添加 {auto_added_report_db_count} 个 report.db。")
+            return
+        if add_count > 0:
+            self._set_status(f"已添加 {add_count} 张照片。")
+            return
+        self._set_status(f"没有新增照片，已自动添加 {auto_added_report_db_count} 个 report.db。")
 
     def _remove_selected_photos(self) -> None:
         selected_items = self.photo_list.selectedItems()
@@ -1487,6 +1552,7 @@ class BirdStampEditorWindow(QMainWindow, _BirdStampCropMixin, _BirdStampRenderer
         if self.photo_list.topLevelItemCount() == 0:
             self.placeholder_path = None
             self.current_path = None
+            self.current_photo_info = None
             self.current_source_image = None
             self.current_raw_metadata = {}
             self.current_metadata_context = {}
@@ -1503,6 +1569,7 @@ class BirdStampEditorWindow(QMainWindow, _BirdStampCropMixin, _BirdStampRenderer
         self._bird_box_cache.clear()
         self.placeholder_path = None
         self.current_path = None
+        self.current_photo_info = None
         self.current_source_image = None
         self.current_raw_metadata = {}
         self.current_metadata_context = {}
@@ -1533,7 +1600,13 @@ class BirdStampEditorWindow(QMainWindow, _BirdStampCropMixin, _BirdStampRenderer
         self.current_source_image = image
         self._invalidate_original_mode_cache()
         self.current_raw_metadata = self._load_raw_metadata(path)
-        self.current_metadata_context = _build_metadata_context(path, self.current_raw_metadata)
+        photo_info = current.data(PHOTO_COL_ROW, PHOTO_LIST_PHOTO_INFO_ROLE)
+        self.current_photo_info = _template_context.ensure_photo_info(
+            photo_info if isinstance(photo_info, _template_context.PhotoInfo) else path,
+            raw_metadata=self.current_raw_metadata,
+        )
+        current.setData(PHOTO_COL_ROW, PHOTO_LIST_PHOTO_INFO_ROLE, self.current_photo_info)
+        self.current_metadata_context = _build_metadata_context(self.current_photo_info, self.current_raw_metadata)
         settings = self._render_settings_for_path(path, prefer_current_ui=False)
         self._apply_render_settings_to_ui(settings)
         self._update_photo_list_item_display(path, raw_metadata=self.current_raw_metadata, settings=settings)

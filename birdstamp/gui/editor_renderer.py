@@ -14,7 +14,7 @@ from PIL import Image
 from PyQt6.QtGui import QPixmap
 
 from birdstamp.decoders.image_decoder import decode_image
-from birdstamp.gui import editor_core, editor_options, editor_template, editor_utils
+from birdstamp.gui import editor_core, editor_options, editor_template, editor_utils, template_context as _template_context
 from birdstamp.gui.editor_preview_canvas import EditorPreviewOverlayOptions, EditorPreviewOverlayState
 
 _pil_to_qpixmap                     = editor_utils.pil_to_qpixmap
@@ -139,6 +139,7 @@ class _BirdStampRendererMixin:
                 preview_base=img,
                 raw_metadata=raw_metadata,
                 metadata_context=dict(self.current_metadata_context),
+                photo_info=self.current_photo_info,
                 settings=original_settings,
                 crop_box=crop_box,
             )
@@ -226,7 +227,8 @@ class _BirdStampRendererMixin:
                 self.current_source_image = image
                 self._invalidate_original_mode_cache()
                 self.current_raw_metadata = self._load_raw_metadata(src)
-                self.current_metadata_context = _build_metadata_context(src, self.current_raw_metadata)
+                self.current_photo_info = _template_context.ensure_photo_info(src, raw_metadata=self.current_raw_metadata)
+                self.current_metadata_context = _build_metadata_context(self.current_photo_info, self.current_raw_metadata)
                 # 走正常渲染流程（current_path 已设置，不会再次调用本函数）
                 self.render_preview()
                 return
@@ -235,6 +237,7 @@ class _BirdStampRendererMixin:
         # 回退：default.jpg 不可用，显示裸 PIL 占位图
         self.placeholder_path = None
         self.current_path = None
+        self.current_photo_info = None
         self.current_source_image = None
         self.current_raw_metadata = {}
         self.current_metadata_context = {}
@@ -527,6 +530,7 @@ class _BirdStampRendererMixin:
         preview_base: Image.Image,
         raw_metadata: dict[str, Any],
         metadata_context: dict[str, str],
+        photo_info: _template_context.PhotoInfo | None,
         settings: dict[str, Any],
         crop_box: tuple[float, float, float, float] | None,
     ) -> Image.Image:
@@ -539,6 +543,7 @@ class _BirdStampRendererMixin:
             preview_base,
             raw_metadata=raw_metadata,
             metadata_context=metadata_context,
+            photo_info=photo_info,
             template_payload=template_payload,
             crop_box=crop_box,
             draw_banner=_parse_bool_value(settings.get("draw_banner"), True),
@@ -594,12 +599,15 @@ class _BirdStampRendererMixin:
         template_payload = self._resolve_template_payload_for_render(settings)
         if self.current_path and path == self.current_path and self.current_source_image is not None:
             context = dict(self.current_metadata_context)
+            photo_info = self.current_photo_info
         else:
-            context = _build_metadata_context(path, raw_metadata)
+            photo_info = _template_context.ensure_photo_info(path, raw_metadata=raw_metadata)
+            context = _build_metadata_context(photo_info, raw_metadata)
         return render_template_overlay(
             processed,
             raw_metadata=raw_metadata,
             metadata_context=context,
+            photo_info=photo_info,
             template_payload=template_payload,
             draw_banner=_parse_bool_value(settings.get("draw_banner"), True),
             draw_text=_parse_bool_value(settings.get("draw_text"), True),
@@ -638,6 +646,7 @@ class _BirdStampRendererMixin:
                 preview_base=processed,
                 raw_metadata=raw_metadata,
                 metadata_context=dict(self.current_metadata_context),
+                photo_info=self.current_photo_info,
                 settings=preview_settings,
                 crop_box=crop_box,
             )

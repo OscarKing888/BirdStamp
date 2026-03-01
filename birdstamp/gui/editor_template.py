@@ -24,6 +24,16 @@ from birdstamp.gui.editor_core import (
 from birdstamp.gui.editor_core import parse_bool_value as _parse_bool_value
 from birdstamp.gui.editor_core import parse_ratio_value as _parse_ratio_value
 from birdstamp.gui.editor_options import DEFAULT_FIELD_TAG, STYLE_OPTIONS
+from birdstamp.gui.template_context import (
+    PhotoInfo,
+    TEMPLATE_SOURCE_AUTO,
+    TEMPLATE_SOURCE_EXIF,
+    TEMPLATE_SOURCE_FROM_FILE,
+    TEMPLATE_SOURCE_REPORT_DB,
+    build_template_context_provider,
+    ensure_photo_info,
+    normalize_template_source_type,
+)
 from birdstamp.gui.editor_utils import (
     ALIGN_OPTIONS_HORIZONTAL,
     ALIGN_OPTIONS_VERTICAL,
@@ -138,6 +148,56 @@ def _deep_copy_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return json.loads(json.dumps(payload, ensure_ascii=False))
 
 
+def _normalize_template_text_source(data: dict[str, Any]) -> dict[str, str]:
+    source_raw = data.get("text_source")
+    source_type = ""
+    source_key = ""
+    if isinstance(source_raw, dict):
+        source_type = normalize_template_source_type(
+            source_raw.get("type") or source_raw.get("provider_id") or source_raw.get("data_source")
+        )
+        source_key = str(
+            source_raw.get("key") or source_raw.get("value") or source_raw.get("source_key") or ""
+        ).strip()
+
+    legacy_data_source = normalize_template_source_type(data.get("data_source"))
+    legacy_report_field = str(data.get("report_field") or "").strip()
+    legacy_fallback = str(data.get("fallback") or "").strip()
+    legacy_tag = str(data.get("tag") or DEFAULT_FIELD_TAG).strip()
+
+    if not source_key:
+        if legacy_data_source == TEMPLATE_SOURCE_REPORT_DB and legacy_report_field:
+            source_type = TEMPLATE_SOURCE_AUTO
+            source_key = legacy_report_field
+        elif legacy_data_source == TEMPLATE_SOURCE_EXIF and legacy_tag:
+            source_type = TEMPLATE_SOURCE_AUTO
+            source_key = legacy_tag
+        elif legacy_fallback:
+            source_type = TEMPLATE_SOURCE_AUTO
+            source_key = legacy_fallback
+        elif legacy_report_field:
+            source_type = TEMPLATE_SOURCE_AUTO
+            source_key = legacy_report_field
+        elif legacy_tag:
+            source_type = TEMPLATE_SOURCE_AUTO
+            source_key = legacy_tag
+
+    source_type = normalize_template_source_type(source_type)
+    if source_key and source_type in {
+        TEMPLATE_SOURCE_EXIF,
+        TEMPLATE_SOURCE_FROM_FILE,
+        TEMPLATE_SOURCE_REPORT_DB,
+    }:
+        source_type = TEMPLATE_SOURCE_AUTO
+    if not source_key:
+        source_type = TEMPLATE_SOURCE_AUTO
+        source_key = "{bird}"
+    return {
+        "type": source_type,
+        "key": source_key,
+    }
+
+
 def _normalize_template_field(data: dict[str, Any], index: int) -> dict[str, Any]:
     align_h = str(data.get("align_horizontal") or data.get("align") or "left").lower()
     if align_h not in ALIGN_OPTIONS_HORIZONTAL:
@@ -151,16 +211,25 @@ def _normalize_template_field(data: dict[str, Any], index: int) -> dict[str, Any
     font_type = str(data.get("font_type") or "").strip()
     if not font_type or font_type.lower() in {"auto", "default", "system", "none"}:
         font_type = "auto"
-    data_source = str(data.get("data_source") or "").strip().lower()
-    if data_source not in ("metadata", "report_db"):
-        data_source = "metadata"
-    report_field = str(data.get("report_field") or "").strip() if data_source == "report_db" else ""
+    text_source = _normalize_template_text_source(data)
+    data_source = text_source["type"]
+    source_key = text_source["key"]
+    report_field = ""
+    fallback = ""
+    tag = str(data.get("tag") or DEFAULT_FIELD_TAG)
+    if data_source == TEMPLATE_SOURCE_REPORT_DB:
+        report_field = source_key
+    elif data_source == TEMPLATE_SOURCE_FROM_FILE:
+        fallback = source_key
+    elif data_source == TEMPLATE_SOURCE_EXIF:
+        tag = source_key
     return {
         "name": str(data.get("name") or f"字段{index + 1}"),
-        "tag": str(data.get("tag") or DEFAULT_FIELD_TAG),
-        "fallback": str(data.get("fallback") or ""),
+        "tag": tag,
+        "fallback": fallback,
         "data_source": data_source,
         "report_field": report_field,
+        "text_source": text_source,
         "align_horizontal": align_h,
         "align_vertical": align_v,
         "x_offset_pct": round(_clamp_float(data.get("x_offset_pct"), -100.0, 100.0, 0.0), 2),
@@ -170,6 +239,14 @@ def _normalize_template_field(data: dict[str, Any], index: int) -> dict[str, Any
         "font_type": font_type,
         "style": style,
     }
+
+
+def _resolve_template_field_text(provider, photo_info: PhotoInfo) -> str:
+    """模板渲染文本优先取实际内容，空值时回退到 provider caption。"""
+    text = clean_text(provider.get_text_content(photo_info))
+    if text:
+        return text
+    return clean_text(provider.get_display_caption(photo_info))
 
 
 def _default_template_field() -> dict[str, Any]:
@@ -606,6 +683,7 @@ def render_template_overlay(
     *,
     raw_metadata: dict[str, Any],
     metadata_context: dict[str, str],
+    photo_info: PhotoInfo | None = None,
     template_payload: dict[str, Any],
     auto_scale_font: bool = True,
     draw_banner: bool = True,
@@ -613,7 +691,6 @@ def render_template_overlay(
 ) -> Image.Image:
     canvas = image.convert("RGBA")
     draw = ImageDraw.Draw(canvas)
-    lookup = normalize_lookup(raw_metadata)
     font_scale = _template_font_scale_for_canvas(canvas.width, canvas.height) if auto_scale_font else 1.0
     occupied_boxes: list[tuple[int, int, int, int]] = []
     text_gap = max(4, int(round(min(canvas.width, canvas.height) * 0.006)))
@@ -621,21 +698,19 @@ def render_template_overlay(
     fields = template_payload.get("fields") or []
     if not isinstance(fields, list):
         fields = []
+    source_file = raw_metadata.get("SourceFile") or raw_metadata.get("sourcefile") or "."
+    render_photo_info = ensure_photo_info(photo_info or source_file, raw_metadata=raw_metadata)
     for field_index, raw_field in enumerate(fields):
         if not isinstance(raw_field, dict):
             continue
         field = _normalize_template_field(raw_field, field_index)
-        data_source = str(field.get("data_source") or "metadata")
-        report_field = str(field.get("report_field") or "").strip()
-        if data_source == "report_db" and report_field:
-            text = clean_text(metadata_context.get("report." + report_field, "") or "")
-        else:
-            expr = str(field.get("fallback") or "")
-            text = clean_text(_format_with_context(expr, metadata_context))
-            if not text and field.get("tag"):
-                text = _lookup_tag_value(str(field["tag"]), lookup, metadata_context)
-                if text:
-                    text = clean_text(text)
+        text_source = field.get("text_source") or {}
+        provider = build_template_context_provider(
+            str(text_source.get("type") or TEMPLATE_SOURCE_FROM_FILE),
+            str(text_source.get("key") or ""),
+            display_label=str(field.get("name") or ""),
+        )
+        text = _resolve_template_field_text(provider, render_photo_info)
         if not text:
             continue
         font_size_base = max(8, int(field.get("font_size") or 24))
@@ -777,6 +852,7 @@ def render_template_overlay_in_crop_region(
     *,
     raw_metadata: dict[str, Any],
     metadata_context: dict[str, str],
+    photo_info: PhotoInfo | None = None,
     template_payload: dict[str, Any],
     crop_box: tuple[float, float, float, float] | None,
     draw_banner: bool = True,
@@ -785,6 +861,7 @@ def render_template_overlay_in_crop_region(
     kw = dict(
         raw_metadata=raw_metadata,
         metadata_context=metadata_context,
+        photo_info=photo_info,
         template_payload=template_payload,
         draw_banner=draw_banner,
         draw_text=draw_text,

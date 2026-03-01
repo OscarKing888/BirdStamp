@@ -44,7 +44,7 @@ from PyQt6.QtWidgets import (
 )
 
 from app_common.preview_canvas import PreviewWithStatusBar
-from birdstamp.gui import editor_core, editor_options, editor_template, editor_utils
+from birdstamp.gui import editor_core, editor_options, editor_template, editor_utils, template_context as _template_context
 from birdstamp.gui.editor_preview_canvas import (
     EditorPreviewCanvas,
     EditorPreviewOverlayOptions,
@@ -112,7 +112,6 @@ _BANNER_GRADIENT_BOTTOM_OPACITY_PCT_DEFAULT = editor_template.BANNER_GRADIENT_BO
 _BANNER_GRADIENT_TOP_COLOR_DEFAULT = editor_template.BANNER_GRADIENT_TOP_COLOR_DEFAULT
 _BANNER_GRADIENT_BOTTOM_COLOR_DEFAULT = editor_template.BANNER_GRADIENT_BOTTOM_COLOR_DEFAULT
 _DEFAULT_TEMPLATE_CENTER_MODE = editor_template.DEFAULT_TEMPLATE_CENTER_MODE
-_DEFAULT_TEMPLATE_AUTO_CROP_BY_BIRD = editor_template.DEFAULT_TEMPLATE_AUTO_CROP_BY_BIRD
 _DEFAULT_TEMPLATE_MAX_LONG_EDGE = editor_template.DEFAULT_TEMPLATE_MAX_LONG_EDGE
 _normalize_template_field = editor_template.normalize_template_field
 _normalize_template_payload = editor_template.normalize_template_payload
@@ -636,6 +635,7 @@ class TemplateManagerDialog(QDialog):
         # 预览图源：优先使用 images/default.jpg 原图 + 真实 EXIF（与主界面一致）
         self._preview_source_path: Path = Path(".")
         self._preview_source_image: "Image.Image | None" = None
+        self._preview_photo_info: _template_context.PhotoInfo | None = None
         self._preview_raw_metadata: dict[str, Any] = {}
         self._preview_metadata_context: dict[str, str] = {}
         self._preview_bird_box_cache: tuple[float, float, float, float] | None = None
@@ -672,12 +672,14 @@ class TemplateManagerDialog(QDialog):
                 if not isinstance(raw_meta, dict):
                     raw_meta = {}
                 self._preview_raw_metadata = raw_meta
+                self._preview_photo_info = _template_context.ensure_photo_info(src, raw_metadata=raw_meta)
                 self._preview_metadata_context = _build_metadata_context(src, raw_meta)
                 return
             except Exception:
                 pass
         # 回退：使用 placeholder PIL 图 + 空 metadata
         self._preview_source_image = self.placeholder.copy()
+        self._preview_photo_info = _template_context.ensure_photo_info(self._preview_source_path, raw_metadata={})
 
     # ------------------------------------------------------------------
     # UI construction
@@ -843,11 +845,6 @@ class TemplateManagerDialog(QDialog):
         self.template_center_mode_combo.currentIndexChanged.connect(self._on_tmpl_center_mode_changed)
         form.addRow("裁切中心", self.template_center_mode_combo)
 
-        self.template_auto_crop_check = QCheckBox("自动根据鸟体计算")
-        self.template_auto_crop_check.setChecked(_DEFAULT_TEMPLATE_AUTO_CROP_BY_BIRD)
-        self.template_auto_crop_check.toggled.connect(self._on_tmpl_auto_crop_changed)
-        form.addRow("裁切策略", self.template_auto_crop_check)
-
         self.template_max_long_edge_combo = QComboBox()
         seen_edges: set[int] = set()
         for _val in MAX_LONG_EDGE_OPTIONS:
@@ -968,10 +965,8 @@ class TemplateManagerDialog(QDialog):
         self._field_fallback_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
         self._field_fallback_combo.addItem("（空）", ("", ""))
         for data_source, key, display_label in _get_template_context_field_options():
-            if data_source == "metadata":
-                display_text = f"元数据 — {key}  —  {display_label}"
-            else:
-                display_text = f"ReportDB — {key}  —  {display_label}"
+            source_name = _template_context.template_source_display_name(data_source)
+            display_text = f"{source_name} — {key}  —  {display_label}"
             self._field_fallback_combo.addItem(display_text, (data_source, key))
         self._field_fallback_combo.setCurrentIndex(0)
         if self._field_fallback_combo.lineEdit():
@@ -1184,8 +1179,8 @@ class TemplateManagerDialog(QDialog):
         try:
             self._set_template_ratio_combo_value(payload.get("ratio"))
             self._set_tmpl_center_mode_value(payload.get("center_mode", _DEFAULT_TEMPLATE_CENTER_MODE))
-            self.template_auto_crop_check.setChecked(
-                _parse_bool_value(payload.get("auto_crop_by_bird"), _DEFAULT_TEMPLATE_AUTO_CROP_BY_BIRD)
+            payload["auto_crop_by_bird"] = self._tmpl_auto_crop_by_center_mode(
+                payload.get("center_mode", _DEFAULT_TEMPLATE_CENTER_MODE)
             )
             self._set_tmpl_max_long_edge_value(
                 int(payload.get("max_long_edge") or _DEFAULT_TEMPLATE_MAX_LONG_EDGE)
@@ -1225,7 +1220,7 @@ class TemplateManagerDialog(QDialog):
         self._refresh_preview()
 
     # ------------------------------------------------------------------
-    # Ratio / center mode / auto crop / max edge
+    # Ratio / center mode / max edge
     # ------------------------------------------------------------------
 
     def _template_ratio_combo_index_for_value(self, ratio: float | None) -> int:
@@ -1264,19 +1259,17 @@ class TemplateManagerDialog(QDialog):
                 self.template_center_mode_combo.setCurrentIndex(idx)
                 return
 
+    def _tmpl_auto_crop_by_center_mode(self, value: Any) -> bool:
+        return _normalize_center_mode(value) == _CENTER_MODE_BIRD
+
     def _on_tmpl_center_mode_changed(self, *_args: Any) -> None:
         if self._updating or not self.current_payload:
             return
-        self.current_payload["center_mode"] = str(
-            self.template_center_mode_combo.currentData() or _DEFAULT_TEMPLATE_CENTER_MODE
-        )
+        center_mode = str(self.template_center_mode_combo.currentData() or _DEFAULT_TEMPLATE_CENTER_MODE)
+        self.current_payload["center_mode"] = center_mode
+        self.current_payload["auto_crop_by_bird"] = self._tmpl_auto_crop_by_center_mode(center_mode)
         self._save_current_template()
-
-    def _on_tmpl_auto_crop_changed(self, *_args: Any) -> None:
-        if self._updating or not self.current_payload:
-            return
-        self.current_payload["auto_crop_by_bird"] = bool(self.template_auto_crop_check.isChecked())
-        self._save_current_template()
+        self._refresh_preview()
 
     def _set_tmpl_max_long_edge_value(self, value: int) -> None:
         edge = max(0, int(value))
@@ -1588,27 +1581,40 @@ class TemplateManagerDialog(QDialog):
             item_data = combo.itemData(idx)
             if not isinstance(item_data, (list, tuple)) or len(item_data) < 2:
                 continue
-            if str(item_data[0] or "").strip().lower() == target_source and str(item_data[1] or "").strip() == target_key:
+            item_source = str(item_data[0] or "").strip().lower()
+            item_key = str(item_data[1] or "").strip()
+            if item_source == target_source and item_key == target_key:
+                return idx
+            if (
+                item_source == _template_context.TEMPLATE_SOURCE_AUTO
+                and item_key == target_key
+                and target_source in {
+                    _template_context.TEMPLATE_SOURCE_AUTO,
+                    _template_context.TEMPLATE_SOURCE_EXIF,
+                    _template_context.TEMPLATE_SOURCE_FROM_FILE,
+                    _template_context.TEMPLATE_SOURCE_REPORT_DB,
+                }
+            ):
                 return idx
         return -1
 
     def _field_source_display_text(self, field: dict[str, Any] | None, index: int = 0) -> str:
         normalized = _normalize_template_field(field or {}, index)
-        data_source = str(normalized.get("data_source") or "metadata").strip().lower()
-        if data_source == "report_db":
-            report_field = str(normalized.get("report_field") or "").strip()
-            if report_field:
-                combo_idx = self._fallback_combo_index_for_value("report_db", report_field)
-                if combo_idx >= 0:
-                    return str(self._field_fallback_combo.itemText(combo_idx) or "").strip()
-                return f"ReportDB - {report_field}"
-        fallback = str(normalized.get("fallback") or "").strip()
-        if fallback:
-            combo_idx = self._fallback_combo_index_for_value("metadata", fallback)
-            if combo_idx >= 0:
-                return str(self._field_fallback_combo.itemText(combo_idx) or "").strip()
-            return fallback
-        return "（空）"
+        text_source = normalized.get("text_source") or {}
+        source_type = str(text_source.get("type") or "").strip()
+        source_key = str(text_source.get("key") or "").strip()
+        if not source_key:
+            return "（空）"
+        combo_idx = self._fallback_combo_index_for_value(source_type, source_key)
+        if combo_idx >= 0:
+            return str(self._field_fallback_combo.itemText(combo_idx) or "").strip()
+        provider = _template_context.build_template_context_provider(
+            source_type,
+            source_key,
+            display_label=str(normalized.get("name") or ""),
+        )
+        preview_photo = self._preview_photo_info or _template_context.ensure_photo_info(Path("."), raw_metadata={})
+        return provider.get_display_caption(preview_photo)
 
     def _current_field_source_display_text(self) -> str:
         text = str(self._field_fallback_combo.currentText() or "").strip()
@@ -1673,10 +1679,11 @@ class TemplateManagerDialog(QDialog):
                 return
 
             normalized = _normalize_template_field(field, 0)
+            text_source = normalized.get("text_source") or {}
             self._set_fallback_combo_value(
-                normalized.get("fallback", ""),
-                data_source=normalized.get("data_source"),
-                report_field=normalized.get("report_field"),
+                str(text_source.get("key") or ""),
+                data_source=str(text_source.get("type") or ""),
+                source_key=str(text_source.get("key") or ""),
             )
             self.field_align_h_combo.setCurrentText(normalized["align_horizontal"])
             self.field_align_v_combo.setCurrentText(normalized["align_vertical"])
@@ -1731,33 +1738,38 @@ class TemplateManagerDialog(QDialog):
         fallback: str = "",
         *,
         data_source: str | None = None,
-        report_field: str | None = None,
+        source_key: str | None = None,
     ) -> None:
         old = self._updating
         self._updating = True
         try:
             combo = self._field_fallback_combo
             matched = -1
-            ds = (data_source or "").strip().lower() if data_source else "metadata"
-            rf = (report_field or "").strip()
-            if ds == "report_db" and rf:
+            ds = _template_context.normalize_template_source_type(data_source)
+            key = (source_key or "").strip() or (fallback or "").strip()
+            if ds and key:
                 for i in range(combo.count()):
                     item_data = combo.itemData(i)
                     if isinstance(item_data, (list, tuple)) and len(item_data) >= 2:
-                        if item_data[0] == "report_db" and item_data[1] == rf:
+                        item_source = str(item_data[0] or "").strip().lower()
+                        item_key = str(item_data[1] or "").strip()
+                        if item_source == ds and item_key == key:
                             matched = i
                             break
-            else:
-                fb = (fallback or "").strip()
-                if not fb:
-                    matched = 0
-                else:
-                    for i in range(combo.count()):
-                        item_data = combo.itemData(i)
-                        if isinstance(item_data, (list, tuple)) and len(item_data) >= 2:
-                            if item_data[0] == "metadata" and item_data[1] == fb:
-                                matched = i
-                                break
+                        if (
+                            item_source == _template_context.TEMPLATE_SOURCE_AUTO
+                            and item_key == key
+                            and ds in {
+                                _template_context.TEMPLATE_SOURCE_AUTO,
+                                _template_context.TEMPLATE_SOURCE_EXIF,
+                                _template_context.TEMPLATE_SOURCE_FROM_FILE,
+                                _template_context.TEMPLATE_SOURCE_REPORT_DB,
+                            }
+                        ):
+                            matched = i
+                            break
+            elif not (fallback or "").strip():
+                matched = 0
             if matched >= 0:
                 combo.setCurrentIndex(matched)
                 if combo.lineEdit():
@@ -1765,7 +1777,7 @@ class TemplateManagerDialog(QDialog):
             if matched < 0:
                 combo.setCurrentIndex(0)
                 if combo.lineEdit():
-                    combo.lineEdit().setText(fallback.strip())
+                    combo.lineEdit().setText(key.strip())
         finally:
             self._updating = old
 
@@ -1794,14 +1806,20 @@ class TemplateManagerDialog(QDialog):
         item_data = self._field_fallback_combo.currentData()
         uses_selected_item = self._fallback_combo_uses_selected_item()
         if uses_selected_item and isinstance(item_data, (list, tuple)) and len(item_data) >= 2:
-            ds, key = str(item_data[0] or ""), str(item_data[1] or "")
-            field["data_source"] = "report_db" if ds == "report_db" else "metadata"
-            field["report_field"] = key if ds == "report_db" else ""
-            field["fallback"] = key if ds == "metadata" else ""
+            source_type = _template_context.normalize_template_source_type(item_data[0])
+            source_key = str(item_data[1] or "").strip()
         else:
-            field["data_source"] = "metadata"
-            field["report_field"] = ""
-            field["fallback"] = str(self.field_fallback_edit.text() or "").strip()
+            source_type = _template_context.TEMPLATE_SOURCE_AUTO
+            source_key = str(self.field_fallback_edit.text() or "").strip()
+        field["text_source"] = {
+            "type": source_type,
+            "key": source_key,
+        }
+        field["data_source"] = source_type
+        field["report_field"] = source_key if source_type == _template_context.TEMPLATE_SOURCE_REPORT_DB else ""
+        field["fallback"] = source_key if source_type == _template_context.TEMPLATE_SOURCE_FROM_FILE else ""
+        if source_type == _template_context.TEMPLATE_SOURCE_EXIF:
+            field["tag"] = source_key
         align_h = self.field_align_h_combo.currentText().strip().lower()
         align_v = self.field_align_v_combo.currentText().strip().lower()
         field["align_horizontal"] = align_h if align_h in ALIGN_OPTIONS_HORIZONTAL else "left"
@@ -1987,9 +2005,7 @@ class TemplateManagerDialog(QDialog):
             center_mode = _normalize_center_mode(
                 str(self.current_payload.get("center_mode") or _DEFAULT_TEMPLATE_CENTER_MODE)
             )
-            auto_crop = _parse_bool_value(
-                self.current_payload.get("auto_crop_by_bird"), _DEFAULT_TEMPLATE_AUTO_CROP_BY_BIRD
-            )
+            auto_crop = self._tmpl_auto_crop_by_center_mode(center_mode)
             fill_color = str(self.current_payload.get("crop_padding_fill") or "#FFFFFF")
             # 使用与主界面完全一致的裁切管线，含非对称内边距传入鸟体裁切算法
             inner_top = _parse_padding_value(self.current_payload.get("crop_padding_top"), 0)
@@ -2026,6 +2042,7 @@ class TemplateManagerDialog(QDialog):
                 source,
                 raw_metadata=self._preview_raw_metadata,
                 metadata_context=self._preview_metadata_context,
+                photo_info=self._preview_photo_info,
                 template_payload=self.current_payload,
                 crop_box=crop_box,
             )
