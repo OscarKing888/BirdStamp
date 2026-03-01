@@ -202,8 +202,7 @@ class _BirdStampCropMixin:
             center_mode=str(settings.get("center_mode") or _CENTER_MODE_IMAGE),
         )
 
-        auto_crop = _parse_bool_value(settings.get("auto_crop_by_bird"), False)
-        if auto_crop and keep_box is not None:
+        if keep_box is not None:
             crop_box, outer_pad = self._compute_auto_bird_crop_plan(
                 image=image,
                 bird_box=keep_box,

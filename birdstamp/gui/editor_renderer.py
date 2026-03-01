@@ -41,7 +41,6 @@ _load_template_payload              = editor_template.load_template_payload
 render_template_overlay             = editor_template.render_template_overlay
 _render_template_overlay_in_crop_region = editor_template.render_template_overlay_in_crop_region
 _DEFAULT_TEMPLATE_CENTER_MODE       = editor_template.DEFAULT_TEMPLATE_CENTER_MODE
-_DEFAULT_TEMPLATE_AUTO_CROP_BY_BIRD = editor_template.DEFAULT_TEMPLATE_AUTO_CROP_BY_BIRD
 _DEFAULT_TEMPLATE_MAX_LONG_EDGE     = editor_template.DEFAULT_TEMPLATE_MAX_LONG_EDGE
 _DEFAULT_CROP_PADDING_PX            = editor_core.DEFAULT_CROP_PADDING_PX
 OUTPUT_FORMAT_OPTIONS               = editor_options.OUTPUT_FORMAT_OPTIONS
@@ -88,14 +87,13 @@ class _BirdStampRendererMixin:
         draw_overlay = f"{self.draw_banner_check.isChecked()}|{self.draw_text_check.isChecked()}"
         r = self._selected_ratio()
         cm = self._selected_center_mode()
-        auto_crop = bool(self.auto_crop_by_bird_check.isChecked())
         pt = self.crop_padding_top.value()
         pb = self.crop_padding_bottom.value()
         pl = self.crop_padding_left.value()
         pr = self.crop_padding_right.value()
         fill = getattr(self, "crop_padding_fill_combo", None)
         fill_val = fill.currentData() if fill is not None and fill.currentData() else "#FFFFFF"
-        return f"{base}|{template_name}|{draw_overlay}|{r}|{cm}|{auto_crop}|{pt}_{pb}_{pl}_{pr}|{fill_val}"
+        return f"{base}|{template_name}|{draw_overlay}|{r}|{cm}|{pt}_{pb}_{pl}_{pr}|{fill_val}"
 
     def _preview_render_settings(self, settings: dict[str, Any]) -> dict[str, Any]:
         """预览固定按原图尺寸渲染，避免 Banner 在预览阶段被二次缩放。"""
@@ -291,7 +289,6 @@ class _BirdStampRendererMixin:
             "draw_text": bool(self.draw_text_check.isChecked()),
             "ratio": self._selected_ratio(),
             "center_mode": self._selected_center_mode(),
-            "auto_crop_by_bird": bool(self.auto_crop_by_bird_check.isChecked()),
             "max_long_edge": self._selected_max_long_edge(),
             "crop_padding_top": self.crop_padding_top.value(),
             "crop_padding_bottom": self.crop_padding_bottom.value(),
@@ -342,7 +339,6 @@ class _BirdStampRendererMixin:
             "draw_text": _parse_bool_value(settings.get("draw_text"), True),
             "ratio": ratio,
             "center_mode": _normalize_center_mode(settings.get("center_mode")),
-            "auto_crop_by_bird": _parse_bool_value(settings.get("auto_crop_by_bird"), False),
             "max_long_edge": max_long_edge,
             "crop_padding_top": _pad_px("crop_padding_top"),
             "crop_padding_bottom": _pad_px("crop_padding_bottom"),
@@ -383,8 +379,6 @@ class _BirdStampRendererMixin:
 
         if "center_mode" in raw:
             settings["center_mode"] = _normalize_center_mode(raw.get("center_mode"))
-        if "auto_crop_by_bird" in raw:
-            settings["auto_crop_by_bird"] = _parse_bool_value(raw.get("auto_crop_by_bird"), settings["auto_crop_by_bird"])
 
         if "max_long_edge" in raw:
             try:
@@ -441,7 +435,7 @@ class _BirdStampRendererMixin:
 
         widgets_to_block = [
             self.template_combo, self.draw_banner_check, self.draw_text_check,
-            self.ratio_combo, self.center_mode_combo, self.auto_crop_by_bird_check,
+            self.ratio_combo, self.center_mode_combo,
             self.max_edge_combo,
         ]
         for w in widgets_to_block:
@@ -461,7 +455,6 @@ class _BirdStampRendererMixin:
             if center_idx >= 0:
                 self.center_mode_combo.setCurrentIndex(center_idx)
 
-            self.auto_crop_by_bird_check.setChecked(bool(normalized.get("auto_crop_by_bird", False)))
             max_edge_idx = self._ensure_max_edge_option(int(normalized["max_long_edge"]))
             if max_edge_idx >= 0:
                 self.max_edge_combo.setCurrentIndex(max_edge_idx)
@@ -694,10 +687,9 @@ class _BirdStampRendererMixin:
         fit_reset = self._pending_preview_fit_reset
         self._pending_preview_fit_reset = False
         self._refresh_preview_label(reset_view=True, force_fit=fit_reset)
-        if _parse_bool_value(settings.get("auto_crop_by_bird"), False):
+        if pad_top or pad_bottom or pad_left or pad_right:
             self._set_status(
-                "预览完成: "
-                f"{rendered.width}x{rendered.height} | 自动外填充 上{pad_top}px 下{pad_bottom}px 左{pad_left}px 右{pad_right}px"
+                f"预览完成: {rendered.width}x{rendered.height} | 外填充 上{pad_top}px 下{pad_bottom}px 左{pad_left}px 右{pad_right}px"
             )
         else:
             self._set_status(f"预览完成: {rendered.width}x{rendered.height}")

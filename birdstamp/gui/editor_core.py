@@ -1002,7 +1002,6 @@ def compute_crop_plan(
     ratio: float | None,
     center_mode: str,
     camera_type: CameraFocusType | str | None = None,
-    auto_crop_by_bird: bool = True,
     inner_top: int = 0,
     inner_bottom: int = 0,
     inner_left: int = 0,
@@ -1042,7 +1041,7 @@ def compute_crop_plan(
             anchor = focus_point
 
     # Auto bird crop with asymmetric inner padding
-    if auto_crop_by_bird and keep_box is not None:
+    if keep_box is not None:
         expanded_px = expand_unit_box_to_unclamped_pixels(
             keep_box, width=w, height=h,
             top=inner_top, bottom=inner_bottom, left=inner_left, right=inner_right,
@@ -1095,7 +1094,6 @@ def apply_full_crop(
     ratio: float | None,
     center_mode: str,
     camera_type: CameraFocusType | str | None = None,
-    auto_crop_by_bird: bool = True,
     inner_top: int = 0,
     inner_bottom: int = 0,
     inner_left: int = 0,
@@ -1114,7 +1112,6 @@ def apply_full_crop(
         ratio=ratio,
         center_mode=center_mode,
         camera_type=camera_type,
-        auto_crop_by_bird=auto_crop_by_bird,
         inner_top=inner_top,
         inner_bottom=inner_bottom,
         inner_left=inner_left,
@@ -1141,7 +1138,6 @@ def apply_editor_crop(
     crop_padding_px: int = DEFAULT_CROP_PADDING_PX,
     max_long_edge: int = 0,
     fill_color: str = "#FFFFFF",
-    use_bird_auto: bool = True,
 ) -> Image.Image:
     """Apply editor-style crop (focus/bird/image center) for CLI or batch use."""
     w, h = image.width, image.height
@@ -1165,7 +1161,7 @@ def apply_editor_crop(
             if focus_box is not None:
                 keep_box = focus_box
                 anchor = box_center(focus_box)
-    elif center_mode == CENTER_MODE_BIRD and use_bird_auto:
+    elif center_mode == CENTER_MODE_BIRD:
         bird_box = detect_primary_bird_box(image)
         if bird_box is not None:
             keep_box = bird_box

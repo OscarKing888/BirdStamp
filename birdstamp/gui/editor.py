@@ -68,10 +68,12 @@ from PyQt6.QtWidgets import (
 
 from app_common.about_dialog import load_about_info, load_about_images, show_about_dialog
 from app_common.app_info_bar import AppInfoBar
+from app_common.log import get_logger
+from app_common.send_to_app import SingleInstanceReceiver
 
 import birdstamp
 from birdstamp.config import get_config_path
-from birdstamp.constants import SUPPORTED_EXTENSIONS
+from birdstamp.constants import SEND_TO_APP_ID, SUPPORTED_EXTENSIONS
 from birdstamp.decoders.image_decoder import decode_image
 from birdstamp.discover import discover_inputs
 from app_common.exif_io import (
@@ -161,7 +163,6 @@ _BANNER_GRADIENT_TOP_OPACITY_PCT_DEFAULT = editor_template.BANNER_GRADIENT_TOP_O
 _BANNER_GRADIENT_TOP_COLOR_DEFAULT = editor_template.BANNER_GRADIENT_TOP_COLOR_DEFAULT
 _BANNER_GRADIENT_BOTTOM_COLOR_DEFAULT = editor_template.BANNER_GRADIENT_BOTTOM_COLOR_DEFAULT
 _DEFAULT_TEMPLATE_CENTER_MODE = editor_template.DEFAULT_TEMPLATE_CENTER_MODE
-_DEFAULT_TEMPLATE_AUTO_CROP_BY_BIRD = editor_template.DEFAULT_TEMPLATE_AUTO_CROP_BY_BIRD
 _DEFAULT_TEMPLATE_MAX_LONG_EDGE = editor_template.DEFAULT_TEMPLATE_MAX_LONG_EDGE
 _path_key = editor_utils.path_key
 _sanitize_template_name = editor_utils.sanitize_template_name
@@ -269,12 +270,17 @@ def _get_bird_detector_error_message() -> str:
 
 
 _pil_to_qpixmap = editor_utils.pil_to_qpixmap
+_log = get_logger("editor")
 
 
 # PreviewCanvas and PhotoListWidget now live in editor_preview_canvas.py / editor_photo_list.py
 
 class BirdStampEditorWindow(QMainWindow, _BirdStampCropMixin, _BirdStampRendererMixin, _BirdStampExporterMixin):
-    def __init__(self, startup_file: Path | None = None) -> None:
+    def __init__(
+        self,
+        startup_file: Path | None = None,
+        startup_files: list[Path] | None = None,
+    ) -> None:
         super().__init__()
         self.setWindowTitle("极速鸟框")
         self.resize(1420, 920)
@@ -325,8 +331,14 @@ class BirdStampEditorWindow(QMainWindow, _BirdStampCropMixin, _BirdStampRenderer
         self._show_placeholder_preview()
         self._start_bird_detector_preload()
 
-        if startup_file:
-            self._add_photo_paths([startup_file])
+        # 冷启动或「发送到本应用」传入的文件列表：加入照片列表
+        files_to_add: list[Path] = []
+        if startup_files:
+            files_to_add = list(startup_files)
+        elif startup_file:
+            files_to_add = [startup_file]
+        if files_to_add:
+            self._add_photo_paths(files_to_add)
 
         # 初始化 report.db 行解析器（无缓存时返回 None）
         self._update_report_db_row_resolver()
@@ -632,11 +644,6 @@ class BirdStampEditorWindow(QMainWindow, _BirdStampCropMixin, _BirdStampRenderer
         self.center_mode_combo.addItem("图像中心", _CENTER_MODE_IMAGE)
         self.center_mode_combo.currentIndexChanged.connect(self._on_crop_settings_changed)
         override_form.addRow("裁切中心", self.center_mode_combo)
-
-        self.auto_crop_by_bird_check = QCheckBox("自动根据鸟体计算")
-        self.auto_crop_by_bird_check.setChecked(True)
-        self.auto_crop_by_bird_check.toggled.connect(self._on_crop_settings_changed)
-        override_form.addRow("裁切策略", self.auto_crop_by_bird_check)
 
         self._crop_padding_widget = _CropPaddingEditorWidget()
         self._crop_padding_widget.changed.connect(self._on_crop_settings_changed)
@@ -1091,13 +1098,6 @@ class BirdStampEditorWindow(QMainWindow, _BirdStampCropMixin, _BirdStampRenderer
             finally:
                 self.center_mode_combo.blockSignals(False)
 
-        auto_crop = _parse_bool_value(p.get("auto_crop_by_bird"), _DEFAULT_TEMPLATE_AUTO_CROP_BY_BIRD)
-        self.auto_crop_by_bird_check.blockSignals(True)
-        try:
-            self.auto_crop_by_bird_check.setChecked(auto_crop)
-        finally:
-            self.auto_crop_by_bird_check.blockSignals(False)
-
         try:
             max_edge = max(0, int(p.get("max_long_edge") or _DEFAULT_TEMPLATE_MAX_LONG_EDGE))
         except Exception:
@@ -1528,6 +1528,17 @@ class BirdStampEditorWindow(QMainWindow, _BirdStampCropMixin, _BirdStampRenderer
             return
         self._set_status(f"没有新增照片，已自动添加 {auto_added_report_db_count} 个 report.db。")
 
+    def add_received_file_paths(self, paths: list[str]) -> None:
+        """
+        由「发送到本应用」热接收回调调用，将接收到的文件路径加入照片列表。
+        可在任意线程调用；内部通过 QTimer.singleShot 投递到主线程执行。
+        """
+        if not paths:
+            return
+        _log.info("send_to_app: received %d file(s), scheduling add to photo list: %s", len(paths), paths)
+        path_objs = [Path(p) for p in paths]
+        QTimer.singleShot(0, lambda: self._add_photo_paths(path_objs))
+
     def _remove_selected_photos(self) -> None:
         selected_items = self.photo_list.selectedItems()
         if not selected_items:
@@ -1716,8 +1727,43 @@ class BirdStampEditorWindow(QMainWindow, _BirdStampCropMixin, _BirdStampRenderer
         self._set_status(f"已将当前裁切重载设置应用到全部 {len(targets)} 张照片。")
 
 
-def launch_gui(startup_file: Path | None = None) -> None:
+def launch_gui(
+    startup_file: Path | None = None,
+    startup_files: list[Path] | None = None,
+) -> None:
+    _log.info(
+        "launch_gui enter startup_file=%s startup_files=%s",
+        str(startup_file) if startup_file else "",
+        [str(path) for path in (startup_files or [])],
+    )
     app = QApplication.instance() or QApplication(sys.argv)
-    window = BirdStampEditorWindow(startup_file=startup_file)
+    window = BirdStampEditorWindow(startup_file=startup_file, startup_files=startup_files)
+    _log.info("editor window created")
     window.showMaximized()
-    app.exec()
+    _log.info("editor window shown")
+
+    # 热接收：单例 IPC，其它进程通过 send_file_list_to_running_app 发来文件列表时加入本窗口照片列表
+    def on_files_received(paths: list[str]) -> None:
+        _log.info("received files from running instance count=%s", len(paths))
+        window.add_received_file_paths(paths)
+
+    receiver = SingleInstanceReceiver(SEND_TO_APP_ID, on_files_received)
+    if receiver.start():
+        window._send_to_app_receiver = receiver  # 保持引用，避免被回收；退出时可选 stop()
+        _log.info("single instance receiver started")
+    else:
+        window._send_to_app_receiver = None
+        _log.info("single instance receiver unavailable")
+
+    def _on_about_to_quit() -> None:
+        _log.info("qt aboutToQuit emitted")
+        active_receiver = getattr(window, "_send_to_app_receiver", None)
+        if active_receiver is not None:
+            try:
+                active_receiver.stop()
+            except Exception as exc:
+                _log.warning("receiver stop failed: %s", exc)
+
+    app.aboutToQuit.connect(_on_about_to_quit)
+    exit_code = app.exec()
+    _log.info("qt event loop exited code=%s window_visible=%s", exit_code, window.isVisible())

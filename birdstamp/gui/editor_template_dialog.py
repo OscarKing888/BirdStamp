@@ -1179,9 +1179,7 @@ class TemplateManagerDialog(QDialog):
         try:
             self._set_template_ratio_combo_value(payload.get("ratio"))
             self._set_tmpl_center_mode_value(payload.get("center_mode", _DEFAULT_TEMPLATE_CENTER_MODE))
-            payload["auto_crop_by_bird"] = self._tmpl_auto_crop_by_center_mode(
-                payload.get("center_mode", _DEFAULT_TEMPLATE_CENTER_MODE)
-            )
+            payload["auto_crop_by_bird"] = True  # 固定为根据鸟体计算，保留键以兼容旧模板
             self._set_tmpl_max_long_edge_value(
                 int(payload.get("max_long_edge") or _DEFAULT_TEMPLATE_MAX_LONG_EDGE)
             )
@@ -1259,15 +1257,12 @@ class TemplateManagerDialog(QDialog):
                 self.template_center_mode_combo.setCurrentIndex(idx)
                 return
 
-    def _tmpl_auto_crop_by_center_mode(self, value: Any) -> bool:
-        return _normalize_center_mode(value) == _CENTER_MODE_BIRD
-
     def _on_tmpl_center_mode_changed(self, *_args: Any) -> None:
         if self._updating or not self.current_payload:
             return
         center_mode = str(self.template_center_mode_combo.currentData() or _DEFAULT_TEMPLATE_CENTER_MODE)
         self.current_payload["center_mode"] = center_mode
-        self.current_payload["auto_crop_by_bird"] = self._tmpl_auto_crop_by_center_mode(center_mode)
+        self.current_payload["auto_crop_by_bird"] = True  # 固定为根据鸟体计算
         self._save_current_template()
         self._refresh_preview()
 
@@ -2005,7 +2000,6 @@ class TemplateManagerDialog(QDialog):
             center_mode = _normalize_center_mode(
                 str(self.current_payload.get("center_mode") or _DEFAULT_TEMPLATE_CENTER_MODE)
             )
-            auto_crop = self._tmpl_auto_crop_by_center_mode(center_mode)
             fill_color = str(self.current_payload.get("crop_padding_fill") or "#FFFFFF")
             # 使用与主界面完全一致的裁切管线，含非对称内边距传入鸟体裁切算法
             inner_top = _parse_padding_value(self.current_payload.get("crop_padding_top"), 0)
@@ -2019,7 +2013,6 @@ class TemplateManagerDialog(QDialog):
                 ratio=ratio,
                 center_mode=center_mode,
                 camera_type=focus_camera_type,
-                auto_crop_by_bird=auto_crop,
                 inner_top=inner_top,
                 inner_bottom=inner_bottom,
                 inner_left=inner_left,

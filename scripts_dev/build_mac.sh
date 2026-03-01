@@ -1,19 +1,20 @@
 #!/usr/bin/env bash
-# build_mac.sh — Build BirdStamp.app for macOS using PyInstaller
+# build_mac.sh — Build SuperBirdStamp.app for macOS using PyInstaller
 #
 # Usage:
-#   bash scripts_dev/build_mac.sh [--clean] [--arch universal2]
+#   bash scripts_dev/build_mac.sh [--clean] [--arch universal2] [--console]
 #
 # Options:
 #   --clean            Remove dist/ and build/ before building
 #   --arch universal2  Build a universal (Intel + Apple Silicon) binary
+#   --console          Build with console (Terminal) so logs are visible
 #
 # Prerequisites (run once):
 #   pip install pyinstaller pyinstaller-hooks-contrib
 #
 # Output:
-#   dist/BirdStamp-<version>.app
-#   dist/BirdStamp-<version>-mac.zip
+#   dist/SuperBirdStamp.app
+#   dist/SuperBirdStamp-mac.zip
 # ---------------------------------------------------------------------------
 
 set -euo pipefail
@@ -26,12 +27,14 @@ cd "$PROJECT_ROOT"
 # ── defaults ─────────────────────────────────────────────────────────────────
 CLEAN=0
 TARGET_ARCH=""   # empty = native arch
+CONSOLE=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --clean)  CLEAN=1; shift ;;
-        --arch)   TARGET_ARCH="$2"; shift 2 ;;
-        *)        echo "Unknown option: $1"; exit 1 ;;
+        --clean)   CLEAN=1; shift ;;
+        --arch)    TARGET_ARCH="$2"; shift 2 ;;
+        --console) CONSOLE=1; shift ;;
+        *)         echo "Unknown option: $1"; exit 1 ;;
     esac
 done
 
@@ -51,16 +54,7 @@ if ! "$PYTHON" -c "import PyInstaller" 2>/dev/null; then
     "$PYTHON" -m pip install pyinstaller pyinstaller-hooks-contrib
 fi
 
-# ── read version from source (no import needed) ──────────────────────────────
-VERSION=$("$PYTHON" -c "
-import re, pathlib
-text = pathlib.Path('birdstamp/__init__.py').read_text(encoding='utf-8')
-m = re.search(r'__version__\s*=\s*[\"\']([\d.]+[\w.-]*)', text)
-print(m.group(1) if m else '0.0.0')
-")
-echo "Version: $VERSION"
-
-APP_NAME="BirdStamp-${VERSION}"
+APP_NAME="SuperBirdStamp"
 APP_DIR="dist/${APP_NAME}.app"
 ZIP_FILE="dist/${APP_NAME}-mac.zip"
 
@@ -72,11 +66,17 @@ fi
 
 # ── patch target_arch in spec if --arch was passed ───────────────────────────
 SPEC_FILE="BirdStamp_mac.spec"
+mkdir -p build
 if [[ -n "$TARGET_ARCH" ]]; then
     echo "Setting target_arch to: $TARGET_ARCH"
     SPEC_FILE="build/BirdStamp_mac_patched.spec"
-    mkdir -p build
     sed "s/target_arch=None/target_arch=\"$TARGET_ARCH\"/" BirdStamp_mac.spec > "$SPEC_FILE"
+fi
+if [[ $CONSOLE -eq 1 ]]; then
+    echo "Building with CONSOLE (logs visible in Terminal)."
+    CONSOLE_SPEC="$PROJECT_ROOT/BirdStamp_mac_console.spec"
+    sed 's/console=False/console=True/' "$SPEC_FILE" > "$CONSOLE_SPEC"
+    SPEC_FILE="$CONSOLE_SPEC"
 fi
 
 # ── build ─────────────────────────────────────────────────────────────────────
@@ -86,23 +86,26 @@ echo "============================================================"
 
 "$PYTHON" -m PyInstaller "$SPEC_FILE" --noconfirm
 
-# ── rename output to include version ─────────────────────────────────────────
-if [[ -d "dist/BirdStamp.app" ]]; then
-    # Remove stale versioned app if it exists from a previous build
-    [[ -d "$APP_DIR" ]] && rm -rf "$APP_DIR"
-    mv "dist/BirdStamp.app" "$APP_DIR"
-    echo "Renamed to: $APP_DIR"
-fi
-
 if [[ ! -d "$APP_DIR" ]]; then
     echo "ERROR: Build failed — $APP_DIR not found." >&2
     exit 1
 fi
 
+# ── bundle sanity check ───────────────────────────────────────────────────────
+PLIST_FILE="$APP_DIR/Contents/Info.plist"
+if [[ -f "$PLIST_FILE" ]] && command -v plutil &>/dev/null; then
+    if plutil -p "$PLIST_FILE" | grep -q '"LSBackgroundOnly" => 1'; then
+        echo "ERROR: Build produced a background-only app (LSBackgroundOnly=1)." >&2
+        echo "       Check the PyInstaller spec console/windowed setting." >&2
+        exit 1
+    fi
+    echo "Bundle sanity check PASSED (foreground GUI app)."
+fi
+
 # ── smoke test ────────────────────────────────────────────────────────────────
 echo ""
 echo "Smoke test — checking executable launches ..."
-EXEC="$APP_DIR/Contents/MacOS/BirdStamp"
+EXEC="$APP_DIR/Contents/MacOS/SuperBirdStamp"
 if [[ -x "$EXEC" ]]; then
     timeout 10 "$EXEC" --help &>/dev/null \
         && echo "  Smoke test PASSED (--help exit 0)" \

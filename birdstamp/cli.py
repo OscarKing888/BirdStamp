@@ -205,7 +205,6 @@ def render(
             # Apply ratio crop from template (e.g. 9:16 portrait)
             tpl_ratio = _parse_ratio(template_payload.get("ratio"))
             tpl_center = str(template_payload.get("center_mode") or "image")
-            tpl_auto_bird = _parse_bool(template_payload.get("auto_crop_by_bird"), False)
             tpl_fill = str(template_payload.get("crop_padding_fill") or "#FFFFFF")
             # Effective max_long_edge: CLI arg overrides template; 0 = unlimited
             tpl_max_edge = max(0, int(template_payload.get("max_long_edge") or 0))
@@ -221,7 +220,6 @@ def render(
                     crop_padding_px=0,   # 模板的 crop_padding_* 是鸟检测内缩偏移，不是外边距
                     max_long_edge=effective_max_edge,
                     fill_color=tpl_fill,
-                    use_bird_auto=tpl_auto_bird,
                 )
             elif effective_max_edge > 0:
                 image = resize_fit(image, effective_max_edge)

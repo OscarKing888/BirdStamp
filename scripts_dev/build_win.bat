@@ -1,18 +1,19 @@
 @echo off
-REM build_win.bat — Build BirdStamp Windows package using PyInstaller
+REM build_win.bat — Build SuperBirdStamp Windows package using PyInstaller
 REM
 REM Usage (from project root):
-REM   scripts_dev\build_win.bat [--clean]
+REM   scripts_dev\build_win.bat [--clean] [--console]
 REM
 REM Options:
 REM   --clean    Remove dist\ and build\ before building
+REM   --console  Build with console window (for viewing logs; exe shows terminal)
 REM
 REM Prerequisites (run once):
 REM   pip install pyinstaller pyinstaller-hooks-contrib
 REM
 REM Output:
-REM   dist\BirdStamp-<version>\BirdStamp.exe  (onedir bundle)
-REM   dist\BirdStamp-<version>-win.zip
+REM   dist\SuperBirdStamp\SuperBirdStamp.exe  (onedir bundle)
+REM   dist\SuperBirdStamp-win.zip
 REM ---------------------------------------------------------------------------
 
 setlocal enabledelayedexpansion
@@ -23,8 +24,10 @@ set "PROJECT_ROOT=%CD%"
 
 REM ── parse arguments ──────────────────────────────────────────────────────────
 set "CLEAN=0"
+set "CONSOLE=0"
 :parse_args
 if "%~1"=="--clean" ( set "CLEAN=1" & shift & goto parse_args )
+if "%~1"=="--console" ( set "CONSOLE=1" & shift & goto parse_args )
 if not "%~1"=="" ( echo Unknown option: %~1 & exit /b 1 )
 
 REM ── resolve Python ───────────────────────────────────────────────────────────
@@ -45,18 +48,7 @@ if errorlevel 1 (
     if errorlevel 1 ( echo ERROR: pip install failed. & exit /b 1 )
 )
 
-REM ── read version from source (no import needed) ──────────────────────────────
-for /f "delims=" %%v in (
-    '%PYTHON% -c "import re,pathlib; text=pathlib.Path(\"birdstamp/__init__.py\").read_text(encoding=\"utf-8\"); m=re.search(r\"__version__\s*=\s*[\"\x27]([\d.]+[\w.-]*)\", text); print(m.group(1) if m else \"0.0.0\")"'
-) do set "VERSION=%%v"
-
-if "%VERSION%"=="" (
-    echo WARNING: Could not read version, defaulting to 0.0.0
-    set "VERSION=0.0.0"
-)
-echo Version: %VERSION%
-
-set "APP_NAME=BirdStamp-%VERSION%"
+set "APP_NAME=SuperBirdStamp"
 set "APP_DIR=dist\%APP_NAME%"
 set "ZIP_FILE=dist\%APP_NAME%-win.zip"
 
@@ -68,21 +60,22 @@ if "%CLEAN%"=="1" (
 )
 
 REM ── build ─────────────────────────────────────────────────────────────────────
+set "SPEC_FILE=BirdStamp_win.spec"
+if "%CONSOLE%"=="1" (
+    echo Building with CONSOLE (log visible in terminal) ...
+    if not exist build mkdir build
+    %PYTHON% -c "p=open('BirdStamp_win.spec', encoding='utf-8').read(); open('build/BirdStamp_win_console.spec', 'w', encoding='utf-8').write(p.replace('console=False', 'console=True'))"
+    set "SPEC_FILE=build\BirdStamp_win_console.spec"
+)
+
 echo ============================================================
 echo  Building %APP_NAME% (this may take several minutes) ...
 echo ============================================================
 
-%PYTHON% -m PyInstaller BirdStamp_win.spec --noconfirm
+%PYTHON% -m PyInstaller %SPEC_FILE% --noconfirm
 if errorlevel 1 (
     echo ERROR: PyInstaller build failed.
     exit /b 1
-)
-
-REM ── rename output directory to include version ───────────────────────────────
-if exist "dist\BirdStamp" (
-    if exist "%APP_DIR%" rmdir /s /q "%APP_DIR%"
-    rename "dist\BirdStamp" "%APP_NAME%"
-    echo Renamed to: %APP_DIR%
 )
 
 if not exist "%APP_DIR%" (
@@ -91,7 +84,7 @@ if not exist "%APP_DIR%" (
 )
 
 REM ── smoke test ───────────────────────────────────────────────────────────────
-set "EXE=%APP_DIR%\BirdStamp.exe"
+set "EXE=%APP_DIR%\SuperBirdStamp.exe"
 if not exist "%EXE%" (
     echo ERROR: Executable not found: %EXE%
     exit /b 1

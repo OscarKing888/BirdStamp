@@ -25,3 +25,6 @@ DEFAULT_SHOW_FIELDS = {
 VALID_MODES = {"keep", "fit", "square", "vertical"}
 VALID_FRAME_STYLES = {"crop", "pad"}
 
+# 单例 IPC 用：接收「发送到本应用」文件列表时的服务名
+SEND_TO_APP_ID = "birdstamp"
+

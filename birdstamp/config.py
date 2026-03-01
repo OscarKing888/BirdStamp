@@ -52,8 +52,40 @@ def get_app_dir() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
+def get_user_data_dir() -> Path:
+    """返回用户可写的数据目录，打包后避免写入 app bundle 内部。"""
+    if not getattr(sys, "frozen", False):
+        return get_app_dir()
+
+    system_name = platform.system().lower()
+    if system_name == "windows":
+        base = (
+            os.environ.get("APPDATA")
+            or os.environ.get("LOCALAPPDATA")
+            or str(Path.home() / "AppData" / "Roaming")
+        )
+        return Path(base) / "BirdStamp"
+    if system_name == "darwin":
+        return Path.home() / "Library" / "Application Support" / "BirdStamp"
+
+    xdg_config_home = os.environ.get("XDG_CONFIG_HOME")
+    if xdg_config_home:
+        return Path(xdg_config_home) / "BirdStamp"
+    return Path.home() / ".config" / "BirdStamp"
+
+
+def _legacy_frozen_config_path() -> Path | None:
+    """兼容旧版本：曾将配置写到可执行文件旁边。"""
+    if not getattr(sys, "frozen", False):
+        return None
+    legacy_path = get_app_dir() / "Config" / "config.yaml"
+    if legacy_path.exists():
+        return legacy_path
+    return None
+
+
 def get_config_path() -> Path:
-    return get_app_dir() / "Config" / "config.yaml"
+    return get_user_data_dir() / "Config" / "config.yaml"
 
 
 def _deep_merge(base: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
@@ -68,6 +100,10 @@ def _deep_merge(base: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any
 
 def load_config(path: Path | None = None) -> dict[str, Any]:
     cfg_path = path or get_config_path()
+    if path is None and not cfg_path.exists():
+        legacy_path = _legacy_frozen_config_path()
+        if legacy_path is not None:
+            cfg_path = legacy_path
     if not cfg_path.exists():
         cfg = copy.deepcopy(DEFAULT_CONFIG)
         cfg["jobs"] = default_jobs()
