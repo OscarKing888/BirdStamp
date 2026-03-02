@@ -1473,7 +1473,12 @@ class BirdStampEditorWindow(QMainWindow, _BirdStampCropMixin, _BirdStampRenderer
                 paths.append(Path(raw))
         return paths
 
-    def _add_photo_paths(self, paths: Iterable[Path]) -> None:
+    def _add_photo_paths(
+        self,
+        paths: Iterable[Path],
+        *,
+        select_last_added: bool = False,
+    ) -> None:
         valid_paths: list[Path] = []
         for incoming in paths:
             try:
@@ -1490,6 +1495,7 @@ class BirdStampEditorWindow(QMainWindow, _BirdStampCropMixin, _BirdStampRenderer
         existing_keys = {_path_key(path) for path in self._list_photo_paths()}
         default_settings = self._build_current_render_settings()
         add_count = 0
+        last_added_item: QTreeWidgetItem | None = None
 
         for path in valid_paths:
             key = _path_key(path)
@@ -1512,12 +1518,15 @@ class BirdStampEditorWindow(QMainWindow, _BirdStampCropMixin, _BirdStampRenderer
             self.photo_list.addTopLevelItem(item)
             self._update_photo_list_item_display(path, raw_metadata=raw_metadata, settings=current_settings)
             add_count += 1
+            last_added_item = item
 
         if add_count == 0 and auto_added_report_db_count == 0:
             self._set_status("没有新增照片。")
             return
 
-        if self.photo_list.currentItem() is None and self.photo_list.topLevelItemCount() > 0:
+        if select_last_added and last_added_item is not None:
+            self.photo_list.setCurrentItem(last_added_item)
+        elif self.photo_list.currentItem() is None and self.photo_list.topLevelItemCount() > 0:
             first_item = self.photo_list.topLevelItem(0)
             if first_item is not None:
                 self.photo_list.setCurrentItem(first_item)
@@ -1546,7 +1555,12 @@ class BirdStampEditorWindow(QMainWindow, _BirdStampCropMixin, _BirdStampRenderer
             normalized_paths,
         )
         path_objs = [Path(path_text) for path_text in normalized_paths]
-        QTimer.singleShot(0, lambda pending_paths=path_objs: self._add_photo_paths(pending_paths))
+        QTimer.singleShot(
+            0,
+            lambda pending_paths=path_objs: self._add_photo_paths(
+                pending_paths, select_last_added=True
+            ),
+        )
 
     def _remove_selected_photos(self) -> None:
         selected_items = self.photo_list.selectedItems()

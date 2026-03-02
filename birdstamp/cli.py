@@ -87,8 +87,9 @@ def _find_template_path(template_arg: str | None) -> Path | None:
         return candidate
     # Look in config/templates/
     try:
-        from birdstamp.gui.editor_template import template_directory
+        from birdstamp.gui.editor_template import ensure_template_repository, template_directory
         cfg_dir = template_directory()
+        ensure_template_repository(cfg_dir)
         cfg_path = cfg_dir / f"{template_arg}.json"
         if cfg_path.exists():
             return cfg_path

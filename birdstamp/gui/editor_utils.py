@@ -12,7 +12,7 @@ from PyQt6.QtCore import QPoint, QRect, QRectF, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QCursor, QFontDatabase, QGuiApplication, QImage, QPainter, QPen, QPixmap, QRawFont
 from PyQt6.QtWidgets import QApplication, QAbstractSpinBox, QFormLayout, QLabel, QSizePolicy, QWidget
 
-from birdstamp.config import get_app_dir
+from birdstamp.config import resolve_bundled_path
 from birdstamp.gui.template_context import (
     PhotoInfo,
     build_template_context,
@@ -406,8 +406,8 @@ _DEFAULT_FALLBACK_CONTEXT_VARS: list[tuple[str, str]] = [
 
 
 def get_birdstamp_cfg_path() -> Path:
-    """返回 birdstamp.cfg 的路径（project_root/config/birdstamp.cfg）。"""
-    return get_app_dir() / "config" / "birdstamp.cfg"
+    """返回内置 birdstamp.cfg 的路径。"""
+    return resolve_bundled_path("config", "birdstamp.cfg")
 
 
 def _load_birdstamp_cfg_raw() -> dict[str, Any]:
@@ -471,14 +471,8 @@ def pil_to_qpixmap(image: Image.Image) -> QPixmap:
 
 
 def _default_placeholder_path() -> Path:
-    """Locate images/default.jpg: next to executable (frozen) or at project root (dev)."""
-    import sys
-    if getattr(sys, "frozen", False):
-        base = Path(sys.executable).resolve().parent
-    else:
-        # birdstamp/gui/editor_utils.py → birdstamp/gui/ → birdstamp/ → project root
-        base = Path(__file__).resolve().parent.parent.parent
-    return base / "images" / "default.jpg"
+    """Locate bundled images/default.jpg in dev/frozen layouts."""
+    return resolve_bundled_path("images", "default.jpg")
 
 
 def build_placeholder_image(width: int = 1600, height: int = 1000) -> Image.Image:

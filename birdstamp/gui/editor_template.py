@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import shutil
+import sys
 from collections import defaultdict
 from functools import lru_cache
 from importlib import resources
@@ -131,7 +133,53 @@ def _normalize_banner_gradient_color(value: Any, default: str) -> str:
 
 
 def template_directory() -> Path:
+    # 模板运行时始终落到用户可写目录；打包内置模板只作为首启/补缺的种子源。
     return get_config_path().parent / "templates"
+
+
+def _iter_seed_template_directories() -> list[Path]:
+    """Return candidate directories that may contain bundled template JSON files."""
+    candidates: list[Path] = []
+
+    def _add(path: Path) -> None:
+        normalized = path.resolve(strict=False)
+        if normalized in candidates:
+            return
+        candidates.append(normalized)
+
+    app_root = get_config_path().parents[1]
+    _add(app_root / "config" / "templates")
+
+    if getattr(sys, "frozen", False):
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            _add(Path(meipass) / "config" / "templates")
+
+        executable_dir = Path(sys.executable).resolve().parent
+        _add(executable_dir / "_internal" / "config" / "templates")
+        if sys.platform == "darwin":
+            _add(executable_dir.parent / "Resources" / "config" / "templates")
+
+    return [path for path in candidates if path.is_dir()]
+
+
+def _copy_missing_seed_templates(template_dir: Path) -> int:
+    """Copy bundled seed templates into the writable repository without overwriting user files."""
+    copied = 0
+    target_dir = template_dir.resolve(strict=False)
+    for seed_dir in _iter_seed_template_directories():
+        if seed_dir == target_dir:
+            continue
+        for source_path in sorted(seed_dir.glob("*.json")):
+            if not source_path.is_file():
+                continue
+            target_path = template_dir / source_path.name
+            if target_path.exists():
+                continue
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source_path, target_path)
+            copied += 1
+    return copied
 
 
 @lru_cache(maxsize=1)
@@ -352,6 +400,7 @@ def save_template_payload(path: Path, payload: dict[str, Any]) -> None:
 
 def ensure_template_repository(template_dir: Path) -> None:
     template_dir.mkdir(parents=True, exist_ok=True)
+    _copy_missing_seed_templates(template_dir)
     has_json = any(path.suffix.lower() == ".json" for path in template_dir.iterdir() if path.is_file())
     if has_json:
         return

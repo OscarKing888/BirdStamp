@@ -52,6 +52,41 @@ def get_app_dir() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
+def get_app_resource_dir() -> Path:
+    """返回打包资源根目录。
+
+    开发环境下返回工程根目录；
+    Windows onedir 优先返回 ``_internal``；
+    macOS .app 优先返回 ``Contents/Resources``。
+    """
+    if not getattr(sys, "frozen", False):
+        return get_app_dir()
+
+    executable_dir = Path(sys.executable).resolve().parent
+    candidates: list[Path] = []
+
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        candidates.append(Path(meipass))
+
+    if sys.platform == "darwin":
+        candidates.append(executable_dir.parent / "Resources")
+
+    candidates.append(executable_dir / "_internal")
+    candidates.append(executable_dir)
+
+    for candidate in candidates:
+        if candidate.is_dir():
+            return candidate
+
+    return executable_dir
+
+
+def resolve_bundled_path(*parts: str) -> Path:
+    """基于资源根目录拼接内置文件路径。"""
+    return get_app_resource_dir().joinpath(*parts)
+
+
 def get_user_data_dir() -> Path:
     """返回用户可写的数据目录，打包后避免写入 app bundle 内部。"""
     if not getattr(sys, "frozen", False):

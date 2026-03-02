@@ -15,9 +15,11 @@ from app_common.focus_calc import (
     extract_focus_box as _extract_focus_box_by_camera_type,
     extract_focus_box_for_display as _extract_focus_box_for_display_by_camera_type,
     get_focus_point as _get_focus_point_by_camera_type,
+    get_focus_point_for_display as _get_focus_point_for_display_by_camera_type,
     resolve_focus_camera_type as _resolve_focus_camera_type,
     resolve_focus_camera_type_from_metadata as _resolve_focus_camera_type_from_metadata,
 )
+from birdstamp.config import resolve_bundled_path
 
 # Center mode constants (used by CLI and GUI)
 CENTER_MODE_IMAGE = "image"
@@ -286,6 +288,16 @@ def get_focus_point(
 ) -> tuple[float, float] | None:
     """Return normalized (x,y) focus point from metadata, or None."""
     return _get_focus_point_by_camera_type(raw, width, height, camera_type=camera_type)
+
+
+def get_focus_point_for_display(
+    raw: dict[str, Any],
+    width: int,
+    height: int,
+    camera_type: CameraFocusType | str | None = None,
+) -> tuple[float, float] | None:
+    """Resolve a preview-ready focus point using metadata size + Orientation mapping."""
+    return _get_focus_point_for_display_by_camera_type(raw, width, height, camera_type=camera_type)
 
 
 def _extract_focus_point_impl(raw: dict[str, Any], width: int, height: int) -> tuple[float, float] | None:
@@ -942,8 +954,12 @@ def _load_bird_detector() -> tuple[Any, set[int]] | None:
         return None
     last_error = ""
     for model_name in _BIRD_MODEL_CANDIDATES:
+        model_path = resolve_bundled_path("models", model_name)
+        if not model_path.is_file():
+            last_error = f"{model_name}: model file not found ({model_path})"
+            continue
         try:
-            model = yolo_class(f"models/{model_name}")
+            model = yolo_class(str(model_path))
         except Exception as exc:
             last_error = f"{model_name}: {_short_error_text(exc)}"
             continue
@@ -1032,7 +1048,7 @@ def compute_crop_plan(
     keep_box: tuple[float, float, float, float] | None = None
 
     # Resolve anchor and keep_box
-    focus_point = get_focus_point(raw_metadata, w, h, camera_type=camera_type)
+    focus_point = get_focus_point_for_display(raw_metadata, w, h, camera_type=camera_type)
     bird_box: tuple[float, float, float, float] | None = None
     try:
         bird_box = detect_primary_bird_box(image)
@@ -1159,7 +1175,7 @@ def apply_editor_crop(
     keep_box: tuple[float, float, float, float] | None = None
 
     if center_mode == CENTER_MODE_FOCUS:
-        focus_box = extract_focus_box(raw_metadata, w, h, camera_type=camera_type)
+        focus_box = extract_focus_box_for_display(raw_metadata, w, h, camera_type=camera_type)
         if focus_box is not None:
             if ratio is not None and ratio > 0:
                 focus_box = transform_focus_box_after_crop(
