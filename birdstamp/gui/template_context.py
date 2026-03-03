@@ -5,7 +5,6 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
 from functools import lru_cache
-from importlib import resources
 import json
 from pathlib import Path
 import re
@@ -13,6 +12,7 @@ from typing import Any, Callable, Dict, Optional
 
 from app_common.exif_io.config import load_exif_settings
 from app_common.report_db import PHOTO_COLUMNS
+from birdstamp.config import resolve_bundled_path
 from birdstamp.meta.normalize import format_settings_line, normalize_metadata
 
 # 与 editor_utils 中一致：不写入 context 的路径列
@@ -628,7 +628,7 @@ def _humanize_exif_source_key(source_key: str, token_map: dict[str, str]) -> str
 @lru_cache(maxsize=1)
 def _load_builtin_auto_proxy_route_config_raw() -> dict[str, Any]:
     try:
-        route_file = resources.files("birdstamp.gui") / "resources" / "template_context_routes.json"
+        route_file = resolve_bundled_path("config", "template_context_routes.json")
         text = route_file.read_text(encoding="utf-8")
         raw = json.loads(text)
         if isinstance(raw, dict):

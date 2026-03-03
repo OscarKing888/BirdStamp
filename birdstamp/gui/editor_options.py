@@ -1,10 +1,11 @@
-# Editor options loaded from editor_options.json (no Qt).
+# Editor options loaded from config/editor_options.json (no Qt).
 from __future__ import annotations
 
 import json
 from functools import lru_cache
-from importlib import resources
 from typing import Any
+
+from birdstamp.config import resolve_bundled_path
 
 _FALLBACK_STYLE_OPTIONS = ("normal",)
 _FALLBACK_RATIO_OPTIONS: list[tuple[str, float | None]] = [("原比例", None)]
@@ -18,7 +19,7 @@ _FALLBACK_SAMPLE_RAW_METADATA: dict[str, Any] = {}
 
 @lru_cache(maxsize=1)
 def _load_builtin_editor_options_raw() -> dict[str, Any]:
-    options_file = resources.files("birdstamp.gui") / "resources" / "editor_options.json"
+    options_file = resolve_bundled_path("config", "editor_options.json")
     text = options_file.read_text(encoding="utf-8")
     raw = json.loads(text)
     if not isinstance(raw, dict):

@@ -6,13 +6,12 @@ import shutil
 import sys
 from collections import defaultdict
 from functools import lru_cache
-from importlib import resources
 from pathlib import Path
 from typing import Any
 
 from PIL import Image, ImageColor, ImageDraw
 
-from birdstamp.config import get_config_path
+from birdstamp.config import get_config_path, resolve_bundled_path
 from birdstamp.render.typography import load_font
 
 from birdstamp.gui.editor_core import (
@@ -184,9 +183,12 @@ def _copy_missing_seed_templates(template_dir: Path) -> int:
 
 @lru_cache(maxsize=1)
 def _load_builtin_default_template_raw() -> dict[str, Any]:
-    default_file = resources.files("birdstamp.gui") / "resources" / "default_template.json"
-    text = default_file.read_text(encoding="utf-8")
-    raw = json.loads(text)
+    default_file = resolve_bundled_path("config", "templates", "default.json")
+    try:
+        text = default_file.read_text(encoding="utf-8")
+        raw = json.loads(text)
+    except Exception as exc:
+        raise ValueError(f"默认模板读取失败: {default_file}") from exc
     if not isinstance(raw, dict):
         raise ValueError(f"默认模板格式错误: {default_file}")
     return raw
