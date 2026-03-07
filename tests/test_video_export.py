@@ -2,6 +2,7 @@ from pathlib import Path
 
 from PIL import Image
 
+from birdstamp.gui.editor_core import draw_focus_box_overlay
 from birdstamp.video_export import (
     _count_contiguous_rendered_frames,
     _partial_video_output_path,
@@ -73,3 +74,10 @@ def test_partial_video_output_path_marks_frame_count() -> None:
     output_path = Path("/tmp/video.mp4")
     partial_path = _partial_video_output_path(output_path, 12)
     assert partial_path.name == "video__partial_000012.mp4"
+
+
+def test_draw_focus_box_overlay_uses_expected_border_colors() -> None:
+    image = Image.new("RGB", (100, 100), "#FFFFFF")
+    draw_focus_box_overlay(image, (0.2, 0.2, 0.8, 0.8))
+    assert image.getpixel((20, 20)) == (0, 0, 0)
+    assert image.getpixel((21, 21)) == (46, 255, 85)

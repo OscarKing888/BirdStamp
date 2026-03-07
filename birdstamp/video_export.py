@@ -44,10 +44,12 @@ _resize_fit = editor_core.resize_fit
 _pad_image = editor_core.pad_image
 _crop_image_by_normalized_box = editor_core.crop_image_by_normalized_box
 _compute_ratio_crop_box = editor_core.compute_ratio_crop_box
+_draw_focus_box_overlay = editor_core.draw_focus_box_overlay
 _expand_unit_box_to_unclamped_pixels = editor_core.expand_unit_box_to_unclamped_pixels
 _normalize_unit_box = editor_core.normalize_unit_box
 _box_center = editor_core.box_center
 _get_focus_point_for_display = editor_core.get_focus_point_for_display
+_resolve_focus_box_after_processing = editor_core.resolve_focus_box_after_processing
 _resolve_focus_camera_type_from_metadata = editor_core.resolve_focus_camera_type_from_metadata
 _detect_primary_bird_box = editor_core.detect_primary_bird_box
 _get_bird_detector_error_message = editor_core.get_bird_detector_error_message
@@ -358,6 +360,7 @@ def _clone_render_settings(settings: dict[str, Any]) -> dict[str, Any]:
         "template_payload": _deep_copy_payload(template_payload),
         "draw_banner": _parse_bool_value(settings.get("draw_banner"), True),
         "draw_text": _parse_bool_value(settings.get("draw_text"), True),
+        "draw_focus": _parse_bool_value(settings.get("draw_focus"), False),
         "ratio": ratio,
         "center_mode": _normalize_center_mode(settings.get("center_mode") or _DEFAULT_TEMPLATE_CENTER_MODE),
         "max_long_edge": max_long_edge,
@@ -589,15 +592,19 @@ def _build_processed_image(
     source_path: Path | None,
     bird_box_cache: dict[str, tuple[float, float, float, float] | None],
     bird_box_lock: threading.Lock | None = None,
+    crop_plan: tuple[tuple[float, float, float, float] | None, tuple[int, int, int, int]] | None = None,
 ) -> Image.Image:
-    crop_box, outer_pad = _compute_crop_plan_for_image(
-        path=source_path,
-        image=image,
-        raw_metadata=raw_metadata,
-        settings=settings,
-        bird_box_cache=bird_box_cache,
-        bird_box_lock=bird_box_lock,
-    )
+    if crop_plan is None:
+        crop_box, outer_pad = _compute_crop_plan_for_image(
+            path=source_path,
+            image=image,
+            raw_metadata=raw_metadata,
+            settings=settings,
+            bird_box_cache=bird_box_cache,
+            bird_box_lock=bird_box_lock,
+        )
+    else:
+        crop_box, outer_pad = crop_plan
     top, bottom, left, right = outer_pad
     if top or bottom or left or right:
         fill = str(settings.get("crop_padding_fill") or "#FFFFFF").strip() or "#FFFFFF"
@@ -624,6 +631,14 @@ def render_video_frame(
     else:
         image = decode_image(job.path, decoder="auto")
 
+    crop_box, outer_pad = _compute_crop_plan_for_image(
+        path=job.path,
+        image=image,
+        raw_metadata=raw_metadata,
+        settings=settings,
+        bird_box_cache=cache,
+        bird_box_lock=bird_box_lock,
+    )
     processed = _build_processed_image(
         image,
         raw_metadata,
@@ -631,22 +646,37 @@ def render_video_frame(
         source_path=job.path,
         bird_box_cache=cache,
         bird_box_lock=bird_box_lock,
+        crop_plan=(crop_box, outer_pad),
     )
-    if not _should_draw_template_overlay(settings):
-        return processed.convert("RGB")
+    rendered: Image.Image
+    if _should_draw_template_overlay(settings):
+        template_payload = _resolve_template_payload_for_render(settings, template_paths)
+        photo_info = _template_context.ensure_photo_info(job.photo_info or job.path, raw_metadata=raw_metadata)
+        metadata_context = dict(job.metadata_context or {}) or _build_metadata_context(photo_info, raw_metadata)
+        rendered = _render_template_overlay(
+            processed,
+            raw_metadata=raw_metadata,
+            metadata_context=metadata_context,
+            photo_info=photo_info,
+            template_payload=template_payload,
+            draw_banner=_parse_bool_value(settings.get("draw_banner"), True),
+            draw_text=_parse_bool_value(settings.get("draw_text"), True),
+        )
+    else:
+        rendered = processed.convert("RGB")
 
-    template_payload = _resolve_template_payload_for_render(settings, template_paths)
-    photo_info = _template_context.ensure_photo_info(job.photo_info or job.path, raw_metadata=raw_metadata)
-    metadata_context = dict(job.metadata_context or {}) or _build_metadata_context(photo_info, raw_metadata)
-    rendered = _render_template_overlay(
-        processed,
-        raw_metadata=raw_metadata,
-        metadata_context=metadata_context,
-        photo_info=photo_info,
-        template_payload=template_payload,
-        draw_banner=_parse_bool_value(settings.get("draw_banner"), True),
-        draw_text=_parse_bool_value(settings.get("draw_text"), True),
-    )
+    if _parse_bool_value(settings.get("draw_focus"), False):
+        focus_box = _resolve_focus_box_after_processing(
+            raw_metadata,
+            source_width=image.width,
+            source_height=image.height,
+            crop_box=crop_box,
+            outer_pad=outer_pad,
+            apply_ratio_crop=True,
+            camera_type=_resolve_focus_camera_type_from_metadata(raw_metadata),
+        )
+        if focus_box is not None:
+            rendered = _draw_focus_box_overlay(rendered, focus_box)
     return rendered.convert("RGB")
 
 

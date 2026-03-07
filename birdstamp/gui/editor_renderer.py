@@ -24,6 +24,8 @@ _build_metadata_context             = editor_utils.build_metadata_context
 _default_placeholder_path           = editor_utils._default_placeholder_path
 _extract_focus_box                  = editor_core.extract_focus_box
 _extract_focus_box_for_display      = editor_core.extract_focus_box_for_display
+_draw_focus_box_overlay            = editor_core.draw_focus_box_overlay
+_resolve_focus_box_after_processing = editor_core.resolve_focus_box_after_processing
 _resolve_focus_camera_type_from_metadata = editor_core.resolve_focus_camera_type_from_metadata
 _transform_source_box_after_crop_padding = editor_core.transform_source_box_after_crop_padding
 _normalize_center_mode              = editor_core.normalize_center_mode
@@ -104,7 +106,7 @@ class _BirdStampRendererMixin:
             return ""
         base = self._source_signature(self.current_path)
         template_name = str(self.template_combo.currentText() or "default").strip() or "default"
-        draw_overlay = f"{self.draw_banner_check.isChecked()}|{self.draw_text_check.isChecked()}"
+        draw_overlay = f"{self.draw_banner_check.isChecked()}|{self.draw_text_check.isChecked()}|{self.draw_focus_check.isChecked()}"
         r = self._selected_ratio()
         cm = self._selected_center_mode()
         pt = self._padding_widget_value(self.crop_padding_top)
@@ -140,7 +142,7 @@ class _BirdStampRendererMixin:
         try:
             # 原尺寸模式显示未裁切预览源，仅保持原始分辨率。
             raw_metadata = dict(self.current_raw_metadata)
-            crop_box, _outer_pad = self._compute_crop_plan_for_image(
+            crop_box, outer_pad = self._compute_crop_plan_for_image(
                 path=self.current_path,
                 image=self.current_source_image,
                 raw_metadata=raw_metadata,
@@ -152,6 +154,7 @@ class _BirdStampRendererMixin:
                 settings=original_settings,
                 source_path=self.current_path,
                 apply_ratio_crop=False,
+                crop_plan=(crop_box, outer_pad),
             )
             img = self._render_overlay_for_preview_frame(
                 preview_base=img,
@@ -160,6 +163,15 @@ class _BirdStampRendererMixin:
                 photo_info=self.current_photo_info,
                 settings=original_settings,
                 crop_box=crop_box,
+            )
+            img = self._render_focus_box_for_image(
+                img,
+                raw_metadata=raw_metadata,
+                source_image=self.current_source_image,
+                settings=original_settings,
+                crop_box=crop_box,
+                outer_pad=outer_pad,
+                apply_ratio_crop=False,
             )
             direct_pixmap = _pil_to_qpixmap(img)
             if not direct_pixmap.isNull():
@@ -307,6 +319,7 @@ class _BirdStampRendererMixin:
             "template_payload": _deep_copy_payload(template_payload),
             "draw_banner": bool(self.draw_banner_check.isChecked()),
             "draw_text": bool(self.draw_text_check.isChecked()),
+            "draw_focus": bool(self.draw_focus_check.isChecked()),
             "ratio": self._selected_ratio(),
             "center_mode": self._selected_center_mode(),
             "max_long_edge": self._selected_max_long_edge(),
@@ -357,6 +370,7 @@ class _BirdStampRendererMixin:
             "template_payload": _deep_copy_payload(template_payload),
             "draw_banner": _parse_bool_value(settings.get("draw_banner"), True),
             "draw_text": _parse_bool_value(settings.get("draw_text"), True),
+            "draw_focus": _parse_bool_value(settings.get("draw_focus"), False),
             "ratio": ratio,
             "center_mode": _normalize_center_mode(settings.get("center_mode")),
             "max_long_edge": max_long_edge,
@@ -381,6 +395,8 @@ class _BirdStampRendererMixin:
             settings["draw_banner"] = _parse_bool_value(raw.get("draw_banner"), settings["draw_banner"])
         if "draw_text" in raw:
             settings["draw_text"] = _parse_bool_value(raw.get("draw_text"), settings["draw_text"])
+        if "draw_focus" in raw:
+            settings["draw_focus"] = _parse_bool_value(raw.get("draw_focus"), settings["draw_focus"])
         if "draw_template_overlay" in raw and "draw_banner" not in raw and "draw_text" not in raw:
             legacy = _parse_bool_value(raw.get("draw_template_overlay"), True)
             settings["draw_banner"] = legacy
@@ -454,7 +470,7 @@ class _BirdStampRendererMixin:
         template_name = str(normalized["template_name"])
 
         widgets_to_block = [
-            self.template_combo, self.draw_banner_check, self.draw_text_check,
+            self.template_combo, self.draw_banner_check, self.draw_text_check, self.draw_focus_check,
             self.ratio_combo, self.center_mode_combo,
             self.max_edge_combo,
         ]
@@ -466,6 +482,7 @@ class _BirdStampRendererMixin:
                 self.template_combo.setCurrentIndex(template_idx)
             self.draw_banner_check.setChecked(bool(normalized.get("draw_banner", True)))
             self.draw_text_check.setChecked(bool(normalized.get("draw_text", True)))
+            self.draw_focus_check.setChecked(bool(normalized.get("draw_focus", False)))
 
             ratio_idx = self._ratio_combo_index_for_value(normalized["ratio"])
             if ratio_idx >= 0:
@@ -571,13 +588,17 @@ class _BirdStampRendererMixin:
         settings: dict[str, Any],
         source_path: Path | None,
         apply_ratio_crop: bool = True,
+        crop_plan: tuple[tuple[float, float, float, float] | None, tuple[int, int, int, int]] | None = None,
     ) -> Image.Image:
-        crop_box, outer_pad = self._compute_crop_plan_for_image(
-            path=source_path,
-            image=image,
-            raw_metadata=raw_metadata,
-            settings=settings,
-        )
+        if crop_plan is None:
+            crop_box, outer_pad = self._compute_crop_plan_for_image(
+                path=source_path,
+                image=image,
+                raw_metadata=raw_metadata,
+                settings=settings,
+            )
+        else:
+            crop_box, outer_pad = crop_plan
         top, bottom, left, right = outer_pad
         if top or bottom or left or right:
             fill = str(settings.get("crop_padding_fill") or "#FFFFFF").strip() or "#FFFFFF"
@@ -590,6 +611,32 @@ class _BirdStampRendererMixin:
         image = _resize_fit(image, max_long_edge)
         return image
 
+    def _render_focus_box_for_image(
+        self,
+        image: Image.Image,
+        *,
+        raw_metadata: dict[str, Any],
+        source_image: Image.Image,
+        settings: dict[str, Any],
+        crop_box: tuple[float, float, float, float] | None,
+        outer_pad: tuple[int, int, int, int],
+        apply_ratio_crop: bool,
+    ) -> Image.Image:
+        if not _parse_bool_value(settings.get("draw_focus"), False):
+            return image
+        focus_box = _resolve_focus_box_after_processing(
+            raw_metadata,
+            source_width=source_image.width,
+            source_height=source_image.height,
+            crop_box=crop_box,
+            outer_pad=outer_pad,
+            apply_ratio_crop=apply_ratio_crop,
+            camera_type=_resolve_focus_camera_type_from_metadata(raw_metadata),
+        )
+        if focus_box is None:
+            return image
+        return _draw_focus_box_overlay(image, focus_box)
+
     def _render_for_path(self, path: Path, *, prefer_current_ui: bool) -> Image.Image:
         settings = self._render_settings_for_path(path, prefer_current_ui=prefer_current_ui)
         if self.current_path and path == self.current_path and self.current_source_image is not None:
@@ -599,31 +646,47 @@ class _BirdStampRendererMixin:
             source_image = decode_image(path, decoder="auto")
             raw_metadata = self._load_raw_metadata(path)
 
+        crop_box, outer_pad = self._compute_crop_plan_for_image(
+            path=path,
+            image=source_image,
+            raw_metadata=raw_metadata,
+            settings=settings,
+        )
         processed = self._build_processed_image(
             source_image,
             raw_metadata,
             settings=settings,
             source_path=path,
             apply_ratio_crop=True,
+            crop_plan=(crop_box, outer_pad),
         )
-        if not self._should_draw_template_overlay(settings):
-            return processed
+        rendered = processed
+        if self._should_draw_template_overlay(settings):
+            template_payload = self._resolve_template_payload_for_render(settings)
+            if self.current_path and path == self.current_path and self.current_source_image is not None:
+                context = dict(self.current_metadata_context)
+                photo_info = self.current_photo_info
+            else:
+                photo_info = _template_context.ensure_photo_info(path, raw_metadata=raw_metadata)
+                context = _build_metadata_context(photo_info, raw_metadata)
+            rendered = render_template_overlay(
+                processed,
+                raw_metadata=raw_metadata,
+                metadata_context=context,
+                photo_info=photo_info,
+                template_payload=template_payload,
+                draw_banner=_parse_bool_value(settings.get("draw_banner"), True),
+                draw_text=_parse_bool_value(settings.get("draw_text"), True),
+            )
 
-        template_payload = self._resolve_template_payload_for_render(settings)
-        if self.current_path and path == self.current_path and self.current_source_image is not None:
-            context = dict(self.current_metadata_context)
-            photo_info = self.current_photo_info
-        else:
-            photo_info = _template_context.ensure_photo_info(path, raw_metadata=raw_metadata)
-            context = _build_metadata_context(photo_info, raw_metadata)
-        return render_template_overlay(
-            processed,
+        return self._render_focus_box_for_image(
+            rendered,
             raw_metadata=raw_metadata,
-            metadata_context=context,
-            photo_info=photo_info,
-            template_payload=template_payload,
-            draw_banner=_parse_bool_value(settings.get("draw_banner"), True),
-            draw_text=_parse_bool_value(settings.get("draw_text"), True),
+            source_image=source_image,
+            settings=settings,
+            crop_box=crop_box,
+            outer_pad=outer_pad,
+            apply_ratio_crop=True,
         )
 
     def render_preview(self, *_args: Any) -> None:
@@ -654,6 +717,7 @@ class _BirdStampRendererMixin:
                 settings=preview_settings,
                 source_path=self.current_path,
                 apply_ratio_crop=False,
+                crop_plan=(crop_box, outer_pad),
             )
             rendered = self._render_overlay_for_preview_frame(
                 preview_base=processed,
@@ -662,6 +726,15 @@ class _BirdStampRendererMixin:
                 photo_info=self.current_photo_info,
                 settings=preview_settings,
                 crop_box=crop_box,
+            )
+            rendered = self._render_focus_box_for_image(
+                rendered,
+                raw_metadata=raw_metadata,
+                source_image=self.current_source_image,
+                settings=preview_settings,
+                crop_box=crop_box,
+                outer_pad=outer_pad,
+                apply_ratio_crop=False,
             )
         except Exception as exc:
             self.preview_overlay_state = EditorPreviewOverlayState()
@@ -700,7 +773,7 @@ class _BirdStampRendererMixin:
             pr=pad_right,
         )
         self.preview_overlay_state = EditorPreviewOverlayState(
-            focus_box=preview_focus_box,
+            focus_box=None if _parse_bool_value(preview_settings.get("draw_focus"), False) else preview_focus_box,
             bird_box=preview_bird_box,
             crop_effect_box=crop_box,
         )
